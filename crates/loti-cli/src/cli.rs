@@ -157,6 +157,10 @@ pub struct EpicStateSel {
 
 #[derive(Debug, Args)]
 pub struct EpicListArgs {
+    /// Restrict output to these summary fields (dotted leaf paths). Heavy
+    /// fields (body/comments/assets) are show-only and rejected here.
+    #[command(flatten)]
+    pub fields: FieldSel,
     /// Machine-readable JSON (flat array).
     #[command(flatten)]
     pub format: ListFormat,
@@ -280,6 +284,10 @@ pub struct TicketListArgs {
     /// Recurse into the subtree (scope only).
     #[arg(long)]
     pub recursive: bool,
+    /// Restrict output to these summary fields (dotted leaf paths). Heavy
+    /// fields (body/comments/assets/subtickets) are show-only and rejected here.
+    #[command(flatten)]
+    pub fields: FieldSel,
     #[command(flatten)]
     pub format: ListFormat,
 }

@@ -7,8 +7,9 @@
 //! this module is a thin, testable shell — it takes its stdin and its output
 //! sinks by reference, so a test can drive a whole command without a real TTY.
 //!
-//! Read-side rendering (`show`/`list`) and filtering are out of scope here and
-//! remain minimal stubs.
+//! Read-side rendering (`show`/`list`) resolves the data through `loti_core`'s
+//! read layer and renders it with `loti_core::render`; the structured filter
+//! families for `list` are a later layer.
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -19,12 +20,14 @@ use loti_core::domain::NodeRef;
 use loti_core::ops::{
     self, CommentView, EpicEdits, NewEpic, NewNode, NodeEdits, NodeStatusChange, Target,
 };
+use loti_core::read::{self, ListScope};
+use loti_core::render::{self, Color, Projection};
 use loti_core::store::{self, Store};
 use loti_core::Actor;
 
 use crate::cli::{
-    ActorArg, AssetCommand, Cli, Command, CommentCommand, EpicCommand, InitArgs, LabelCommand,
-    TicketCommand,
+    ActorArg, AssetCommand, Cli, Command, CommentCommand, EpicCommand, FieldSel, InitArgs,
+    LabelCommand, ListFormat, ShowArgs, ShowFormat, TicketCommand,
 };
 use crate::content_input;
 
@@ -35,6 +38,7 @@ pub fn run<R: Read, O: Write, E: Write>(
     cli: &Cli,
     stdin: &mut R,
     stdin_is_tty: bool,
+    stdout_is_tty: bool,
     out: &mut O,
     err: &mut E,
 ) -> Result<()> {
@@ -48,8 +52,34 @@ pub fn run<R: Read, O: Write, E: Write>(
             writeln!(err, "loti: migrate-store: not yet implemented")?;
             Ok(())
         }
-        Command::Epic(epic) => run_epic(cli, &epic.command, stdin, stdin_is_tty, out, err),
-        Command::Ticket(ticket) => run_ticket(cli, &ticket.command, stdin, stdin_is_tty, out, err),
+        Command::Epic(epic) => run_epic(
+            cli,
+            &epic.command,
+            stdin,
+            stdin_is_tty,
+            stdout_is_tty,
+            out,
+            err,
+        ),
+        Command::Ticket(ticket) => run_ticket(
+            cli,
+            &ticket.command,
+            stdin,
+            stdin_is_tty,
+            stdout_is_tty,
+            out,
+            err,
+        ),
+    }
+}
+
+/// The colour policy for the plain-text `list`: ANSI only on an interactive
+/// terminal, never when piped or redirected.
+fn color_for(stdout_is_tty: bool) -> Color {
+    if stdout_is_tty {
+        Color::Ansi
+    } else {
+        Color::None
     }
 }
 
@@ -108,11 +138,13 @@ fn open_store<E: Write>(cli: &Cli, err: &mut E) -> Result<Store> {
 // epic verbs
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn run_epic<R: Read, O: Write, E: Write>(
     cli: &Cli,
     cmd: &EpicCommand,
     stdin: &mut R,
     stdin_is_tty: bool,
+    stdout_is_tty: bool,
     out: &mut O,
     err: &mut E,
 ) -> Result<()> {
@@ -166,10 +198,12 @@ fn run_epic<R: Read, O: Write, E: Write>(
             run_asset(cli, &a.command, Kind::Epic, stdin, stdin_is_tty, out, err)?
         }
         EpicCommand::Show(a) => {
-            writeln!(err, "loti: epic show {}: not yet implemented", a.reference)?;
+            let store = open_store(cli, err)?;
+            show_epic(&store, a, out)?;
         }
-        EpicCommand::List(_) => {
-            writeln!(err, "loti: epic list: not yet implemented")?;
+        EpicCommand::List(a) => {
+            let store = open_store(cli, err)?;
+            list_epics(&store, &a.fields, &a.format, color_for(stdout_is_tty), out)?;
         }
     }
     Ok(())
@@ -179,11 +213,13 @@ fn run_epic<R: Read, O: Write, E: Write>(
 // ticket verbs
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn run_ticket<R: Read, O: Write, E: Write>(
     cli: &Cli,
     cmd: &TicketCommand,
     stdin: &mut R,
     stdin_is_tty: bool,
+    stdout_is_tty: bool,
     out: &mut O,
     err: &mut E,
 ) -> Result<()> {
@@ -250,14 +286,12 @@ fn run_ticket<R: Read, O: Write, E: Write>(
             run_asset(cli, &a.command, Kind::Ticket, stdin, stdin_is_tty, out, err)?
         }
         TicketCommand::Show(a) => {
-            writeln!(
-                err,
-                "loti: ticket show {}: not yet implemented",
-                a.reference
-            )?;
+            let store = open_store(cli, err)?;
+            show_node(&store, a, out)?;
         }
         TicketCommand::List(a) => {
-            writeln!(err, "loti: ticket list {}: not yet implemented", a.scope)?;
+            let store = open_store(cli, err)?;
+            list_tickets(&store, a, color_for(stdout_is_tty), out)?;
         }
     }
     Ok(())
@@ -512,7 +546,173 @@ fn read_bytes<R: Read>(
 }
 
 // ---------------------------------------------------------------------------
-// tiny renderers (full read-side rendering is a later ticket)
+// show (the sole projectable reader)
+// ---------------------------------------------------------------------------
+
+/// Render `epic show` in the requested mode, applying any `--field`/`--fields`
+/// projection. Markdown is the default; JSON is the canonical form; raw is
+/// strict-unambiguous leaves.
+fn show_epic<O: Write>(store: &Store, a: &ShowArgs, out: &mut O) -> Result<()> {
+    let value = read::epic_json(store, &a.reference)?;
+    let children = read::epic_children(store, &a.reference)?;
+    let comments = read::comment_lines(store, &Target::Epic(a.reference.clone()), false)?;
+    let text = render_show(&value, &a.format, &a.fields, &children, &comments)?;
+    writeln!(out, "{text}")?;
+    Ok(())
+}
+
+/// Render `ticket show` in the requested mode. The direct-children table lists
+/// the node's direct child nodes.
+fn show_node<O: Write>(store: &Store, a: &ShowArgs, out: &mut O) -> Result<()> {
+    let node_ref = NodeRef::parse(&a.reference)?;
+    let value = read::node_json(store, &node_ref)?;
+    let children = read::node_children(store, &node_ref)?;
+    let comments = read::comment_lines(store, &Target::Node(node_ref.clone()), false)?;
+    let text = render_show(&value, &a.format, &a.fields, &children, &comments)?;
+    writeln!(out, "{text}")?;
+    Ok(())
+}
+
+/// Dispatch a resolved value to the chosen `show` mode. Markdown is the default
+/// when no mode flag is given.
+fn render_show(
+    value: &serde_json::Value,
+    format: &ShowFormat,
+    fields: &FieldSel,
+    children: &[render::ChildRow],
+    comments: &[render::CommentLine],
+) -> Result<String> {
+    let projection = projection_of(fields);
+    if format.json {
+        Ok(render::show_json(value, &projection)?)
+    } else if format.raw {
+        Ok(render::show_raw(value, &projection)?)
+    } else {
+        // Markdown is the default. A projection narrows markdown to JSON of the
+        // selected leaves — markdown is the whole-entity view, so a field
+        // selection is served as its canonical value rather than a partial
+        // document.
+        match projection {
+            Projection::Whole => Ok(render::show_markdown(value, children, comments)),
+            _ => Ok(render::show_json(value, &projection)?),
+        }
+    }
+}
+
+/// Translate the `--field`/`--fields` group into a [`Projection`]. The clap
+/// group guarantees at most one is set; `--fields` splits on commas.
+fn projection_of(fields: &FieldSel) -> Projection {
+    if let Some(one) = &fields.field {
+        Projection::One(one.clone())
+    } else if let Some(many) = &fields.fields {
+        let paths: Vec<String> = many
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        Projection::Many(paths)
+    } else {
+        Projection::Whole
+    }
+}
+
+// ---------------------------------------------------------------------------
+// list (the roster reader; never presents)
+// ---------------------------------------------------------------------------
+
+/// Render `epic list` — the flat roster of every epic — in the chosen mode.
+/// `--recursive` is meaningless here and rejected upstream by the grammar;
+/// heavy `--fields` are rejected because the roster serves summary fields only.
+fn list_epics<O: Write>(
+    store: &Store,
+    fields: &FieldSel,
+    format: &ListFormat,
+    color: Color,
+    out: &mut O,
+) -> Result<()> {
+    // A `--fields` selection on list is restricted to summary fields; a
+    // heavy/structured field is a hard error (those are show-only).
+    let selected = list_field_paths(fields);
+    if !selected.is_empty() {
+        render::validate_list_fields(&selected, render::LISTABLE_EPIC_FIELDS)?;
+    }
+    let epics = read::list_epics(store)?;
+    let text = if format.json {
+        render::list_epics_json(&epics)
+    } else if format.ndjson {
+        render::list_epics_ndjson(&epics)
+    } else if format.raw {
+        render::list_epics_raw(&epics)
+    } else {
+        render::list_epics_plain(&epics, color)
+    };
+    write!(out, "{text}")?;
+    Ok(())
+}
+
+/// Render `ticket list <scope>` in the chosen mode. Scope is a whole epic
+/// (`<epic-id>`) or under a node (`<epic-id>/<n>`), with `--recursive` for the
+/// subtree. The plain form is a depth-first indented tree; the flat forms carry
+/// parent pointers.
+fn list_tickets<O: Write>(
+    store: &Store,
+    a: &crate::cli::TicketListArgs,
+    color: Color,
+    out: &mut O,
+) -> Result<()> {
+    let selected = list_field_paths(&a.fields);
+    if !selected.is_empty() {
+        render::validate_list_fields(&selected, render::LISTABLE_NODE_FIELDS)?;
+    }
+    let scope = parse_list_scope(&a.scope, a.recursive)?;
+    let nodes = read::list_nodes(store, &scope)?;
+    // With a field selection the flat/raw and plain forms narrow to those
+    // columns; json/ndjson keep the full listable row.
+    let text = if !selected.is_empty() && (a.format.raw || is_plain(&a.format)) {
+        render::list_nodes_fields_raw(&nodes, &selected)
+    } else if a.format.json {
+        render::list_nodes_json(&nodes)
+    } else if a.format.ndjson {
+        render::list_nodes_ndjson(&nodes)
+    } else if a.format.raw {
+        render::list_nodes_raw(&nodes)
+    } else {
+        render::list_nodes_plain(&nodes, color)
+    };
+    write!(out, "{text}")?;
+    Ok(())
+}
+
+/// Whether a list format is the default plain text (no machine-mode flag set).
+fn is_plain(format: &ListFormat) -> bool {
+    !format.json && !format.ndjson && !format.raw
+}
+
+/// The dotted field paths from a `--field`/`--fields` selection on list, empty
+/// when neither is given.
+fn list_field_paths(fields: &FieldSel) -> Vec<String> {
+    match projection_of(fields) {
+        Projection::Whole => Vec::new(),
+        Projection::One(p) => vec![p],
+        Projection::Many(ps) => ps,
+    }
+}
+
+/// Parse a `ticket list` scope: `<epic-id>` selects a whole epic, `<epic-id>/<n>`
+/// selects the nodes under that node (subtree when `recursive`). A scope with
+/// more than one `/` is rejected — a reference never nests.
+fn parse_list_scope(scope: &str, recursive: bool) -> Result<ListScope> {
+    if scope.contains('/') {
+        let node = NodeRef::parse(scope)?;
+        Ok(ListScope::Under { node, recursive })
+    } else {
+        Ok(ListScope::Epic(scope.to_string()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tiny renderers (used by the collection list verbs)
 // ---------------------------------------------------------------------------
 
 /// Render a label list inline, or a placeholder when empty.
@@ -555,10 +755,12 @@ mod tests {
     /// TTY), and return `(stdout, stderr, result)`. A failed operation returns
     /// its error (as `main` would render it), not written into `stderr`.
     fn invoke(cli: &Cli, stdin: &[u8]) -> (String, String, Result<()>) {
+        // stdin is piped (not a TTY) and stdout is not a TTY, so no colour is
+        // emitted — which is what a test wants to assert against plain text.
         let mut input = Cursor::new(stdin.to_vec());
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let result = run(cli, &mut input, false, &mut out, &mut err);
+        let result = run(cli, &mut input, false, false, &mut out, &mut err);
         (
             String::from_utf8(out).unwrap(),
             String::from_utf8(err).unwrap(),
@@ -692,6 +894,232 @@ mod tests {
             resolve_asset_name(None, Some(Path::new("/a/b/c.png"))).unwrap(),
             "c.png".to_string()
         );
+    }
+
+    // -- read side: show / list -------------------------------------------
+
+    /// Seed a small tree: epic `e` with node 1 (in-progress) and its child 2.
+    fn seed_tree(root: &Path) {
+        let store = Store::at(root);
+        ops::create_epic(&store, test_epic("e")).unwrap();
+        let a = ops::create_node(&store, test_node("e", None)).unwrap();
+        let ar = NodeRef::new("e", a.frontmatter.number);
+        ops::set_node_status(&store, &ar, NodeStatusChange::InProgress).unwrap();
+        ops::create_node(&store, test_node("e", Some(ar))).unwrap();
+    }
+
+    #[test]
+    fn show_json_is_canonical_with_all_fields() {
+        let (_d, root) = init_store();
+        seed_tree(&root);
+        let cli = cli_with_root(&root, &["ticket", "show", "e/1", "--json"]);
+        let (out, _e, r) = invoke(&cli, b"");
+        assert!(r.is_ok(), "show --json should succeed");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["ref"], "e/1");
+        assert_eq!(v["status"], "in-progress");
+        // Every canonical field is present, including body and timestamps.
+        for key in [
+            "number", "name", "summary", "labels", "body", "created", "updated",
+        ] {
+            assert!(v.get(key).is_some(), "missing {key} in {out}");
+        }
+    }
+
+    #[test]
+    fn show_epic_json_carries_computed_state() {
+        let (_d, root) = init_store();
+        seed_tree(&root);
+        let cli = cli_with_root(&root, &["epic", "show", "e", "--json"]);
+        let (out, _e, r) = invoke(&cli, b"");
+        assert!(r.is_ok());
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["state"], "open");
+        assert_eq!(v["nodes"], 2);
+    }
+
+    #[test]
+    fn show_markdown_emits_sections_in_order() {
+        let (_d, root) = init_store();
+        seed_tree(&root);
+        let cli = cli_with_root(&root, &["ticket", "show", "e/1"]);
+        let (out, _e, r) = invoke(&cli, b"");
+        assert!(r.is_ok());
+        // Metadata table, then the H1 name, summary blockquote, children,
+        // assets, body, comments — in that order.
+        let meta = out.find("| field | value |").unwrap();
+        let h1 = out.find("\n# ").unwrap();
+        let subs = out.find("## Subtickets").unwrap();
+        let assets = out.find("## Assets").unwrap();
+        let body = out.find("## Body").unwrap();
+        let comments = out.find("## Comments").unwrap();
+        assert!(
+            meta < h1 && h1 < subs && subs < assets && assets < body && body < comments,
+            "sections out of order:\n{out}"
+        );
+        // The direct child is tabulated.
+        assert!(out.contains("e/2"), "child row missing:\n{out}");
+    }
+
+    #[test]
+    fn show_raw_single_leaf_ok_and_structured_is_a_hard_error() {
+        let (_d, root) = init_store();
+        seed_tree(&root);
+        // A single leaf renders one value, unquoted.
+        let cli = cli_with_root(
+            &root,
+            &["ticket", "show", "e/1", "--raw", "--field", "status"],
+        );
+        let (out, _e, r) = invoke(&cli, b"");
+        assert!(r.is_ok());
+        assert_eq!(out.trim(), "in-progress");
+        // Selecting a whole structured field is ambiguous — a hard error.
+        let cli = cli_with_root(
+            &root,
+            &["ticket", "show", "e/1", "--raw", "--field", "attachments"],
+        );
+        let (_o, _e, r) = invoke(&cli, b"");
+        let msg = r.expect_err("structured raw must error").to_string();
+        assert!(
+            msg.contains("--json"),
+            "error should point at --json: {msg}"
+        );
+    }
+
+    #[test]
+    fn show_fields_dotted_projection() {
+        let (_d, root) = init_store();
+        let store = Store::at(&root);
+        ops::create_epic(&store, test_epic("e")).unwrap();
+        let n = ops::create_node(&store, test_node("e", None)).unwrap();
+        let nr = NodeRef::new("e", n.frontmatter.number);
+        ops::add_comment(
+            &store,
+            &Target::Node(nr.clone()),
+            Actor::Agent("bot".into()),
+            "hi".into(),
+        )
+        .unwrap();
+        // A dotted leaf path over a repeated field distributes to one value.
+        let cli = cli_with_root(
+            &root,
+            &[
+                "ticket",
+                "show",
+                "e/1",
+                "--raw",
+                "--field",
+                "comments.author",
+            ],
+        );
+        let (out, _e, r) = invoke(&cli, b"");
+        assert!(r.is_ok(), "projection should succeed");
+        assert_eq!(out.trim(), "agent:bot");
+    }
+
+    #[test]
+    fn list_plain_is_depth_first_indented_with_blocked_tag() {
+        let (_d, root) = init_store();
+        let store = Store::at(&root);
+        ops::create_epic(&store, test_epic("e")).unwrap();
+        let a = ops::create_node(&store, test_node("e", None)).unwrap();
+        let ar = NodeRef::new("e", a.frontmatter.number);
+        let b = ops::create_node(&store, test_node("e", Some(ar.clone()))).unwrap();
+        let br = NodeRef::new("e", b.frontmatter.number);
+        ops::set_node_status(
+            &store,
+            &br,
+            NodeStatusChange::Blocked {
+                refs: vec![],
+                reason: Some("waiting".into()),
+            },
+        )
+        .unwrap();
+        let cli = cli_with_root(&root, &["ticket", "list", "e"]);
+        let (out, _e, r) = invoke(&cli, b"");
+        assert!(r.is_ok());
+        let lines: Vec<&str> = out.lines().collect();
+        // Parent first at depth 0, child indented under it (depth-first).
+        assert!(lines[0].starts_with("e/1 "), "got: {:?}", lines);
+        assert!(
+            lines[1].starts_with("  e/2 "),
+            "child should be indented: {:?}",
+            lines
+        );
+        assert!(
+            lines[1].contains("[blocked: waiting]"),
+            "blocked tag missing: {:?}",
+            lines
+        );
+    }
+
+    #[test]
+    fn list_json_is_flat_with_parent_pointers() {
+        let (_d, root) = init_store();
+        seed_tree(&root);
+        let cli = cli_with_root(&root, &["ticket", "list", "e", "--json"]);
+        let (out, _e, r) = invoke(&cli, b"");
+        assert!(r.is_ok());
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let arr = v.as_array().expect("flat array");
+        assert_eq!(arr.len(), 2);
+        // Flat, never nested: each row carries a parent pointer, no children key.
+        let child = arr.iter().find(|r| r["ref"] == "e/2").unwrap();
+        assert_eq!(child["parent"], "e/1");
+        assert!(child.get("children").is_none());
+    }
+
+    #[test]
+    fn list_ndjson_is_one_object_per_line() {
+        let (_d, root) = init_store();
+        seed_tree(&root);
+        let cli = cli_with_root(&root, &["ticket", "list", "e", "--ndjson"]);
+        let (out, _e, r) = invoke(&cli, b"");
+        assert!(r.is_ok());
+        let lines: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2);
+        for l in lines {
+            let _: serde_json::Value = serde_json::from_str(l).expect("each line is JSON");
+        }
+    }
+
+    #[test]
+    fn list_raw_is_tab_separated() {
+        let (_d, root) = init_store();
+        seed_tree(&root);
+        let cli = cli_with_root(&root, &["ticket", "list", "e", "--raw"]);
+        let (out, _e, r) = invoke(&cli, b"");
+        assert!(r.is_ok());
+        let first = out.lines().next().unwrap();
+        assert!(
+            first.contains('\t'),
+            "raw rows are tab-separated: {first:?}"
+        );
+        assert!(first.starts_with("e/1\t"), "got: {first:?}");
+    }
+
+    #[test]
+    fn list_heavy_field_is_a_hard_error() {
+        let (_d, root) = init_store();
+        seed_tree(&root);
+        let cli = cli_with_root(&root, &["ticket", "list", "e", "--field", "body"]);
+        let (_o, _e, r) = invoke(&cli, b"");
+        let msg = r.expect_err("heavy field on list must error").to_string();
+        assert!(msg.contains("body"), "got: {msg}");
+    }
+
+    #[test]
+    fn epic_list_roster_and_json() {
+        let (_d, root) = init_store();
+        seed_tree(&root);
+        let cli = cli_with_root(&root, &["epic", "list", "--json"]);
+        let (out, _e, r) = invoke(&cli, b"");
+        assert!(r.is_ok());
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], "e");
+        assert_eq!(arr[0]["nodes"], 2);
     }
 
     /// A minimal epic input for seeding a store directly through the core.
