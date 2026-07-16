@@ -1,0 +1,590 @@
+//! The single declarative command-tree.
+//!
+//! Invariant: argument parsing, scoped `--help`, and the global full-tree help
+//! all render from this one `clap` derive definition — there is never an
+//! independently hand-maintained CLI surface to drift out of sync. The grammar
+//! is noun → verb → collection.
+//!
+//! Two annotations are carried in the help text of every relevant node so an
+//! agent can drive the CLI unaided:
+//!   * **input rule** — inline flag vs stdin/`--file` — on each payload arg;
+//!   * **actor requirement** — `-u`/`-a` — on comment operations.
+
+use std::path::PathBuf;
+
+use clap::{Args, Parser, Subcommand};
+
+/// `loti` — a local, markdown-backed ticket tracker driven entirely by this CLI.
+///
+/// Grammar is noun-verb: `loti <epic|ticket> <verb> ...`, with collections
+/// (`label`/`comment`/`asset`) nesting a third level. Free-form/binary payloads
+/// (body, comment text, asset data) are read from stdin or `--file` — never
+/// inline. Run `loti skill` for concepts and workflow.
+#[derive(Debug, Parser)]
+#[command(
+    name = "loti",
+    version,
+    propagate_version = true,
+    arg_required_else_help = true,
+    disable_help_subcommand = true
+)]
+pub struct Cli {
+    /// Use PATH as the data root, overriding upward `.loti/` discovery.
+    /// Flag only — there is no environment-variable override.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub root: Option<PathBuf>,
+
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Initialise a store: `.loti/` here by default, or a data dir at <DIR>
+    /// plus a `.loti.conf` pointer here. Warns if inside a git repo but not at
+    /// its root.
+    Init(InitArgs),
+
+    /// Epics — the top-level units of work.
+    Epic(EpicArgs),
+
+    /// Tickets and subtickets — nodes at any depth. A subticket is
+    /// `ticket create <epic-id> --parent <ref>`.
+    Ticket(TicketArgs),
+
+    /// Print the static, hand-authored SKILL.md verbatim.
+    Skill,
+
+    /// Align an older on-disk store format to this binary.
+    MigrateStore,
+}
+
+#[derive(Debug, Args)]
+pub struct InitArgs {
+    /// Data directory. Omitted: create `.loti/` in the current directory.
+    /// Given: create the data dir there and a `.loti.conf` pointer here.
+    #[arg(value_name = "DIR")]
+    pub dir: Option<PathBuf>,
+}
+
+// ---------------------------------------------------------------------------
+// epic
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Args)]
+#[command(disable_help_subcommand = true)]
+pub struct EpicArgs {
+    #[command(subcommand)]
+    pub command: EpicCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EpicCommand {
+    /// Create an epic. Body ← stdin or --file (never inline).
+    Create(EpicCreateArgs),
+    /// Show an epic (the sole projectable reader).
+    Show(ShowArgs),
+    /// Edit plain scalar fields (name/summary/body).
+    Edit(EpicEditArgs),
+    /// Set epic state (set-only; read via `show`).
+    Status(EpicStatusArgs),
+    /// Manage labels (add/remove/list).
+    Label(LabelArgs),
+    /// Manage comments (add/edit/delete/list). Actor required on mutations.
+    Comment(CommentArgs),
+    /// Manage assets (add/delete/list). Delete is hard.
+    Asset(AssetArgs),
+    /// List epics — a flat roster.
+    List(EpicListArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct EpicCreateArgs {
+    /// Epic id (human-chosen).
+    #[arg(value_name = "EPIC-ID")]
+    pub epic_id: String,
+    /// One-line name (inline).
+    #[arg(long, value_name = "S")]
+    pub name: String,
+    /// One-line summary (inline).
+    #[arg(long, value_name = "S")]
+    pub summary: String,
+    /// Label; repeatable (inline).
+    #[arg(long, value_name = "L")]
+    pub label: Vec<String>,
+    /// Body source: stdin or --file (never inline; optional → empty).
+    #[command(flatten)]
+    pub content: ContentInput,
+}
+
+#[derive(Debug, Args)]
+pub struct EpicEditArgs {
+    #[arg(value_name = "ID")]
+    pub id: String,
+    /// New name (inline).
+    #[arg(long, value_name = "S")]
+    pub name: Option<String>,
+    /// New summary (inline).
+    #[arg(long, value_name = "S")]
+    pub summary: Option<String>,
+    /// New body source: stdin or --file (never inline).
+    #[command(flatten)]
+    pub content: ContentInput,
+}
+
+#[derive(Debug, Args)]
+pub struct EpicStatusArgs {
+    #[arg(value_name = "ID")]
+    pub id: String,
+    #[command(flatten)]
+    pub state: EpicStateSel,
+    /// Close reason (inline; only with --closed).
+    #[arg(long, value_name = "S", requires = "closed")]
+    pub reason: Option<String>,
+}
+
+/// Epic state selector — exactly one of these is required.
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+pub struct EpicStateSel {
+    /// Mark the epic closed (stored flag; takes precedence).
+    #[arg(long)]
+    pub closed: bool,
+    /// Reopen the epic (clear the closed flag).
+    #[arg(long)]
+    pub open: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct EpicListArgs {
+    /// Machine-readable JSON (flat array).
+    #[command(flatten)]
+    pub format: ListFormat,
+}
+
+// ---------------------------------------------------------------------------
+// ticket
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Args)]
+#[command(disable_help_subcommand = true)]
+pub struct TicketArgs {
+    #[command(subcommand)]
+    pub command: TicketCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TicketCommand {
+    /// Create a ticket/subticket. Body ← stdin or --file (never inline).
+    Create(TicketCreateArgs),
+    /// Show a node (the sole projectable reader).
+    Show(ShowArgs),
+    /// Edit plain scalar fields (name/summary/parent/body).
+    Edit(TicketEditArgs),
+    /// Set node state (set-only; read via `show`).
+    Status(TicketStatusArgs),
+    /// Manage labels (add/remove/list).
+    Label(LabelArgs),
+    /// Manage comments (add/edit/delete/list). Actor required on mutations.
+    Comment(CommentArgs),
+    /// Manage assets (add/delete/list). Delete is hard.
+    Asset(AssetArgs),
+    /// List nodes under a required scope.
+    List(TicketListArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct TicketCreateArgs {
+    /// Owning epic id.
+    #[arg(value_name = "EPIC-ID")]
+    pub epic_id: String,
+    /// Parent node reference `<epic-id>/<n>` — omit for a top-level ticket.
+    #[arg(long, value_name = "REF")]
+    pub parent: Option<String>,
+    /// One-line name (inline).
+    #[arg(long, value_name = "S")]
+    pub name: String,
+    /// One-line summary (inline).
+    #[arg(long, value_name = "S")]
+    pub summary: String,
+    /// Label; repeatable (inline).
+    #[arg(long, value_name = "L")]
+    pub label: Vec<String>,
+    /// Body source: stdin or --file (never inline; optional → empty).
+    #[command(flatten)]
+    pub content: ContentInput,
+}
+
+#[derive(Debug, Args)]
+pub struct TicketEditArgs {
+    /// Node reference `<epic-id>/<n>`.
+    #[arg(value_name = "REF")]
+    pub reference: String,
+    /// New name (inline).
+    #[arg(long, value_name = "S")]
+    pub name: Option<String>,
+    /// New summary (inline).
+    #[arg(long, value_name = "S")]
+    pub summary: Option<String>,
+    /// Reparent under REF (a one-field edit; identity is unchanged).
+    #[arg(long, value_name = "REF")]
+    pub parent: Option<String>,
+    /// New body source: stdin or --file (never inline).
+    #[command(flatten)]
+    pub content: ContentInput,
+}
+
+#[derive(Debug, Args)]
+pub struct TicketStatusArgs {
+    /// Node reference `<epic-id>/<n>`.
+    #[arg(value_name = "REF")]
+    pub reference: String,
+    #[command(flatten)]
+    pub state: TicketStateSel,
+    /// blocked-by node refs, comma-separated (only with --blocked).
+    #[arg(long, value_name = "REF[,REF]", requires = "blocked")]
+    pub blocked_by: Option<String>,
+    /// Free-form reason (inline; with --blocked or --closed).
+    #[arg(long, value_name = "S")]
+    pub reason: Option<String>,
+    /// Cascade a close to non-terminal descendants (only with --closed).
+    #[arg(long, requires = "closed")]
+    pub cascade: bool,
+}
+
+/// Node state selector — exactly one of these is required.
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+pub struct TicketStateSel {
+    #[arg(long)]
+    pub to_do: bool,
+    #[arg(long)]
+    pub in_progress: bool,
+    /// Requires a structured blocked-by (`--blocked-by` and/or `--reason`).
+    #[arg(long)]
+    pub blocked: bool,
+    /// Allowed only when all descendants are terminal.
+    #[arg(long)]
+    pub done: bool,
+    /// Requires `--reason`; refuses non-terminal descendants without --cascade.
+    #[arg(long)]
+    pub closed: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct TicketListArgs {
+    /// Required scope: `<epic-id>` (whole epic) or `<epic-id>/<n>` (under a
+    /// node). There is no bare cross-epic list.
+    #[arg(value_name = "EPIC-ID[/N]")]
+    pub scope: String,
+    /// Recurse into the subtree (scope only).
+    #[arg(long)]
+    pub recursive: bool,
+    #[command(flatten)]
+    pub format: ListFormat,
+}
+
+// ---------------------------------------------------------------------------
+// shared collections: label / comment / asset  (identical under epic & ticket)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Args)]
+#[command(disable_help_subcommand = true)]
+pub struct LabelArgs {
+    #[command(subcommand)]
+    pub command: LabelCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LabelCommand {
+    /// Add labels (inline positionals).
+    Add(LabelMutateArgs),
+    /// Remove labels (inline positionals).
+    Remove(LabelMutateArgs),
+    /// List labels.
+    List(RefArg),
+}
+
+#[derive(Debug, Args)]
+pub struct LabelMutateArgs {
+    /// Target reference (`<id>` or `<epic-id>/<n>`).
+    #[arg(value_name = "REF")]
+    pub reference: String,
+    /// Labels (inline).
+    #[arg(value_name = "LABEL", required = true)]
+    pub labels: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+#[command(disable_help_subcommand = true)]
+pub struct CommentArgs {
+    #[command(subcommand)]
+    pub command: CommentCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CommentCommand {
+    /// Add a comment. ACTOR REQUIRED (-u/--user xor -a/--agent). Text ← stdin
+    /// or --file (required; never inline).
+    Add(CommentAddArgs),
+    /// Edit a comment — own author only. ACTOR REQUIRED. Text ← stdin/--file.
+    Edit(CommentEditArgs),
+    /// Soft-delete a comment — own author only. ACTOR REQUIRED.
+    Delete(CommentDeleteArgs),
+    /// List comments. Hidden deleted comments shown as tombstones with
+    /// --include-deleted.
+    List(CommentListArgs),
+}
+
+/// Actor identity — `-u/--user` xor `-a/--agent <NAME>`, required on comment
+/// mutations (comments are the sole attribution channel).
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+pub struct ActorArg {
+    /// Attribute to the human actor.
+    #[arg(short = 'u', long = "user")]
+    pub user: bool,
+    /// Attribute to a named agent.
+    #[arg(short = 'a', long = "agent", value_name = "NAME")]
+    pub agent: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct CommentAddArgs {
+    #[arg(value_name = "REF")]
+    pub reference: String,
+    #[command(flatten)]
+    pub actor: ActorArg,
+    /// Comment text: stdin or --file (required; never inline).
+    #[command(flatten)]
+    pub content: ContentInput,
+}
+
+#[derive(Debug, Args)]
+pub struct CommentEditArgs {
+    #[arg(value_name = "REF")]
+    pub reference: String,
+    #[arg(value_name = "COMMENT-ID")]
+    pub comment_id: u64,
+    #[command(flatten)]
+    pub actor: ActorArg,
+    /// Replacement text: stdin or --file (required; never inline).
+    #[command(flatten)]
+    pub content: ContentInput,
+}
+
+#[derive(Debug, Args)]
+pub struct CommentDeleteArgs {
+    #[arg(value_name = "REF")]
+    pub reference: String,
+    #[arg(value_name = "COMMENT-ID")]
+    pub comment_id: u64,
+    #[command(flatten)]
+    pub actor: ActorArg,
+}
+
+#[derive(Debug, Args)]
+pub struct CommentListArgs {
+    #[arg(value_name = "REF")]
+    pub reference: String,
+    /// Include soft-deleted comments as author+timestamp tombstones.
+    #[arg(long)]
+    pub include_deleted: bool,
+}
+
+#[derive(Debug, Args)]
+#[command(disable_help_subcommand = true)]
+pub struct AssetArgs {
+    #[command(subcommand)]
+    pub command: AssetCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AssetCommand {
+    /// Add an asset. Data ← stdin or --file (never inline). --name defaults to
+    /// the --file basename.
+    Add(AssetAddArgs),
+    /// Delete an asset by name — HARD delete.
+    Delete(AssetDeleteArgs),
+    /// List assets.
+    List(RefArg),
+}
+
+#[derive(Debug, Args)]
+pub struct AssetAddArgs {
+    #[arg(value_name = "REF")]
+    pub reference: String,
+    /// Asset name (inline); defaults to the --file basename when omitted.
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
+    /// Optional description (inline).
+    #[arg(long, value_name = "S")]
+    pub description: Option<String>,
+    /// Asset data: stdin or --file (never inline).
+    #[command(flatten)]
+    pub content: ContentInput,
+}
+
+#[derive(Debug, Args)]
+pub struct AssetDeleteArgs {
+    #[arg(value_name = "REF")]
+    pub reference: String,
+    #[arg(value_name = "NAME")]
+    pub name: String,
+}
+
+// ---------------------------------------------------------------------------
+// shared building blocks
+// ---------------------------------------------------------------------------
+
+/// A bare target reference — `<id>` or `<epic-id>/<n>` — for readers/listers.
+#[derive(Debug, Args)]
+pub struct RefArg {
+    #[arg(value_name = "REF")]
+    pub reference: String,
+}
+
+/// The shared content-input source. The payload is **never** inline:
+/// it comes from `--file <PATH>` or, absent that, piped stdin; an interactive
+/// TTY is treated as "no source" (never blocks). See [`crate::content_input`].
+#[derive(Debug, Args)]
+pub struct ContentInput {
+    /// Read the payload from PATH instead of stdin (never passed inline).
+    #[arg(long, value_name = "PATH")]
+    pub file: Option<PathBuf>,
+}
+
+/// `show` projection: at most one of `--field` / `--fields`.
+#[derive(Debug, Args)]
+#[group(required = false, multiple = false)]
+pub struct FieldSel {
+    /// Single dotted leaf path (e.g. `comments.author`).
+    #[arg(long, value_name = "F")]
+    pub field: Option<String>,
+    /// Comma-separated dotted leaf paths.
+    #[arg(long, value_name = "F,...")]
+    pub fields: Option<String>,
+}
+
+/// `show` output mode: at most one of markdown/json/raw.
+#[derive(Debug, Args)]
+#[group(required = false, multiple = false)]
+pub struct ShowFormat {
+    /// Viewer-friendly markdown (default).
+    #[arg(long)]
+    pub markdown: bool,
+    /// Canonical JSON (the source of truth).
+    #[arg(long)]
+    pub json: bool,
+    /// Strict-unambiguous leaf values, one per line.
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ShowArgs {
+    /// Target reference (`<id>` or `<epic-id>/<n>`).
+    #[arg(value_name = "REF")]
+    pub reference: String,
+    #[command(flatten)]
+    pub fields: FieldSel,
+    #[command(flatten)]
+    pub format: ShowFormat,
+}
+
+/// `list` output mode: at most one of json/ndjson/raw; default is plain text
+/// (`list` never presents, so there is no `--markdown`).
+#[derive(Debug, Args)]
+#[group(required = false, multiple = false)]
+pub struct ListFormat {
+    /// Flat JSON array with `parent` pointers.
+    #[arg(long)]
+    pub json: bool,
+    /// Stream one JSON object per line.
+    #[arg(long)]
+    pub ndjson: bool,
+    /// Flat, tab-separated rows.
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn command_tree_is_valid() {
+        // Panics if the single declarative tree is internally inconsistent.
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn no_auto_help_subcommand() {
+        // The top-level nouns are exactly init|epic|ticket|skill|migrate-store;
+        // clap's auto `help` subcommand must not appear as extra surface.
+        // `--help` flags remain, only the extra subcommand is gone.
+        assert!(Cli::try_parse_from(["loti", "help"]).is_err());
+        assert!(Cli::try_parse_from(["loti", "epic", "help"]).is_err());
+        assert!(Cli::try_parse_from(["loti", "ticket", "comment", "help"]).is_err());
+    }
+
+    #[test]
+    fn parses_root_override() {
+        let cli = Cli::try_parse_from(["loti", "--root", "/tmp/store", "skill"]).unwrap();
+        assert_eq!(
+            cli.root.as_deref(),
+            Some(std::path::Path::new("/tmp/store"))
+        );
+    }
+
+    #[test]
+    fn comment_add_requires_actor() {
+        // Missing -u/-a is a parse error: comment mutations require an actor.
+        let err = Cli::try_parse_from(["loti", "ticket", "comment", "add", "e/1"]);
+        assert!(err.is_err());
+        // With an actor it parses.
+        assert!(Cli::try_parse_from(["loti", "ticket", "comment", "add", "e/1", "-u"]).is_ok());
+    }
+
+    #[test]
+    fn actor_is_exclusive() {
+        let err = Cli::try_parse_from(["loti", "epic", "comment", "add", "e", "-u", "-a", "bot"]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn ticket_status_requires_one_state() {
+        assert!(Cli::try_parse_from(["loti", "ticket", "status", "e/1"]).is_err());
+        assert!(Cli::try_parse_from(["loti", "ticket", "status", "e/1", "--done"]).is_ok());
+        // Two states are mutually exclusive.
+        assert!(
+            Cli::try_parse_from(["loti", "ticket", "status", "e/1", "--done", "--to-do"]).is_err()
+        );
+    }
+
+    #[test]
+    fn ticket_list_scope_is_required() {
+        assert!(Cli::try_parse_from(["loti", "ticket", "list"]).is_err());
+        assert!(Cli::try_parse_from(["loti", "ticket", "list", "my-epic"]).is_ok());
+    }
+
+    #[test]
+    fn body_has_no_inline_flag() {
+        // `--body` does not exist: body content comes from stdin/--file only,
+        // never an inline flag.
+        assert!(Cli::try_parse_from([
+            "loti",
+            "epic",
+            "create",
+            "e",
+            "--name",
+            "n",
+            "--summary",
+            "s",
+            "--body",
+            "x",
+        ])
+        .is_err());
+    }
+}

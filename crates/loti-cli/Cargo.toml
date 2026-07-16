@@ -1,0 +1,19 @@
+[package]
+name = "loti-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "loti"
+path = "src/main.rs"
+
+[dependencies]
+loti-core.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+clap = { workspace = true }

@@ -1,0 +1,9 @@
+# Rust / Cargo build artifacts
+target/
+
+# Local cargo cache used for sandboxed nix builds
+.cargo-home/
+
+# Nix build result symlinks
+/result
+/result-*
