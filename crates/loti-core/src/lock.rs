@@ -242,6 +242,25 @@ fn try_create(target: &Path, temp: &Path) -> Result<Option<TempLock>, LockError>
     }
 }
 
+/// Attempt to acquire the advisory lock on `target` in a single non-blocking
+/// step: create the temp file exclusively and return the lock, or return
+/// `Ok(None)` if it is already held. Unlike [`acquire`], this never retries and
+/// never treats a stale hold specially — it is one exclusive-create attempt.
+///
+/// This is the acquire discipline for a hint-only mutation that must never
+/// block: a caller that fails to take the lock skips its update silently,
+/// because the value it would write is only an optimisation that self-heals.
+pub fn try_acquire(target: &Path) -> Result<Option<TempLock>, LockError> {
+    let temp = temp_path(target).ok_or_else(|| LockError::Io {
+        path: target.to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "target has no file name to derive a lock from",
+        ),
+    })?;
+    try_create(target, &temp)
+}
+
 /// Whether an existing temp file is stale: its mtime is older than the stale
 /// threshold, so its owner is presumed dead. A temp file we cannot stat (it
 /// vanished mid-check) is treated as not-stale so the caller retries cleanly.

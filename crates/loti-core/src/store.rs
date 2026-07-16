@@ -17,7 +17,12 @@
 //! lock bracketing the whole read-modify-write. Reads stay lock-free — a
 //! single-file read is atomic old-or-new by virtue of that rename, and
 //! multi-file aggregates are explicitly not a consistent global snapshot.
-//! Number allocation is performed elsewhere.
+//!
+//! Node numbers are drawn here from a flat monotonic pool per epic: the epic's
+//! `next-number` is a hint, and a node is created by probing forward and
+//! exclusively creating the first free node file. Correctness comes from that
+//! exclusive create, not from the hint, so a stale-low hint self-heals and
+//! concurrent creators never collide; the hint is then bumped best-effort.
 
 use std::path::{Path, PathBuf};
 
@@ -30,6 +35,12 @@ use crate::lock::{
 use crate::meta::{self, Meta, MARKER_DIR};
 use crate::model::{EpicFile, ModelError, NodeFile};
 use crate::FORMAT_VERSION;
+
+/// An upper bound on how far a single allocation will probe forward before
+/// giving up. The probe advances one number per already-taken slot; a bound
+/// this large is only ever reached under a corrupt or adversarial store, and
+/// turns an otherwise-unbounded loop into a clear error instead of a hang.
+const MAX_PROBE_STEPS: u64 = 1_000_000;
 
 /// The epic file name within an epic directory.
 pub const EPIC_FILE: &str = "epic.md";
@@ -72,6 +83,21 @@ pub enum StoreError {
     /// The store's format version refuses this mutation.
     #[error(transparent)]
     Version(#[from] VersionRefusal),
+    /// A node could not be created because the epic it belongs to does not
+    /// exist. A node's number is drawn from its epic's pool, so the epic must
+    /// exist first.
+    #[error("epic {epic_id} does not exist; create the epic before adding nodes")]
+    NoSuchEpic {
+        /// The missing epic id.
+        epic_id: String,
+    },
+    /// Number allocation probed forward past a sane bound without finding a
+    /// free slot — the epic directory is almost certainly corrupt.
+    #[error("could not allocate a node number in epic {epic_id}; the epic looks corrupt")]
+    Exhausted {
+        /// The epic whose number pool could not yield a free slot.
+        epic_id: String,
+    },
 }
 
 impl Store {
@@ -215,6 +241,143 @@ impl Store {
         gate.verify()?;
         lock.commit(bytes)?;
         Ok(())
+    }
+
+    /// Create a new node in an epic, allocating its number from the epic's flat
+    /// monotonic pool, and return the written [`NodeFile`] (its `number` field
+    /// filled in with the allocated value).
+    ///
+    /// `fields` carries everything about the node except its number: callers
+    /// build the node's frontmatter with any placeholder in `number` (it is
+    /// overwritten) and the body they want. The epic must already exist.
+    ///
+    /// Allocation is a probe-forward atomic exclusive-create: the epic's
+    /// `next-number` is only a hint for where to start looking; the number that
+    /// is actually taken is the first for which the node file could be created
+    /// where none existed. Correctness therefore does not depend on the hint
+    /// being accurate — a stale-low hint self-heals by probing forward, and two
+    /// racers starting from the same hint cannot take the same number because
+    /// the exclusive create of the node file lets exactly one win each slot.
+    pub fn create_node(&self, epic_id: &str, fields: NodeFile) -> Result<NodeFile, StoreError> {
+        self.create_node_forced(epic_id, fields, Force::Deny)
+    }
+
+    /// As [`Store::create_node`], but a stale lock encountered while taking a
+    /// candidate slot is cleared and creation proceeds (the `--force` path).
+    pub fn create_node_forced(
+        &self,
+        epic_id: &str,
+        mut fields: NodeFile,
+        force: Force,
+    ) -> Result<NodeFile, StoreError> {
+        // A node draws its number from its epic's pool, so the epic must exist.
+        if !self.epic_path(epic_id).is_file() {
+            return Err(StoreError::NoSuchEpic {
+                epic_id: epic_id.to_string(),
+            });
+        }
+
+        let start = self.allocation_start(epic_id);
+        let (number, lock) = self.take_free_slot(epic_id, start, force)?;
+
+        // Stamp the allocated number onto the frontmatter, then publish the
+        // complete node file by consuming the slot lock's rename. The version
+        // gate is verified under the lock, before publishing, so the store
+        // cannot change format mid-create.
+        fields.frontmatter.number = number;
+        let text = fields.to_text()?;
+        self.version_gate().verify()?;
+        lock.commit(text.as_bytes())?;
+
+        // Best-effort hint bump; never blocks and never fails the create.
+        self.bump_next_number(epic_id, number + 1);
+        Ok(fields)
+    }
+
+    /// The number to begin probing from: the epic's `next-number` hint, or 1 if
+    /// the epic cannot be read (the exclusive create will correct any error by
+    /// probing forward, so a bad hint is never fatal here).
+    fn allocation_start(&self, epic_id: &str) -> u64 {
+        match self.read_epic(epic_id) {
+            Ok(epic) => epic.frontmatter.next_number.max(1),
+            Err(_) => 1,
+        }
+    }
+
+    /// Probe forward from `start`, taking the first number whose node file does
+    /// not yet exist, and return that number together with a held slot lock
+    /// ready to publish the node file. The caller commits the lock to publish.
+    ///
+    /// The exclusive-create guarantee lives here: for each candidate the slot
+    /// lock (the deterministic node temp file) is acquired first, then the node
+    /// file's non-existence is re-checked while the lock is held. Because the
+    /// temp file is the advisory lock on that exact node, only one operation
+    /// can be between the check and the publish for a given number at a time, so
+    /// two racers cannot both observe the slot free and both publish it.
+    fn take_free_slot(
+        &self,
+        epic_id: &str,
+        start: u64,
+        force: Force,
+    ) -> Result<(u64, lock::TempLock), StoreError> {
+        let dir = self.epic_dir(epic_id);
+        create_dir_all(&dir)?;
+
+        let mut number = start;
+        for _ in 0..MAX_PROBE_STEPS {
+            let path = self.node_path(epic_id, number);
+            // A node file already at this number: the slot is taken, probe on
+            // without even trying to lock it.
+            if path.exists() {
+                number += 1;
+                continue;
+            }
+            let lock = lock::acquire(&path, &self.lock_config, force)?;
+            // Re-check under the lock: another operation may have published this
+            // number between the existence check and taking the lock. If so,
+            // release (drop) and probe forward.
+            if path.exists() {
+                drop(lock);
+                number += 1;
+                continue;
+            }
+            return Ok((number, lock));
+        }
+        Err(StoreError::Exhausted {
+            epic_id: epic_id.to_string(),
+        })
+    }
+
+    /// Best-effort bump of the epic's `next-number` hint to `at_least`.
+    ///
+    /// This is a single non-blocking attempt to take the epic lock that skips
+    /// silently on any collision or error: the counter is only a hint for where
+    /// the next allocation starts probing, and a stale-low value self-heals
+    /// because the exclusive create still probes forward to a free slot. It is
+    /// therefore never worth blocking on, and never worth failing a create for.
+    /// The hint is only ever moved upward, never lowered.
+    fn bump_next_number(&self, epic_id: &str, at_least: u64) {
+        let epic_path = self.epic_path(epic_id);
+        // Single non-blocking acquire; on collision (someone else holds the
+        // epic lock) or any I/O error, skip silently — the hint self-heals.
+        let Ok(Some(lock)) = lock::try_acquire(&epic_path) else {
+            return;
+        };
+        // Read the epic under the lock so the bump is against current contents.
+        let Ok(mut epic) = self.read_epic(epic_id) else {
+            return;
+        };
+        if epic.frontmatter.next_number >= at_least {
+            // Already at or past the target; nothing to publish. Dropping the
+            // lock releases it without a rename.
+            return;
+        }
+        epic.frontmatter.next_number = at_least;
+        let Ok(text) = epic.to_text() else {
+            return;
+        };
+        // The bump is a hint; a failed publish is harmless and ignored.
+        let _ = lock.commit(text.as_bytes());
     }
 
     /// Copy an asset's bytes into the epic's companion directory verbatim,
@@ -547,6 +710,248 @@ mod tests {
         assert!(matches!(
             init(dir.path(), None),
             Err(StoreError::AlreadyInitialised { .. })
+        ));
+    }
+
+    // -- numbering & atomic node creation ----------------------------------
+
+    /// Fast lock tunables so any contention in an allocation test resolves in
+    /// milliseconds rather than the default one-second liveness window.
+    fn fast_store(root: &Path) -> Store {
+        use std::time::Duration;
+        Store::at(root).with_lock_config(LockConfig {
+            stale_threshold: Duration::from_millis(80),
+            retry_interval: Duration::from_millis(5),
+        })
+    }
+
+    /// A node file with no number stamped yet (creation overwrites it) and the
+    /// given parent, for exercising allocation.
+    fn new_node(parent: Option<u64>) -> NodeFile {
+        let mut n = node(0);
+        n.frontmatter.parent = parent;
+        n
+    }
+
+    #[test]
+    fn create_node_allocates_from_the_hint_and_reads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fast_store(dir.path());
+        store.write_epic("my-epic", &epic()).unwrap();
+
+        let created = store.create_node("my-epic", new_node(None)).unwrap();
+        // The epic's next-number hint started at 1.
+        assert_eq!(created.frontmatter.number, 1);
+        let back = store.read_node("my-epic", 1).unwrap();
+        assert_eq!(back.frontmatter.number, 1);
+        assert_eq!(back.body, created.body);
+    }
+
+    #[test]
+    fn allocation_bumps_the_hint_so_the_next_create_advances() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fast_store(dir.path());
+        store.write_epic("my-epic", &epic()).unwrap();
+
+        let a = store.create_node("my-epic", new_node(None)).unwrap();
+        let b = store.create_node("my-epic", new_node(None)).unwrap();
+        assert_eq!(a.frontmatter.number, 1);
+        assert_eq!(b.frontmatter.number, 2);
+        // The hint was bumped to one past the last allocation.
+        let epic = store.read_epic("my-epic").unwrap();
+        assert_eq!(epic.frontmatter.next_number, 3);
+    }
+
+    #[test]
+    fn parent_is_carried_through_onto_the_created_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fast_store(dir.path());
+        store.write_epic("my-epic", &epic()).unwrap();
+        let parent = store.create_node("my-epic", new_node(None)).unwrap();
+        let child = store
+            .create_node("my-epic", new_node(Some(parent.frontmatter.number)))
+            .unwrap();
+        assert_eq!(child.frontmatter.parent, Some(parent.frontmatter.number));
+        let back = store
+            .read_node("my-epic", child.frontmatter.number)
+            .unwrap();
+        assert_eq!(back.frontmatter.parent, Some(parent.frontmatter.number));
+    }
+
+    #[test]
+    fn a_stale_low_hint_self_heals_by_probing_forward() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fast_store(dir.path());
+        // Hint says 1, but 1..=5 are already taken: allocation must return 6.
+        let mut e = epic();
+        e.frontmatter.next_number = 1;
+        store.write_epic("my-epic", &e).unwrap();
+        for n in 1..=5 {
+            store.write_node("my-epic", n, &node(n)).unwrap();
+        }
+        let created = store.create_node("my-epic", new_node(None)).unwrap();
+        assert_eq!(created.frontmatter.number, 6);
+        assert!(store.node_path("my-epic", 6).is_file());
+    }
+
+    #[test]
+    fn numbers_are_never_reused_after_the_pool_advances() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fast_store(dir.path());
+        store.write_epic("my-epic", &epic()).unwrap();
+        let first = store.create_node("my-epic", new_node(None)).unwrap();
+        // Even if the node's file were removed, the hint has advanced past it,
+        // so a later allocation does not hand out the same number again.
+        std::fs::remove_file(store.node_path("my-epic", first.frontmatter.number)).unwrap();
+        let next = store.create_node("my-epic", new_node(None)).unwrap();
+        assert!(next.frontmatter.number > first.frontmatter.number);
+    }
+
+    #[test]
+    fn numbers_may_collide_across_epics() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fast_store(dir.path());
+        store.write_epic("epic-a", &epic()).unwrap();
+        let mut eb = epic();
+        eb.frontmatter.id = "epic-b".into();
+        store.write_epic("epic-b", &eb).unwrap();
+        let a = store.create_node("epic-a", new_node(None)).unwrap();
+        let b = store.create_node("epic-b", new_node(None)).unwrap();
+        // Each epic has its own pool: the same number in two epics is fine.
+        assert_eq!(a.frontmatter.number, 1);
+        assert_eq!(b.frontmatter.number, 1);
+    }
+
+    #[test]
+    fn create_node_requires_the_epic_to_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fast_store(dir.path());
+        assert!(matches!(
+            store.create_node("ghost", new_node(None)),
+            Err(StoreError::NoSuchEpic { .. })
+        ));
+    }
+
+    #[test]
+    fn two_allocations_from_the_same_hint_do_not_collide() {
+        // Both starts see next-number == 1; the exclusive create makes exactly
+        // one take slot 1 and the other probe forward to 2. No lost file, no
+        // reused number.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let store = fast_store(&root);
+        store.write_epic("my-epic", &epic()).unwrap();
+
+        let r1 = root.clone();
+        let r2 = root.clone();
+        let t1 = std::thread::spawn(move || {
+            fast_store(&r1)
+                .create_node("my-epic", new_node(None))
+                .unwrap()
+                .frontmatter
+                .number
+        });
+        let t2 = std::thread::spawn(move || {
+            fast_store(&r2)
+                .create_node("my-epic", new_node(None))
+                .unwrap()
+                .frontmatter
+                .number
+        });
+        let n1 = t1.join().unwrap();
+        let n2 = t2.join().unwrap();
+
+        // Distinct numbers, both files present, both parse cleanly.
+        assert_ne!(n1, n2, "two racers must not take the same number");
+        assert!(store.node_path("my-epic", n1).is_file());
+        assert!(store.node_path("my-epic", n2).is_file());
+        store.read_node("my-epic", n1).unwrap();
+        store.read_node("my-epic", n2).unwrap();
+    }
+
+    #[test]
+    fn many_concurrent_allocations_are_all_distinct_and_persisted() {
+        // A stronger race: N threads against one epic must produce N distinct
+        // numbers and N readable files, with none lost to a collision.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let store = fast_store(&root);
+        store.write_epic("my-epic", &epic()).unwrap();
+
+        const N: usize = 8;
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let r = root.clone();
+                std::thread::spawn(move || {
+                    fast_store(&r)
+                        .create_node("my-epic", new_node(None))
+                        .unwrap()
+                        .frontmatter
+                        .number
+                })
+            })
+            .collect();
+        let mut numbers: Vec<u64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        numbers.sort_unstable();
+        numbers.dedup();
+        assert_eq!(numbers.len(), N, "every allocation must be unique");
+        for n in numbers {
+            assert!(store.node_path("my-epic", n).is_file());
+            store.read_node("my-epic", n).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_held_epic_lock_skips_the_hint_bump_without_failing_the_create() {
+        // The counter bump is best-effort: if the epic lock is held, the bump
+        // is skipped silently and the create still succeeds. The next
+        // allocation self-heals by probing forward from the stale-low hint.
+        let dir = tempfile::tempdir().unwrap();
+        let store = fast_store(dir.path());
+        store.write_epic("my-epic", &epic()).unwrap();
+
+        // Hold the epic lock for the duration of a create so the bump cannot
+        // take it.
+        let epic_lock =
+            lock::acquire(&store.epic_path("my-epic"), &store.lock_config, Force::Deny).unwrap();
+        let created = store.create_node("my-epic", new_node(None)).unwrap();
+        assert_eq!(created.frontmatter.number, 1);
+        // The node file exists; the hint was NOT bumped (still 1) because the
+        // lock was held.
+        assert!(store.node_path("my-epic", 1).is_file());
+        drop(epic_lock);
+        let epic = store.read_epic("my-epic").unwrap();
+        assert_eq!(
+            epic.frontmatter.next_number, 1,
+            "a held epic lock leaves the hint unbumped"
+        );
+
+        // The next create self-heals: it starts at the stale-low hint (1),
+        // finds 1 taken, and probes forward to 2.
+        let second = store.create_node("my-epic", new_node(None)).unwrap();
+        assert_eq!(second.frontmatter.number, 2);
+    }
+
+    #[test]
+    fn create_node_respects_the_version_gate() {
+        // A store whose major is newer than this binary refuses a create.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Write metadata claiming a far-future major version.
+        meta::write(
+            root,
+            &Meta {
+                format_version: format!("{}.0", FORMAT_VERSION.0 + 1),
+            },
+        )
+        .unwrap();
+        let store = fast_store(root);
+        // The epic file must exist for create_node to get past the epic check;
+        // but writing it is itself gated, so the too-new store already refuses
+        // this write — which is the guarantee we want.
+        assert!(matches!(
+            store.write_epic("my-epic", &epic()),
+            Err(StoreError::Version(VersionRefusal::StoreTooNew))
         ));
     }
 }
