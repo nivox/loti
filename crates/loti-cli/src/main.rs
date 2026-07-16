@@ -1,16 +1,20 @@
 //! `loti` binary entrypoint.
 //!
 //! This parses the single declarative command-tree (see [`cli`]), plumbs
-//! `--root`, and routes to the shared content-input helper. Command behaviour
-//! is not implemented yet: every verb is currently a stub that reports what it
+//! `--root`, and routes to the shared content-input helper. `init` is wired
+//! end-to-end; the remaining verbs are still stubs that report what they
 //! *would* do.
 
 mod cli;
 mod content_input;
 
+use anyhow::Context;
 use clap::Parser;
 
-use cli::{AssetCommand, Cli, Command, CommentCommand, EpicCommand, LabelCommand, TicketCommand};
+use cli::{
+    AssetCommand, Cli, Command, CommentCommand, EpicCommand, InitArgs, LabelCommand, TicketCommand,
+};
+use loti_core::store;
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -21,12 +25,7 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| "<discovered>".to_string());
 
     match &cli.command {
-        Command::Init(args) => {
-            stub(&format!(
-                "init (root={root}, dir={:?})",
-                args.dir.as_ref().map(|d| d.display().to_string())
-            ));
-        }
+        Command::Init(args) => run_init(args)?,
         Command::Skill => stub("skill (prints the static SKILL.md)"),
         Command::MigrateStore => stub("migrate-store"),
         Command::Epic(epic) => match &epic.command {
@@ -71,6 +70,30 @@ fn main() -> anyhow::Result<()> {
         },
     }
 
+    Ok(())
+}
+
+/// Create a store, then report where its markers landed.
+///
+/// Init is the one command that runs without an existing store, so it resolves
+/// its location from the current directory rather than upward discovery.
+fn run_init(args: &InitArgs) -> anyhow::Result<()> {
+    let here = std::env::current_dir().context("determining the current directory")?;
+
+    // A store is best kept at a repository's root so a whole checkout shares it.
+    if store::inside_git_repo_but_not_root(&here) {
+        eprintln!(
+            "loti: warning: creating a store here, which is inside a git repository \
+             but not at its top level; consider running this at the repository root \
+             so the whole checkout shares one store"
+        );
+    }
+
+    let outcome = store::init(&here, args.dir.as_deref())?;
+    println!("loti: initialised a store at {}", outcome.root.display());
+    if let Some(pointer) = &outcome.config_pointer {
+        println!("loti: wrote a pointer to it at {}", pointer.display());
+    }
     Ok(())
 }
 

@@ -17,6 +17,11 @@ loti-core = { path = "crates/loti-core" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+toml = "0.8"
+jiff = { version = "0.1", features = ["serde"] }
+tempfile = "3"
 
 # Single static binary: optimize for size, strip, LTO (SPEC §8 goal).
 [profile.release]

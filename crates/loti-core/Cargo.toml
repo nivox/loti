@@ -8,3 +8,10 @@ publish.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+toml.workspace = true
+jiff.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

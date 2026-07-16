@@ -5,8 +5,16 @@
 //! CLI/`clap` types: the `loti-cli` crate (and any future TUI/web surface) is
 //! a thin adapter over this seam.
 //!
-//! It currently pins the store format version and the domain vocabulary as
-//! type stubs; the real logic is not implemented yet.
+//! It currently pins the store format version and the domain vocabulary, plus
+//! the on-disk storage layer (layout, frontmatter/body split, tolerant
+//! round-trip, store metadata, root discovery). The concurrency primitive,
+//! number allocation, and migration are layered on later.
+
+pub mod discovery;
+pub mod frontmatter;
+pub mod meta;
+pub mod model;
+pub mod store;
 
 /// Store `format-version` as `(major, minor)`. Written by `loti init` into
 /// `<root>/.loti/meta`, and carried at store granularity. A store major newer
