@@ -34,6 +34,12 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub root: Option<PathBuf>,
 
+    /// Print the complete command tree in one pass — every noun, verb, and
+    /// collection, with each flag's input rule and the actor requirement on
+    /// comment operations. Handled before normal dispatch; exits after printing.
+    #[arg(long, global = true)]
+    pub help_full: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }

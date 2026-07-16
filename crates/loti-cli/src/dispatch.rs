@@ -48,7 +48,9 @@ pub fn run<R: Read, O: Write, E: Write>(
     match &cli.command {
         Command::Init(args) => run_init(args, out, err),
         Command::Skill => {
-            writeln!(err, "loti: skill: not yet implemented")?;
+            // Printed verbatim: the skill is static, hand-authored prose, not a
+            // rendering of the command model.
+            write!(out, "{}", crate::skill::SKILL)?;
             Ok(())
         }
         Command::MigrateStore(a) => run_migrate_store(cli, a, out, err),

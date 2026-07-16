@@ -9,15 +9,29 @@
 mod cli;
 mod content_input;
 mod dispatch;
+mod help_full;
+mod skill;
 
 use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 
 use cli::Cli;
 
 fn main() -> ExitCode {
+    // `--help-full` is a global short-circuit, like `--help`: it prints the
+    // whole annotated command tree and exits, before the normal parse (which
+    // would otherwise demand a subcommand). It is walked from the one clap
+    // model, never hand-maintained.
+    if std::env::args().skip(1).any(|a| a == "--help-full") {
+        let mut command = Cli::command();
+        let text = help_full::render(&mut command);
+        let mut out = anstream::AutoStream::auto(io::stdout());
+        let _ = write!(out, "{text}");
+        return ExitCode::SUCCESS;
+    }
+
     let cli = Cli::parse();
     let stdin = io::stdin();
     let stdin_is_tty = stdin.is_terminal();
