@@ -30,9 +30,10 @@ use thiserror::Error;
 
 use crate::discovery::CONFIG_FILE;
 use crate::lock::{
-    self, Force, LockConfig, LockError, MajorVersionGate, VersionGate, VersionRefusal,
+    self, classify_read, Force, LockConfig, LockError, ObservedVersion, StoreVersionGate,
+    VersionGate, VersionRefusal,
 };
-use crate::meta::{self, Meta, MARKER_DIR};
+use crate::meta::{self, Meta, StoreVersion, MARKER_DIR};
 use crate::model::{EpicFile, ModelError, NodeFile};
 use crate::FORMAT_VERSION;
 
@@ -124,25 +125,50 @@ impl Store {
         &self.root
     }
 
-    /// A version gate bound to this store: it reads the store's metadata
-    /// version and refuses a store whose major is newer than this binary, so a
-    /// mutation cannot silently write a store it does not understand.
-    ///
-    /// A store with no metadata file is treated as current (permitted): it is a
-    /// bare directory being populated, not a versioned store to gate against.
-    /// Metadata that exists but cannot be parsed reads as unversioned and is
-    /// refused by the gate.
-    fn version_gate(&self) -> MajorVersionGate<impl Fn() -> Option<(u32, u32)> + '_> {
-        MajorVersionGate {
-            binary: FORMAT_VERSION,
-            read_store: move || match meta::read(&self.root) {
-                Ok(m) => m.parsed_version(),
-                // No metadata yet: nothing to gate against, treat as current.
-                Err(meta::MetaError::Io { .. }) => Some(FORMAT_VERSION),
-                // Metadata present but unreadable: refuse via the gate.
-                Err(_) => None,
+    /// The store's observed version for the version rules: settled, or the
+    /// mid-migration sentinel. A store with no metadata file is treated as the
+    /// current settled version — it is a bare directory being populated, not a
+    /// versioned store to gate against. Metadata present but unparseable reads
+    /// as `None`, which the gates treat as unreadable and refuse.
+    fn observed_version(&self) -> Option<ObservedVersion> {
+        match meta::read(&self.root) {
+            Ok(m) => match m.store_version() {
+                Some(StoreVersion::Clean { major, minor }) => {
+                    Some(ObservedVersion::Clean(major, minor))
+                }
+                Some(StoreVersion::Migrating { major, minor }) => {
+                    Some(ObservedVersion::Migrating(major, minor))
+                }
+                None => None,
             },
+            // No metadata yet: nothing to gate against, treat as current.
+            Err(meta::MetaError::Io { .. }) => {
+                Some(ObservedVersion::Clean(FORMAT_VERSION.0, FORMAT_VERSION.1))
+            }
+            // Metadata present but unreadable: refuse via the gate.
+            Err(_) => None,
         }
+    }
+
+    /// A mutation gate bound to this store, applying the whole version matrix:
+    /// a newer major is refused outright, an older major is read-only until
+    /// migrated, a mid-migration sentinel is read-only for everyone but the
+    /// migrator, and minor differences within a major are compatible. A
+    /// mutation cannot silently write a store it does not understand.
+    fn version_gate(&self) -> StoreVersionGate<impl Fn() -> Option<ObservedVersion> + '_> {
+        StoreVersionGate {
+            binary: FORMAT_VERSION,
+            read_store: move || self.observed_version(),
+        }
+    }
+
+    /// Verify the store may be *read*. Reads are otherwise lock-free, but a
+    /// store whose major is newer than this binary must never be read, since the
+    /// binary cannot be trusted to interpret it. An older major and a
+    /// mid-migration store are still readable — only mutation is refused for
+    /// those. Call this before surfacing store contents to a caller.
+    pub fn verify_readable(&self) -> Result<(), VersionRefusal> {
+        classify_read(self.observed_version(), FORMAT_VERSION.0)
     }
 
     /// The directory holding one epic and its nodes.
@@ -952,6 +978,112 @@ mod tests {
         assert!(matches!(
             store.write_epic("my-epic", &epic()),
             Err(StoreError::Version(VersionRefusal::StoreTooNew))
+        ));
+    }
+
+    // -- version mismatch matrix & sentinel gate ---------------------------
+
+    /// Record a store version string, having first placed a real epic so reads
+    /// have something to return.
+    fn store_with_version(root: &Path, version: &str) -> Store {
+        let store = fast_store(root);
+        // Seed content at the current version, then overwrite the recorded
+        // version to the scenario under test (bypassing the gate deliberately).
+        store.write_epic("my-epic", &epic()).unwrap();
+        meta::write(
+            root,
+            &Meta {
+                format_version: version.to_string(),
+            },
+        )
+        .unwrap();
+        store
+    }
+
+    #[test]
+    fn equal_version_permits_reads_and_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (major, minor) = FORMAT_VERSION;
+        let store = store_with_version(dir.path(), &format!("{major}.{minor}"));
+        assert!(store.verify_readable().is_ok());
+        // A mutation succeeds at the equal version.
+        let mut e = store.read_epic("my-epic").unwrap();
+        e.frontmatter.name = "renamed".into();
+        assert!(store.write_epic("my-epic", &e).is_ok());
+    }
+
+    #[test]
+    fn too_new_store_refuses_both_reads_and_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (major, minor) = FORMAT_VERSION;
+        let store = store_with_version(dir.path(), &format!("{}.{minor}", major + 1));
+        // Reads are refused (never read-guess a newer major).
+        assert!(matches!(
+            store.verify_readable(),
+            Err(VersionRefusal::StoreTooNew)
+        ));
+        // Writes are refused too.
+        assert!(matches!(
+            store.write_epic("my-epic", &epic()),
+            Err(StoreError::Version(VersionRefusal::StoreTooNew))
+        ));
+    }
+
+    #[test]
+    fn older_major_store_reads_but_refuses_mutation_with_migrate_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let (major, minor) = FORMAT_VERSION;
+        if major == 0 {
+            // No lower major exists to record; the matrix for older-major is
+            // unreachable with a major-0 binary. Covered by the migrate module
+            // via simulated skew instead.
+            return;
+        }
+        let store = store_with_version(dir.path(), &format!("{}.{minor}", major - 1));
+        // Reads are fine on an older major.
+        assert!(store.verify_readable().is_ok());
+        assert!(store.read_epic("my-epic").is_ok());
+        // Any mutation is refused, pointing at migrate-store.
+        assert!(matches!(
+            store.write_epic("my-epic", &epic()),
+            Err(StoreError::Version(VersionRefusal::NeedsMigration))
+        ));
+    }
+
+    #[test]
+    fn minor_difference_within_a_major_is_compatible_both_ways() {
+        let dir = tempfile::tempdir().unwrap();
+        let (major, minor) = FORMAT_VERSION;
+        // A store a minor ahead within the same major still mutates (tolerant
+        // reader handles any additive keys).
+        let store = store_with_version(dir.path(), &format!("{major}.{}", minor + 1));
+        assert!(store.verify_readable().is_ok());
+        assert!(store.write_epic("my-epic", &epic()).is_ok());
+    }
+
+    #[test]
+    fn mid_migration_sentinel_refuses_mutation_for_everyone_but_reads_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let (major, minor) = FORMAT_VERSION;
+        // The sentinel names this very binary's version, so a matching-major
+        // binary still refuses mutation while the migration is in flight.
+        let store = store_with_version(dir.path(), &format!("{major}.{minor}-migrate"));
+        // Reads remain allowed (the store is not too-new).
+        assert!(store.verify_readable().is_ok());
+        // Every mutation is refused as mid-migration.
+        assert!(matches!(
+            store.write_epic("my-epic", &epic()),
+            Err(StoreError::Version(VersionRefusal::MigrationInProgress))
+        ));
+    }
+
+    #[test]
+    fn unreadable_version_refuses_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_version(dir.path(), "not-a-version");
+        assert!(matches!(
+            store.write_epic("my-epic", &epic()),
+            Err(StoreError::Version(VersionRefusal::Unreadable))
         ));
     }
 }

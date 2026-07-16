@@ -56,7 +56,15 @@ pub enum Command {
     Skill,
 
     /// Align an older on-disk store format to this binary.
-    MigrateStore,
+    MigrateStore(MigrateStoreArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct MigrateStoreArgs {
+    /// Proceed even if staging files from an interrupted operation never clear
+    /// during the drain. Use only when you are sure no other operation is live.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Debug, Args)]

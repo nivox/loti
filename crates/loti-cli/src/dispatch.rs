@@ -29,7 +29,8 @@ use loti_core::Actor;
 
 use crate::cli::{
     ActorArg, AssetCommand, Cli, Command, CommentCommand, EpicCommand, FieldSel, InitArgs,
-    LabelCommand, ListFilterArgs, ListFormat, ShowArgs, ShowFormat, TicketCommand,
+    LabelCommand, ListFilterArgs, ListFormat, MigrateStoreArgs, ShowArgs, ShowFormat,
+    TicketCommand,
 };
 use crate::content_input;
 
@@ -50,10 +51,7 @@ pub fn run<R: Read, O: Write, E: Write>(
             writeln!(err, "loti: skill: not yet implemented")?;
             Ok(())
         }
-        Command::MigrateStore => {
-            writeln!(err, "loti: migrate-store: not yet implemented")?;
-            Ok(())
-        }
+        Command::MigrateStore(a) => run_migrate_store(cli, a, out, err),
         Command::Epic(epic) => run_epic(
             cli,
             &epic.command,
@@ -114,13 +112,95 @@ fn run_init<O: Write, E: Write>(args: &InitArgs, out: &mut O, err: &mut E) -> Re
     Ok(())
 }
 
+/// A progress sink that writes each migration step as a `loti:` line to the
+/// diagnostic stream, so a human sees the sentinel, drain, transform and commit
+/// as they happen.
+struct WriterProgress<'a, E: Write> {
+    err: &'a mut E,
+}
+impl<E: Write> loti_core::migrate::Progress for WriterProgress<'_, E> {
+    fn step(&mut self, message: &str) {
+        // A progress line failing to write must not abort a migration.
+        let _ = writeln!(self.err, "loti: {message}");
+    }
+}
+
+/// Bring an older on-disk store up to the version this binary writes, or resume
+/// an interrupted migration. Runs without upward version gating on the store
+/// itself: a mid-migration store is exactly what this command is here to finish.
+fn run_migrate_store<O: Write, E: Write>(
+    cli: &Cli,
+    args: &MigrateStoreArgs,
+    out: &mut O,
+    err: &mut E,
+) -> Result<()> {
+    let start = std::env::current_dir().context("determining the current directory")?;
+    let discovered = loti_core::discovery::resolve(&start, cli.root.as_deref())?;
+    if let Some(d) = &discovered.disagreement {
+        writeln!(
+            err,
+            "loti: warning: a config file names {} but a marker directory implies {}; \
+             using the config file",
+            d.config_root.display(),
+            d.marker_root.display()
+        )?;
+    }
+    let root = discovered.root;
+
+    // No concrete cross-major transforms exist yet, so the registry is empty;
+    // the machinery (sentinel/drain/snapshot/swap/commit) and the minor-bump
+    // and no-op paths are all live. A future breaking change registers its
+    // per-major transform here.
+    let registry = loti_core::migrate::TransformRegistry::new();
+    let config = loti_core::migrate::MigrateConfig {
+        force: if args.force {
+            loti_core::migrate::Force::Force
+        } else {
+            loti_core::migrate::Force::Deny
+        },
+        ..Default::default()
+    };
+
+    let outcome = {
+        let mut progress = WriterProgress { err };
+        loti_core::migrate::migrate_store(&root, &registry, &config, &mut progress)?
+    };
+
+    match outcome {
+        loti_core::migrate::Outcome::AlreadyCurrent => {
+            writeln!(out, "loti: the store is already at this loti's format")?;
+        }
+        loti_core::migrate::Outcome::MinorBumped { from, to } => {
+            writeln!(
+                out,
+                "loti: updated the store's format version from {}.{} to {}.{} (no rewrite needed)",
+                from.0, from.1, to.0, to.1
+            )?;
+        }
+        loti_core::migrate::Outcome::Migrated { from, to, steps } => {
+            writeln!(
+                out,
+                "loti: migrated the store from format {}.{} to {}.{} ({} step(s)); \
+                 the pre-migration copy was kept alongside it",
+                from.0, from.1, to.0, to.1, steps
+            )?;
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // root resolution
 // ---------------------------------------------------------------------------
 
-/// Resolve the data root for a mutating command: an explicit `--root` wins,
-/// otherwise discovery walks upward from the current directory. A marker/config
+/// Resolve the data root for a command: an explicit `--root` wins, otherwise
+/// discovery walks upward from the current directory. A marker/config
 /// disagreement is surfaced as a warning but does not fail the command.
+///
+/// Every command refuses up front a store whose major format is newer than this
+/// binary understands — such a store is never read-guessed nor written. An older
+/// major and a mid-migration store still open (they are readable); only their
+/// mutations are refused later, by the store's mutation gate.
 fn open_store<E: Write>(cli: &Cli, err: &mut E) -> Result<Store> {
     let start = std::env::current_dir().context("determining the current directory")?;
     let discovered = loti_core::discovery::resolve(&start, cli.root.as_deref())?;
@@ -133,7 +213,9 @@ fn open_store<E: Write>(cli: &Cli, err: &mut E) -> Result<Store> {
             d.marker_root.display()
         )?;
     }
-    Ok(Store::at(discovered.root))
+    let store = Store::at(discovered.root);
+    store.verify_readable().map_err(|e| anyhow!("{e}"))?;
+    Ok(store)
 }
 
 // ---------------------------------------------------------------------------

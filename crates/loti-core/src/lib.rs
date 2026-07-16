@@ -19,6 +19,7 @@ pub mod frontmatter;
 pub mod lock;
 pub mod matcher;
 pub mod meta;
+pub mod migrate;
 pub mod model;
 pub mod ops;
 pub mod read;

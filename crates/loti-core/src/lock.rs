@@ -351,14 +351,76 @@ pub fn acquire(target: &Path, config: &LockConfig, force: Force) -> Result<TempL
 ///
 /// The gate is consulted while the lock is held and before the target is read,
 /// so a store cannot be migrated out from under an in-flight edit. It refuses a
-/// store whose major version is newer than this binary understands.
-///
-/// The in-progress-migration marker is a deliberate seam: when migration lands
-/// it plugs in here (a matching-major binary must also refuse while the marker
-/// is set). Until then the gate enforces only the major-version rule.
+/// store whose major version is newer than this binary understands, a store
+/// whose major is older (read-only until migrated), and a store carrying the
+/// mid-migration sentinel (read-only for everyone but the migrator).
 pub trait VersionGate {
     /// Return `Ok(())` if mutation may proceed, or a reason to refuse.
     fn verify(&self) -> Result<(), VersionRefusal>;
+}
+
+/// The version a store records, as the gate sees it: a settled `(major, minor)`
+/// or a mid-migration sentinel toward `(major, minor)`. Mirrors the metadata
+/// layer's own reading so the gate never has to know the on-disk encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservedVersion {
+    /// A settled store at this `(major, minor)`.
+    Clean(u32, u32),
+    /// A store mid-migration toward this `(major, minor)`: read-only for
+    /// everyone but the migrator.
+    Migrating(u32, u32),
+}
+
+/// Apply the full mismatch matrix to an observed store version against this
+/// binary's version. Shared by both the mutation gate and the read-time check
+/// so the two can never drift:
+///   * a mid-migration sentinel refuses mutation for everyone but the migrator;
+///   * a store major newer than the binary is refused outright;
+///   * a store major older than the binary is read-only until migrated;
+///   * within a major, minor differences are compatible either direction.
+fn classify_mutation(
+    observed: Option<ObservedVersion>,
+    binary_major: u32,
+) -> Result<(), VersionRefusal> {
+    let (store_major, migrating) = match observed {
+        Some(ObservedVersion::Clean(major, _)) => (major, false),
+        Some(ObservedVersion::Migrating(major, _)) => (major, true),
+        None => return Err(VersionRefusal::Unreadable),
+    };
+    if migrating {
+        // The sentinel doubles as a dirty-marker: any binary that sees it,
+        // including a matching-major one, treats the store as read-only until
+        // the migration commits or is re-run.
+        return Err(VersionRefusal::MigrationInProgress);
+    }
+    if store_major > binary_major {
+        Err(VersionRefusal::StoreTooNew)
+    } else if store_major < binary_major {
+        Err(VersionRefusal::NeedsMigration)
+    } else {
+        Ok(())
+    }
+}
+
+/// The subset of the matrix that gates *reads*. Reads are otherwise lock-free,
+/// but a store whose major is newer than this binary must never be read (the
+/// binary cannot be trusted to interpret it). An older major and a
+/// mid-migration sentinel are both still readable — only mutation is refused
+/// for those — so this returns `Ok` for them.
+pub fn classify_read(
+    observed: Option<ObservedVersion>,
+    binary_major: u32,
+) -> Result<(), VersionRefusal> {
+    match observed {
+        // A newer major is never safe to read.
+        Some(ObservedVersion::Clean(major, _)) | Some(ObservedVersion::Migrating(major, _))
+            if major > binary_major =>
+        {
+            Err(VersionRefusal::StoreTooNew)
+        }
+        None => Err(VersionRefusal::Unreadable),
+        _ => Ok(()),
+    }
 }
 
 /// Why a mutation was refused by the version gate.
@@ -397,15 +459,29 @@ where
     F: Fn() -> Option<(u32, u32)>,
 {
     fn verify(&self) -> Result<(), VersionRefusal> {
-        let (store_major, _store_minor) = (self.read_store)().ok_or(VersionRefusal::Unreadable)?;
-        let (binary_major, _binary_minor) = self.binary;
-        if store_major > binary_major {
-            Err(VersionRefusal::StoreTooNew)
-        } else if store_major < binary_major {
-            Err(VersionRefusal::NeedsMigration)
-        } else {
-            Ok(())
-        }
+        let observed =
+            (self.read_store)().map(|(major, minor)| ObservedVersion::Clean(major, minor));
+        classify_mutation(observed, self.binary.0)
+    }
+}
+
+/// The full sentinel-aware mutation gate. Reads the store's observed version
+/// (settled or mid-migration) via the supplied closure and applies the whole
+/// mismatch matrix, including refusing mutation while the migration sentinel is
+/// set. This is the gate every real store mutation is bracketed by.
+pub struct StoreVersionGate<F> {
+    /// This binary's `(major, minor)`.
+    pub binary: (u32, u32),
+    /// Reads the store's observed version, or `None` when it is unreadable.
+    pub read_store: F,
+}
+
+impl<F> VersionGate for StoreVersionGate<F>
+where
+    F: Fn() -> Option<ObservedVersion>,
+{
+    fn verify(&self) -> Result<(), VersionRefusal> {
+        classify_mutation((self.read_store)(), self.binary.0)
     }
 }
 
@@ -845,6 +921,70 @@ mod tests {
             read_store: || None,
         };
         assert_eq!(unreadable.verify(), Err(VersionRefusal::Unreadable));
+    }
+
+    #[test]
+    fn store_version_gate_covers_the_full_matrix_including_sentinel() {
+        // Newer major: refuse outright.
+        let newer = StoreVersionGate {
+            binary: (1, 0),
+            read_store: || Some(ObservedVersion::Clean(2, 0)),
+        };
+        assert_eq!(newer.verify(), Err(VersionRefusal::StoreTooNew));
+
+        // Older major: read-only until migrated.
+        let older = StoreVersionGate {
+            binary: (2, 0),
+            read_store: || Some(ObservedVersion::Clean(1, 5)),
+        };
+        assert_eq!(older.verify(), Err(VersionRefusal::NeedsMigration));
+
+        // Equal and minor-diff within a major: compatible.
+        let equal = StoreVersionGate {
+            binary: (1, 3),
+            read_store: || Some(ObservedVersion::Clean(1, 3)),
+        };
+        assert_eq!(equal.verify(), Ok(()));
+        let minor = StoreVersionGate {
+            binary: (1, 3),
+            read_store: || Some(ObservedVersion::Clean(1, 1)),
+        };
+        assert_eq!(minor.verify(), Ok(()));
+
+        // A mid-migration sentinel refuses mutation even for a matching major.
+        let migrating = StoreVersionGate {
+            binary: (1, 3),
+            read_store: || Some(ObservedVersion::Migrating(1, 3)),
+        };
+        assert_eq!(migrating.verify(), Err(VersionRefusal::MigrationInProgress));
+
+        let unreadable = StoreVersionGate {
+            binary: (1, 0),
+            read_store: || None,
+        };
+        assert_eq!(unreadable.verify(), Err(VersionRefusal::Unreadable));
+    }
+
+    #[test]
+    fn read_classification_only_refuses_a_newer_major() {
+        // Newer major is never safe to read.
+        assert_eq!(
+            classify_read(Some(ObservedVersion::Clean(2, 0)), 1),
+            Err(VersionRefusal::StoreTooNew)
+        );
+        assert_eq!(
+            classify_read(Some(ObservedVersion::Migrating(2, 0)), 1),
+            Err(VersionRefusal::StoreTooNew)
+        );
+        // Older major, equal, and a same-or-older mid-migration store all read.
+        assert_eq!(classify_read(Some(ObservedVersion::Clean(1, 0)), 2), Ok(()));
+        assert_eq!(classify_read(Some(ObservedVersion::Clean(1, 0)), 1), Ok(()));
+        assert_eq!(
+            classify_read(Some(ObservedVersion::Migrating(1, 0)), 1),
+            Ok(())
+        );
+        // Unreadable is refused.
+        assert_eq!(classify_read(None, 1), Err(VersionRefusal::Unreadable));
     }
 
     #[test]

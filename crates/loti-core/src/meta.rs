@@ -54,6 +54,52 @@ pub enum MetaError {
     Encode(#[from] toml::ser::Error),
 }
 
+/// The suffix that marks a version string as a mid-migration sentinel. A store
+/// whose recorded version carries this suffix is being migrated (or a migration
+/// died holding it): it is read-only for every binary except the migrator, and
+/// the suffix doubles as a crash dirty-marker until the migration commits.
+const SENTINEL_SUFFIX: &str = "-migrate";
+
+/// The version a store records, as understood by the version rules.
+///
+/// A store either records a clean `major.minor` it is settled at, or a
+/// `major.minor-migrate` sentinel meaning a migration to that version is in
+/// flight. The sentinel is written first and cleared last, so observing it
+/// always means "not settled" — either live or crashed mid-migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreVersion {
+    /// A settled store at this `(major, minor)`.
+    Clean {
+        /// Major component.
+        major: u32,
+        /// Minor component.
+        minor: u32,
+    },
+    /// A store mid-migration toward this `(major, minor)` (the sentinel).
+    Migrating {
+        /// Target major once the migration commits.
+        major: u32,
+        /// Target minor once the migration commits.
+        minor: u32,
+    },
+}
+
+impl StoreVersion {
+    /// The target `(major, minor)` regardless of settled/migrating state.
+    pub fn version(self) -> (u32, u32) {
+        match self {
+            StoreVersion::Clean { major, minor } | StoreVersion::Migrating { major, minor } => {
+                (major, minor)
+            }
+        }
+    }
+
+    /// Whether this is the mid-migration sentinel (also the crash dirty-marker).
+    pub fn is_migrating(self) -> bool {
+        matches!(self, StoreVersion::Migrating { .. })
+    }
+}
+
 impl Meta {
     /// Metadata carrying the version this binary writes for a fresh store.
     pub fn current() -> Self {
@@ -63,11 +109,52 @@ impl Meta {
         }
     }
 
+    /// Metadata carrying a settled `major.minor` version.
+    pub fn clean(major: u32, minor: u32) -> Self {
+        Self {
+            format_version: format!("{major}.{minor}"),
+        }
+    }
+
+    /// Metadata carrying the mid-migration sentinel for target `major.minor`.
+    /// Written as the first step of a migration and cleared last; its presence
+    /// is the dirty-marker that keeps the store read-only until the migration
+    /// commits.
+    pub fn migrating(major: u32, minor: u32) -> Self {
+        Self {
+            format_version: format!("{major}.{minor}{SENTINEL_SUFFIX}"),
+        }
+    }
+
     /// Parse `"major.minor"` into its numeric parts, ignoring surrounding
-    /// whitespace. Returns `None` when the shape is not two dotted integers.
+    /// whitespace. Returns `None` when the shape is not two dotted integers, or
+    /// when the string is the mid-migration sentinel (use [`Meta::store_version`]
+    /// to distinguish the two).
     pub fn parsed_version(&self) -> Option<(u32, u32)> {
-        let (major, minor) = self.format_version.trim().split_once('.')?;
-        Some((major.parse().ok()?, minor.parse().ok()?))
+        match self.store_version()? {
+            StoreVersion::Clean { major, minor } => Some((major, minor)),
+            StoreVersion::Migrating { .. } => None,
+        }
+    }
+
+    /// Parse the recorded version into a [`StoreVersion`], distinguishing a
+    /// settled store from one carrying the mid-migration sentinel. Returns
+    /// `None` when the string is neither a clean `major.minor` nor a
+    /// `major.minor-migrate` sentinel.
+    pub fn store_version(&self) -> Option<StoreVersion> {
+        let raw = self.format_version.trim();
+        let (core, migrating) = match raw.strip_suffix(SENTINEL_SUFFIX) {
+            Some(core) => (core, true),
+            None => (raw, false),
+        };
+        let (major, minor) = core.split_once('.')?;
+        let major = major.parse().ok()?;
+        let minor = minor.parse().ok()?;
+        Some(if migrating {
+            StoreVersion::Migrating { major, minor }
+        } else {
+            StoreVersion::Clean { major, minor }
+        })
     }
 }
 
@@ -137,5 +224,40 @@ mod tests {
     fn read_missing_meta_is_an_io_error() {
         let dir = tempfile::tempdir().unwrap();
         assert!(matches!(read(dir.path()), Err(MetaError::Io { .. })));
+    }
+
+    #[test]
+    fn clean_version_parses_as_clean() {
+        let m = Meta::clean(1, 4);
+        assert_eq!(
+            m.store_version(),
+            Some(StoreVersion::Clean { major: 1, minor: 4 })
+        );
+        assert!(!m.store_version().unwrap().is_migrating());
+        assert_eq!(m.parsed_version(), Some((1, 4)));
+    }
+
+    #[test]
+    fn sentinel_version_parses_as_migrating_and_hides_from_parsed_version() {
+        let m = Meta::migrating(2, 0);
+        assert_eq!(m.format_version, "2.0-migrate");
+        assert_eq!(
+            m.store_version(),
+            Some(StoreVersion::Migrating { major: 2, minor: 0 })
+        );
+        assert!(m.store_version().unwrap().is_migrating());
+        assert_eq!(m.store_version().unwrap().version(), (2, 0));
+        // parsed_version deliberately refuses the sentinel so callers using the
+        // plain numeric path cannot mistake a mid-migration store for settled.
+        assert_eq!(m.parsed_version(), None);
+    }
+
+    #[test]
+    fn garbage_version_parses_as_none_both_ways() {
+        let m = Meta {
+            format_version: "garbage-migrate".into(),
+        };
+        assert_eq!(m.store_version(), None);
+        assert_eq!(m.parsed_version(), None);
     }
 }
