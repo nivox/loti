@@ -7,11 +7,13 @@
 //!
 //! It currently pins the store format version and the domain vocabulary, plus
 //! the on-disk storage layer (layout, frontmatter/body split, tolerant
-//! round-trip, store metadata, root discovery). The concurrency primitive,
-//! number allocation, and migration are layered on later.
+//! round-trip, store metadata, root discovery) and the concurrency primitive
+//! (atomic writes bracketed by a deterministic temp-file lock). Number
+//! allocation and migration are layered on later.
 
 pub mod discovery;
 pub mod frontmatter;
+pub mod lock;
 pub mod meta;
 pub mod model;
 pub mod store;

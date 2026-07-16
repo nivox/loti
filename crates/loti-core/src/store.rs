@@ -11,18 +11,25 @@
 //! Attachments live in lazily-created companion directories beside their file:
 //! `<epic-id>/epic/` for the epic and `<epic-id>/<n>/` for a node.
 //!
-//! This module provides a plain read/write seam. It does not take the
-//! same-directory temp-file lock or perform the atomic rename that guards
-//! concurrent edits: those bracket every mutation and are layered on top here.
-//! Number allocation is likewise performed elsewhere.
+//! Every mutation here routes through the atomic write + temp-file advisory
+//! lock primitive: a write stages a same-directory temp file and atomically
+//! renames it over the target, and the temp file's exclusive existence is the
+//! lock bracketing the whole read-modify-write. Reads stay lock-free — a
+//! single-file read is atomic old-or-new by virtue of that rename, and
+//! multi-file aggregates are explicitly not a consistent global snapshot.
+//! Number allocation is performed elsewhere.
 
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
 use crate::discovery::CONFIG_FILE;
+use crate::lock::{
+    self, Force, LockConfig, LockError, MajorVersionGate, VersionGate, VersionRefusal,
+};
 use crate::meta::{self, Meta, MARKER_DIR};
 use crate::model::{EpicFile, ModelError, NodeFile};
+use crate::FORMAT_VERSION;
 
 /// The epic file name within an epic directory.
 pub const EPIC_FILE: &str = "epic.md";
@@ -34,6 +41,9 @@ pub const EPIC_ASSET_DIR: &str = "epic";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Store {
     root: PathBuf,
+    /// Tunables for the temp-file lock's acquire loop; defaults follow the
+    /// recommended liveness threshold and retry interval.
+    lock_config: LockConfig,
 }
 
 /// Failure to read or write through the store.
@@ -56,18 +66,57 @@ pub enum StoreError {
         /// The existing marker directory.
         path: PathBuf,
     },
+    /// The temp-file lock could not be taken, or the atomic write failed.
+    #[error(transparent)]
+    Lock(#[from] LockError),
+    /// The store's format version refuses this mutation.
+    #[error(transparent)]
+    Version(#[from] VersionRefusal),
 }
 
 impl Store {
     /// Open a store at an already-resolved data root. The root is taken as-is;
-    /// discovery and version gating happen before this.
+    /// discovery happens before this. Mutations are gated on the store version
+    /// read from its metadata.
     pub fn at(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            lock_config: LockConfig::default(),
+        }
+    }
+
+    /// Override the lock tunables (for tests or specialised callers). The
+    /// acquire-loop invariant (retry interval below the stale threshold) is
+    /// the caller's to uphold.
+    pub fn with_lock_config(mut self, config: LockConfig) -> Self {
+        self.lock_config = config;
+        self
     }
 
     /// The data-root directory.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// A version gate bound to this store: it reads the store's metadata
+    /// version and refuses a store whose major is newer than this binary, so a
+    /// mutation cannot silently write a store it does not understand.
+    ///
+    /// A store with no metadata file is treated as current (permitted): it is a
+    /// bare directory being populated, not a versioned store to gate against.
+    /// Metadata that exists but cannot be parsed reads as unversioned and is
+    /// refused by the gate.
+    fn version_gate(&self) -> MajorVersionGate<impl Fn() -> Option<(u32, u32)> + '_> {
+        MajorVersionGate {
+            binary: FORMAT_VERSION,
+            read_store: move || match meta::read(&self.root) {
+                Ok(m) => m.parsed_version(),
+                // No metadata yet: nothing to gate against, treat as current.
+                Err(meta::MetaError::Io { .. }) => Some(FORMAT_VERSION),
+                // Metadata present but unreadable: refuse via the gate.
+                Err(_) => None,
+            },
+        }
     }
 
     /// The directory holding one epic and its nodes.
@@ -109,33 +158,69 @@ impl Store {
         Ok(NodeFile::parse(&text)?)
     }
 
-    /// Render and write an epic file, creating its directory if needed.
-    ///
-    /// This is a plain write. Callers that must guard against concurrent edits
-    /// wrap it with the temp-file lock and atomic rename layered on top.
+    /// Render and write an epic file atomically, creating its directory if
+    /// needed. The write stages a temp file and renames it over the target
+    /// under the advisory lock; a stale lock fails fast.
     pub fn write_epic(&self, epic_id: &str, epic: &EpicFile) -> Result<(), StoreError> {
+        self.write_epic_forced(epic_id, epic, Force::Deny)
+    }
+
+    /// As [`Store::write_epic`], but a stale lock from an interrupted operation
+    /// is cleared and the write proceeds (the `--force` path).
+    pub fn write_epic_forced(
+        &self,
+        epic_id: &str,
+        epic: &EpicFile,
+        force: Force,
+    ) -> Result<(), StoreError> {
         let dir = self.epic_dir(epic_id);
         create_dir_all(&dir)?;
         let path = self.epic_path(epic_id);
-        write_string(&path, &epic.to_text()?)
+        self.atomic_write(&path, epic.to_text()?.as_bytes(), force)
     }
 
-    /// Render and write a node file, creating its epic directory if needed.
+    /// Render and write a node file atomically, creating its epic directory if
+    /// needed.
     pub fn write_node(
         &self,
         epic_id: &str,
         number: u64,
         node: &NodeFile,
     ) -> Result<(), StoreError> {
+        self.write_node_forced(epic_id, number, node, Force::Deny)
+    }
+
+    /// As [`Store::write_node`], but clears a stale lock (the `--force` path).
+    pub fn write_node_forced(
+        &self,
+        epic_id: &str,
+        number: u64,
+        node: &NodeFile,
+        force: Force,
+    ) -> Result<(), StoreError> {
         let dir = self.epic_dir(epic_id);
         create_dir_all(&dir)?;
         let path = self.node_path(epic_id, number);
-        write_string(&path, &node.to_text()?)
+        self.atomic_write(&path, node.to_text()?.as_bytes(), force)
+    }
+
+    /// Atomically write bytes to a store file under the advisory lock and the
+    /// store's version gate. The single shared path every file mutation routes
+    /// through, so the lock discipline cannot be sidestepped.
+    fn atomic_write(&self, path: &Path, bytes: &[u8], force: Force) -> Result<(), StoreError> {
+        let gate = self.version_gate();
+        let lock = lock::acquire(path, &self.lock_config, force)?;
+        // Verify-after-lock: the store version is checked while the lock is
+        // held, before publishing, so a store cannot change format underneath.
+        gate.verify()?;
+        lock.commit(bytes)?;
+        Ok(())
     }
 
     /// Copy an asset's bytes into the epic's companion directory verbatim,
     /// creating the directory lazily. Returns the written path. Index upkeep is
-    /// the caller's; this only lands the bytes.
+    /// the caller's; this only lands the bytes. The copy is atomic (temp file
+    /// then rename) under the advisory lock.
     pub fn copy_epic_asset(
         &self,
         epic_id: &str,
@@ -145,11 +230,12 @@ impl Store {
         let dir = self.epic_asset_dir(epic_id);
         create_dir_all(&dir)?;
         let path = dir.join(name);
-        write_bytes(&path, bytes)?;
+        self.atomic_write(&path, bytes, Force::Deny)?;
         Ok(path)
     }
 
-    /// Copy an asset's bytes into a node's companion directory verbatim.
+    /// Copy an asset's bytes into a node's companion directory verbatim, landed
+    /// atomically under the advisory lock.
     pub fn copy_node_asset(
         &self,
         epic_id: &str,
@@ -160,7 +246,7 @@ impl Store {
         let dir = self.node_asset_dir(epic_id, number);
         create_dir_all(&dir)?;
         let path = dir.join(name);
-        write_bytes(&path, bytes)?;
+        self.atomic_write(&path, bytes, Force::Deny)?;
         Ok(path)
     }
 
@@ -283,13 +369,6 @@ fn read_to_string(path: &Path) -> Result<String, StoreError> {
 
 fn write_string(path: &Path, text: &str) -> Result<(), StoreError> {
     std::fs::write(path, text).map_err(|source| StoreError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
-    std::fs::write(path, bytes).map_err(|source| StoreError::Io {
         path: path.to_path_buf(),
         source,
     })
