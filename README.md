@@ -1,5 +1,7 @@
 # loti
 
+[![CI](https://github.com/nivox/loti/actions/workflows/ci.yml/badge.svg)](https://github.com/nivox/loti/actions/workflows/ci.yml)
+
 **loti** (LOcal TIckets) — a local, markdown-backed ticket tracker driven
 entirely through the `loti` CLI.
 

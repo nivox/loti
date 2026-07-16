@@ -1,0 +1,55 @@
+name: CI
+
+# Compile + test (plus lint/format gates) on every push and pull request.
+# The toolchain comes from the flake dev shell, so CI uses the exact same
+# pinned Rust as local development.
+#
+# Two caches keep runs fast:
+#   * the Nix store (toolchain + flake inputs) via GitHub's Actions cache;
+#   * the Cargo registry and build `target/`.
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Nix (flakes enabled)
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Cache the Nix store
+        uses: nix-community/cache-nix-action@v7
+        with:
+          # Toolchain/inputs only change when these files change.
+          primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'flake.nix', 'rust-toolchain.toml') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Cache Cargo registry and target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build, test, lint (flake dev shell)
+        run: |
+          nix develop --command bash -euo pipefail -c '
+            cargo build --workspace --locked
+            cargo test  --workspace --locked
+            cargo clippy --all-targets --locked -- -D warnings
+            cargo fmt --check
+          '

@@ -1,0 +1,88 @@
+name: Release
+
+# Build a release binary for every supported platform and attach it to the
+# GitHub release. Linux targets are single static (musl) binaries; the macOS
+# target is the native arm64 build (there is no fully-static macOS binary).
+#
+# Each platform is built natively on a matching-arch runner via the flake dev
+# shell — no cross toolchain — so the binary is exactly what the flake produces
+# locally. The Nix store and Cargo caches (keyed per platform + target) keep
+# repeat builds fast.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-14
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Nix (flakes enabled)
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Cache the Nix store
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'flake.nix', 'rust-toolchain.toml') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Cache Cargo registry and target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-release-${{ matrix.target }}-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
+          restore-keys: |
+            cargo-release-${{ matrix.target }}-
+
+      - name: Build release binary (flake dev shell)
+        run: |
+          nix develop --command bash -euo pipefail -c '
+            cargo build --release --locked --target ${{ matrix.target }}
+          '
+
+      - name: Package
+        run: |
+          dist="loti-${{ matrix.target }}"
+          install -Dm755 "target/${{ matrix.target }}/release/loti" "$dist/loti"
+          tar -czf "$dist.tar.gz" "$dist"
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$dist.tar.gz" > "$dist.tar.gz.sha256"
+          else
+            shasum -a 256 "$dist.tar.gz" > "$dist.tar.gz.sha256"
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: loti-${{ matrix.target }}
+          path: |
+            loti-${{ matrix.target }}.tar.gz
+            loti-${{ matrix.target }}.tar.gz.sha256
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            loti-${{ matrix.target }}.tar.gz
+            loti-${{ matrix.target }}.tar.gz.sha256
