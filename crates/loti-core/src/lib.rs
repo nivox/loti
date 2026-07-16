@@ -14,8 +14,10 @@
 
 pub mod discovery;
 pub mod domain;
+pub mod filter;
 pub mod frontmatter;
 pub mod lock;
+pub mod matcher;
 pub mod meta;
 pub mod model;
 pub mod ops;

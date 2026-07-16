@@ -8,9 +8,13 @@
 //! richer filter families (label/state/match) are a separate layer that will
 //! narrow the set this module resolves before it is rendered.
 
+use std::path::PathBuf;
+
 use serde_json::Value;
 
 use crate::domain::{epic_state, NodeRef, NodeStatus};
+use crate::filter::{RegexMatcher, StructuredFilters};
+use crate::matcher::{self, MatchWarning, MatcherError, MatcherRegistry, ResolvedMatcher};
 use crate::ops::{descendants_of, list_comments, load_epic_nodes, CommentView, OpError, Target};
 use crate::render::{BlockedTag, ChildRow, CommentLine, ListEpic, ListNode};
 use crate::store::{Store, EPIC_FILE};
@@ -136,6 +140,170 @@ pub fn list_nodes(store: &Store, scope: &ListScope) -> Result<Vec<ListNode>, OpE
     let mut rows: Vec<ListNode> = selected.iter().map(|n| list_node(&epic_id, n)).collect();
     rows.sort_by_key(|n| n.number);
     Ok(rows)
+}
+
+/// A request to run the match family over the structured-filter survivors: the
+/// query and which implementation to use (the built-in regex or a configured
+/// external matcher).
+#[derive(Debug, Clone)]
+pub struct MatchRequest {
+    /// The query passed to the matcher.
+    pub query: String,
+    /// The `--match-impl` name; the reserved built-in name selects the regex
+    /// matcher, any other name a configured external one.
+    pub impl_name: String,
+}
+
+/// Failure to run a filtered `list`. Wraps the structured layer's errors and the
+/// match layer's errors (matcher resolution, external process, invalid regex).
+#[derive(Debug, thiserror::Error)]
+pub enum FilteredListError {
+    /// A store or projection error while resolving the candidate set.
+    #[error(transparent)]
+    Op(#[from] OpError),
+    /// A match-implementation resolution or execution failure.
+    #[error(transparent)]
+    Matcher(#[from] MatcherError),
+    /// The built-in regex query was not a valid pattern.
+    #[error("{0}")]
+    Regex(String),
+}
+
+/// The result of a filtered `list`: the surviving rows plus any non-fatal
+/// warnings the match layer raised (paths outside the candidate set, etc.) so
+/// the caller can surface them without failing the run.
+#[derive(Debug, Clone)]
+pub struct FilteredList {
+    /// The surviving rows, ordered by node number (the flat result the tree
+    /// renderer reconstructs hierarchy from).
+    pub nodes: Vec<ListNode>,
+    /// Non-fatal warnings from the match family.
+    pub warnings: Vec<MatchWarning>,
+}
+
+/// Resolve a `list` scope, then narrow it by the structured filters (label and
+/// state), then — if requested — by the match family, combining every family
+/// with AND. The structured predicate runs first over the whole scoped set; the
+/// match family runs only over those survivors.
+///
+/// The result is flat and ordered by node number regardless of match order; the
+/// match implementation's own ordering matters only for which nodes it selects,
+/// not the final presentation, which the renderer owns.
+pub fn list_nodes_filtered(
+    store: &Store,
+    scope: &ListScope,
+    filters: &StructuredFilters,
+    matching: Option<&MatchRequest>,
+    matchers: &MatcherRegistry,
+) -> Result<FilteredList, FilteredListError> {
+    // Scope → candidate set (each node with its on-disk path, needed to hand
+    // whole files to an external matcher).
+    let candidates = resolve_candidates(store, scope)?;
+
+    // Structured families (label + state) evaluate first, as pure predicates.
+    let survivors: Vec<(NodeFile, PathBuf)> = candidates
+        .into_iter()
+        .filter(|(node, _)| filters.matches(node))
+        .collect();
+
+    // Match family (if requested) runs over the structured survivors only.
+    let (final_nodes, warnings): (Vec<NodeFile>, Vec<MatchWarning>) = match matching {
+        None => (survivors.into_iter().map(|(n, _)| n).collect(), Vec::new()),
+        Some(request) => apply_match(store, matchers, request, survivors)?,
+    };
+
+    let epic_id = scope_epic_id(scope);
+    let mut rows: Vec<ListNode> = final_nodes.iter().map(|n| list_node(&epic_id, n)).collect();
+    rows.sort_by_key(|n| n.number);
+    Ok(FilteredList {
+        nodes: rows,
+        warnings,
+    })
+}
+
+/// The epic id a scope resolves within.
+fn scope_epic_id(scope: &ListScope) -> String {
+    match scope {
+        ListScope::Epic(id) => id.clone(),
+        ListScope::Under { node, .. } => node.epic_id.clone(),
+    }
+}
+
+/// Resolve a scope to the candidate set: each selected node paired with its
+/// on-disk file path. This is the same selection [`list_nodes`] renders, but it
+/// carries the paths the external matcher protocol needs.
+fn resolve_candidates(
+    store: &Store,
+    scope: &ListScope,
+) -> Result<Vec<(NodeFile, PathBuf)>, OpError> {
+    let (epic_id, selected): (String, Vec<NodeFile>) = match scope {
+        ListScope::Epic(id) => (id.clone(), load_epic_nodes(store, id)?),
+        ListScope::Under { node, recursive } => {
+            read_node(store, node)?;
+            let all = load_epic_nodes(store, &node.epic_id)?;
+            let selected = if *recursive {
+                let sub: std::collections::HashSet<u64> = descendants_of(store, node)?
+                    .into_iter()
+                    .map(|s| s.number)
+                    .collect();
+                all.into_iter()
+                    .filter(|n| sub.contains(&n.frontmatter.number))
+                    .collect()
+            } else {
+                all.into_iter()
+                    .filter(|n| n.frontmatter.parent == Some(node.number))
+                    .collect()
+            };
+            (node.epic_id.clone(), selected)
+        }
+    };
+    Ok(selected
+        .into_iter()
+        .map(|n| {
+            let path = store.node_path(&epic_id, n.frontmatter.number);
+            (n, path)
+        })
+        .collect())
+}
+
+/// Apply the match family to the structured survivors: the built-in regex tests
+/// name+summary+body in-process; an external matcher receives the whole node
+/// files as candidate paths and returns the matching subset. Either way the
+/// result is the AND of match with the earlier families.
+#[allow(clippy::type_complexity)]
+fn apply_match(
+    store: &Store,
+    matchers: &MatcherRegistry,
+    request: &MatchRequest,
+    survivors: Vec<(NodeFile, PathBuf)>,
+) -> Result<(Vec<NodeFile>, Vec<MatchWarning>), FilteredListError> {
+    match matchers.resolve(&request.impl_name)? {
+        ResolvedMatcher::Builtin => {
+            let matcher = RegexMatcher::compile(&request.query)
+                .map_err(|e| FilteredListError::Regex(e.to_string()))?;
+            let kept = survivors
+                .into_iter()
+                .filter(|(node, _)| matcher.matches(node))
+                .map(|(n, _)| n)
+                .collect();
+            Ok((kept, Vec::new()))
+        }
+        ResolvedMatcher::External { name, config } => {
+            let candidate_paths: Vec<PathBuf> = survivors.iter().map(|(_, p)| p.clone()).collect();
+            let outcome = matcher::run_external(&name, config, &request.query, &candidate_paths)?;
+            // Map the matched paths back to their nodes; a path the matcher
+            // returned that maps to a survivor is kept.
+            let by_path: std::collections::HashMap<PathBuf, NodeFile> =
+                survivors.into_iter().map(|(n, p)| (p, n)).collect();
+            let _ = store; // paths already resolved; store not needed further.
+            let kept = outcome
+                .matched
+                .into_iter()
+                .filter_map(|p| by_path.get(&p).cloned())
+                .collect();
+            Ok((kept, outcome.warnings))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

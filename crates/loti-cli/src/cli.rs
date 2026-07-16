@@ -284,12 +284,55 @@ pub struct TicketListArgs {
     /// Recurse into the subtree (scope only).
     #[arg(long)]
     pub recursive: bool,
+    #[command(flatten)]
+    pub filters: ListFilterArgs,
     /// Restrict output to these summary fields (dotted leaf paths). Heavy
     /// fields (body/comments/assets/subtickets) are show-only and rejected here.
     #[command(flatten)]
     pub fields: FieldSel,
     #[command(flatten)]
     pub format: ListFormat,
+}
+
+/// The label/state/match filter families for `ticket list`. Families combine
+/// with AND. Structured families (label, state) are evaluated first; `--match`
+/// runs over the survivors.
+#[derive(Debug, Args)]
+pub struct ListFilterArgs {
+    /// Keep nodes carrying this label. Repeat for AND; comma within one flag is
+    /// an OR-group (`--label a --label b,c` keeps `a AND (b OR c)`).
+    #[arg(long, value_name = "L[,L]")]
+    pub label: Vec<String>,
+    /// Drop nodes carrying any of these labels ("has none of"); comma and repeat
+    /// both union.
+    #[arg(long, value_name = "L[,L]")]
+    pub not_label: Vec<String>,
+    /// Keep nodes in one of these states; comma is OR. Give once — states are
+    /// mutually exclusive, so several go in one comma-separated flag.
+    #[arg(
+        long,
+        value_name = "STATE[,STATE]",
+        conflicts_with_all = ["open", "resolved"]
+    )]
+    pub state: Vec<String>,
+    /// Drop nodes in any of these states; comma and repeat union.
+    #[arg(long, value_name = "STATE[,STATE]")]
+    pub not_state: Vec<String>,
+    /// Shorthand for the non-terminal states (to-do, in-progress, blocked).
+    #[arg(long, conflicts_with_all = ["resolved", "state"])]
+    pub open: bool,
+    /// Shorthand for the terminal states (done, closed).
+    #[arg(long, conflicts_with_all = ["open", "state"])]
+    pub resolved: bool,
+    /// Keep nodes the matcher selects. The built-in `regex` matcher (default)
+    /// tests name, summary and body; an external matcher is chosen with
+    /// `--match-impl`.
+    #[arg(long = "match", value_name = "QUERY")]
+    pub match_query: Option<String>,
+    /// The match implementation to use. Defaults to the built-in `regex`;
+    /// other names must be configured. Only meaningful with `--match`.
+    #[arg(long, value_name = "IMPL", requires = "match_query")]
+    pub match_impl: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -594,5 +637,70 @@ mod tests {
             "x",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn list_accepts_the_filter_families() {
+        // Repeated --label (AND) with a comma OR-group, exclusions, a state set
+        // and a match all parse together.
+        assert!(Cli::try_parse_from([
+            "loti",
+            "ticket",
+            "list",
+            "e",
+            "--label",
+            "a",
+            "--label",
+            "b,c",
+            "--not-label",
+            "x",
+            "--state",
+            "to-do,blocked",
+            "--match",
+            "needle",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn list_state_aggregators_conflict_at_parse_time() {
+        // --open and --resolved are mutually exclusive, and each conflicts with
+        // an explicit --state, so the grammar rejects the combinations.
+        assert!(
+            Cli::try_parse_from(["loti", "ticket", "list", "e", "--open", "--resolved"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["loti", "ticket", "list", "e", "--open", "--state", "done"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "loti",
+            "ticket",
+            "list",
+            "e",
+            "--resolved",
+            "--state",
+            "to-do"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn match_impl_requires_a_match_query() {
+        // --match-impl is meaningless without --match, so it is rejected alone.
+        assert!(
+            Cli::try_parse_from(["loti", "ticket", "list", "e", "--match-impl", "rg"]).is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "loti",
+            "ticket",
+            "list",
+            "e",
+            "--match",
+            "q",
+            "--match-impl",
+            "rg"
+        ])
+        .is_ok());
     }
 }

@@ -17,17 +17,19 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 
 use loti_core::domain::NodeRef;
+use loti_core::filter::{self, FilterInput, StructuredFilters};
+use loti_core::matcher::{self, MatcherRegistry};
 use loti_core::ops::{
     self, CommentView, EpicEdits, NewEpic, NewNode, NodeEdits, NodeStatusChange, Target,
 };
-use loti_core::read::{self, ListScope};
+use loti_core::read::{self, ListScope, MatchRequest};
 use loti_core::render::{self, Color, Projection};
 use loti_core::store::{self, Store};
 use loti_core::Actor;
 
 use crate::cli::{
     ActorArg, AssetCommand, Cli, Command, CommentCommand, EpicCommand, FieldSel, InitArgs,
-    LabelCommand, ListFormat, ShowArgs, ShowFormat, TicketCommand,
+    LabelCommand, ListFilterArgs, ListFormat, ShowArgs, ShowFormat, TicketCommand,
 };
 use crate::content_input;
 
@@ -291,7 +293,7 @@ fn run_ticket<R: Read, O: Write, E: Write>(
         }
         TicketCommand::List(a) => {
             let store = open_store(cli, err)?;
-            list_tickets(&store, a, color_for(stdout_is_tty), out)?;
+            list_tickets(&store, a, color_for(stdout_is_tty), out, err)?;
         }
     }
     Ok(())
@@ -655,18 +657,32 @@ fn list_epics<O: Write>(
 /// (`<epic-id>`) or under a node (`<epic-id>/<n>`), with `--recursive` for the
 /// subtree. The plain form is a depth-first indented tree; the flat forms carry
 /// parent pointers.
-fn list_tickets<O: Write>(
+fn list_tickets<O: Write, E: Write>(
     store: &Store,
     a: &crate::cli::TicketListArgs,
     color: Color,
     out: &mut O,
+    err: &mut E,
 ) -> Result<()> {
     let selected = list_field_paths(&a.fields);
     if !selected.is_empty() {
         render::validate_list_fields(&selected, render::LISTABLE_NODE_FIELDS)?;
     }
     let scope = parse_list_scope(&a.scope, a.recursive)?;
-    let nodes = read::list_nodes(store, &scope)?;
+
+    // Validate the label/state families up front (conflicts, unknown states),
+    // then apply scope → structured → match with AND across families.
+    let filters = build_filters(&a.filters)?;
+    let matching = build_match_request(&a.filters);
+    let matchers = build_matcher_registry(cli_root_hint(store));
+    let result = read::list_nodes_filtered(store, &scope, &filters, matching.as_ref(), &matchers)?;
+    // Non-fatal match warnings (e.g. a matcher returning a path outside the
+    // candidate set) are surfaced without failing the list.
+    for warning in &result.warnings {
+        writeln!(err, "loti: warning: {warning}")?;
+    }
+    let nodes = result.nodes;
+
     // With a field selection the flat/raw and plain forms narrow to those
     // columns; json/ndjson keep the full listable row.
     let text = if !selected.is_empty() && (a.format.raw || is_plain(&a.format)) {
@@ -687,6 +703,47 @@ fn list_tickets<O: Write>(
 /// Whether a list format is the default plain text (no machine-mode flag set).
 fn is_plain(format: &ListFormat) -> bool {
     !format.json && !format.ndjson && !format.raw
+}
+
+/// Validate and normalise the label/state filter flags into the core's
+/// structured-filter value, surfacing usage errors (conflicts, unknown states)
+/// before any store access.
+fn build_filters(args: &ListFilterArgs) -> Result<StructuredFilters> {
+    let input = FilterInput {
+        labels: args.label.clone(),
+        not_labels: args.not_label.clone(),
+        states: args.state.clone(),
+        not_states: args.not_state.clone(),
+        open: args.open,
+        resolved: args.resolved,
+    };
+    Ok(filter::parse_filters(&input)?)
+}
+
+/// The match request, if `--match` was given. The implementation defaults to the
+/// reserved built-in `regex` when `--match-impl` is absent.
+fn build_match_request(args: &ListFilterArgs) -> Option<MatchRequest> {
+    args.match_query.as_ref().map(|query| MatchRequest {
+        query: query.clone(),
+        impl_name: args
+            .match_impl
+            .clone()
+            .unwrap_or_else(|| filter::BUILTIN_MATCHER_NAME.to_string()),
+    })
+}
+
+/// Build the external-matcher registry by layering the user-global XDG config
+/// under the project config, project winning on a name collision. The project
+/// config is the nearest `.loti.conf` at or above the store root.
+fn build_matcher_registry(store_root: &Path) -> MatcherRegistry {
+    let user_global = matcher::user_global_config_path();
+    let project = loti_core::discovery::find_project_config(store_root);
+    MatcherRegistry::layered(user_global.as_deref(), project.as_deref())
+}
+
+/// The store root, as the starting point for finding the project config file.
+fn cli_root_hint(store: &Store) -> &Path {
+    store.root()
 }
 
 /// The dotted field paths from a `--field`/`--fields` selection on list, empty
@@ -1120,6 +1177,187 @@ mod tests {
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["id"], "e");
         assert_eq!(arr[0]["nodes"], 2);
+    }
+
+    /// Seed an epic with three labelled nodes of varied state for filter tests:
+    ///   e/1 in-progress [urgent]     e/2 to-do [later]     e/3 done [urgent]
+    fn seed_filterable(root: &Path) {
+        let store = Store::at(root);
+        ops::create_epic(&store, test_epic("e")).unwrap();
+        let mut a = test_node("e", None);
+        a.name = "alpha needle".into();
+        a.labels = vec!["urgent".into()];
+        let an = ops::create_node(&store, a).unwrap();
+        ops::set_node_status(
+            &store,
+            &NodeRef::new("e", an.frontmatter.number),
+            NodeStatusChange::InProgress,
+        )
+        .unwrap();
+        let mut b = test_node("e", None);
+        b.name = "beta".into();
+        b.labels = vec!["later".into()];
+        ops::create_node(&store, b).unwrap();
+        let mut c = test_node("e", None);
+        c.name = "gamma needle".into();
+        c.labels = vec!["urgent".into()];
+        let cn = ops::create_node(&store, c).unwrap();
+        ops::set_node_status(
+            &store,
+            &NodeRef::new("e", cn.frontmatter.number),
+            NodeStatusChange::Done,
+        )
+        .unwrap();
+    }
+
+    fn refs_in(out: &str) -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_str(out).unwrap();
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["ref"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn list_label_filter_narrows_the_set() {
+        let (_d, root) = init_store();
+        seed_filterable(&root);
+        let cli = cli_with_root(
+            &root,
+            &["ticket", "list", "e", "--label", "urgent", "--json"],
+        );
+        let (out, _e, r) = invoke(&cli, b"");
+        assert!(r.is_ok());
+        assert_eq!(refs_in(&out), vec!["e/1", "e/3"]);
+    }
+
+    #[test]
+    fn list_state_filter_narrows_the_set() {
+        let (_d, root) = init_store();
+        seed_filterable(&root);
+        let cli = cli_with_root(
+            &root,
+            &["ticket", "list", "e", "--state", "to-do,done", "--json"],
+        );
+        let (out, _e, r) = invoke(&cli, b"");
+        assert!(r.is_ok());
+        assert_eq!(refs_in(&out), vec!["e/2", "e/3"]);
+    }
+
+    #[test]
+    fn list_open_aggregator_and_label_combine_with_and() {
+        let (_d, root) = init_store();
+        seed_filterable(&root);
+        // open = to-do|in-progress|blocked, AND label urgent => only e/1.
+        let cli = cli_with_root(
+            &root,
+            &[
+                "ticket", "list", "e", "--open", "--label", "urgent", "--json",
+            ],
+        );
+        let (out, _e, r) = invoke(&cli, b"");
+        assert!(r.is_ok());
+        assert_eq!(refs_in(&out), vec!["e/1"]);
+    }
+
+    #[test]
+    fn list_builtin_regex_match_over_name() {
+        let (_d, root) = init_store();
+        seed_filterable(&root);
+        let cli = cli_with_root(
+            &root,
+            &["ticket", "list", "e", "--match", "needle", "--json"],
+        );
+        let (out, _e, r) = invoke(&cli, b"");
+        assert!(r.is_ok());
+        // Only the two nodes whose name carries "needle".
+        assert_eq!(refs_in(&out), vec!["e/1", "e/3"]);
+    }
+
+    #[test]
+    fn list_match_runs_over_structured_survivors() {
+        let (_d, root) = init_store();
+        seed_filterable(&root);
+        // Structured (state=done) first leaves only e/3; match "needle" keeps it.
+        let cli = cli_with_root(
+            &root,
+            &[
+                "ticket", "list", "e", "--state", "done", "--match", "needle", "--json",
+            ],
+        );
+        let (out, _e, r) = invoke(&cli, b"");
+        assert!(r.is_ok());
+        assert_eq!(refs_in(&out), vec!["e/3"]);
+    }
+
+    #[test]
+    fn list_unknown_match_impl_lists_available() {
+        let (_d, root) = init_store();
+        seed_filterable(&root);
+        let cli = cli_with_root(
+            &root,
+            &[
+                "ticket",
+                "list",
+                "e",
+                "--match",
+                "q",
+                "--match-impl",
+                "ghost",
+            ],
+        );
+        let (_o, _e, r) = invoke(&cli, b"");
+        let msg = r.expect_err("unknown match-impl must error").to_string();
+        assert!(msg.contains("ghost"), "got: {msg}");
+        assert!(
+            msg.contains("regex"),
+            "available list should name the built-in: {msg}"
+        );
+    }
+
+    #[test]
+    fn list_external_matcher_via_project_config() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_d, root) = init_store();
+        seed_filterable(&root);
+        // A fake external matcher: echo back the candidate whose file is 1.md,
+        // regardless of the order candidates arrive in (deterministic).
+        let script = root.join("fake-matcher.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nshift\nfor c in \"$@\"; do\n  case \"$c\" in\n    */1.md) printf '%s\\n' \"$c\" ;;\n  esac\ndone\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        // Configure it as a project matcher named `first` in .loti.conf.
+        std::fs::write(
+            root.join(".loti.conf"),
+            format!(
+                "loti-root = \".\"\n[match-impl.first]\ncommand = [\"{}\", \"<QUERY>\", \"<CANDIDATES>\"]\n",
+                script.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let cli = cli_with_root(
+            &root,
+            &[
+                "ticket",
+                "list",
+                "e",
+                "--match",
+                "anything",
+                "--match-impl",
+                "first",
+                "--json",
+            ],
+        );
+        let (out, _e, r) = invoke(&cli, b"");
+        assert!(r.is_ok(), "external matcher list should succeed");
+        // The fake matcher returned the first candidate (e/1).
+        assert_eq!(refs_in(&out), vec!["e/1"]);
     }
 
     /// A minimal epic input for seeding a store directly through the core.

@@ -133,6 +133,20 @@ pub fn discover(start: &Path) -> Result<Discovered, DiscoveryError> {
     Err(DiscoveryError::NotFound)
 }
 
+/// Locate the nearest project config file walking upward from `start`, if any.
+/// This is the `.loti.conf` that configures the project (including its external
+/// matcher tables); it may sit above the data root. Returns `None` when no
+/// config file is found on the walk.
+pub fn find_project_config(start: &Path) -> Option<PathBuf> {
+    for dir in start.ancestors() {
+        let config = dir.join(CONFIG_FILE);
+        if config.is_file() {
+            return Some(config);
+        }
+    }
+    None
+}
+
 /// Read a config file and resolve its `loti-root` (absolute, or relative to the
 /// config file's directory).
 fn read_config_root(config_path: &Path) -> Result<PathBuf, DiscoveryError> {
