@@ -10,7 +10,7 @@
 //!     required one.
 
 use std::fs;
-use std::io::{IsTerminal, Read};
+use std::io::Read;
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
@@ -55,15 +55,6 @@ pub fn resolve_content<R: Read>(
         ));
     }
     Ok(None)
-}
-
-/// Convenience wrapper over [`resolve_content`] wired to the real process stdin
-/// and its TTY detection.
-pub fn read_content(file: Option<&Path>, required: bool) -> Result<Option<Vec<u8>>> {
-    let stdin = std::io::stdin();
-    let is_tty = stdin.is_terminal();
-    let mut lock = stdin.lock();
-    resolve_content(file, &mut lock, is_tty, required)
 }
 
 #[cfg(test)]

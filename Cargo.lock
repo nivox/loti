@@ -237,6 +237,7 @@ dependencies = [
  "anyhow",
  "clap",
  "loti-core",
+ "tempfile",
 ]
 
 [[package]]

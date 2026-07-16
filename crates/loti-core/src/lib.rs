@@ -8,8 +8,9 @@
 //! It currently pins the store format version and the domain vocabulary, plus
 //! the on-disk storage layer (layout, frontmatter/body split, tolerant
 //! round-trip, store metadata, root discovery), the concurrency primitive
-//! (atomic writes bracketed by a deterministic temp-file lock), and the domain
-//! rules and state machine the commands enforce. Migration is layered on later.
+//! (atomic writes bracketed by a deterministic temp-file lock), the domain
+//! rules and state machine the commands enforce, and the write-side business
+//! operations that wire them together. Migration is layered on later.
 
 pub mod discovery;
 pub mod domain;
@@ -17,6 +18,7 @@ pub mod frontmatter;
 pub mod lock;
 pub mod meta;
 pub mod model;
+pub mod ops;
 pub mod store;
 
 /// Store `format-version` as `(major, minor)`. Written by `loti init` into
