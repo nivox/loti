@@ -26,6 +26,7 @@ regex = "1"
 tempfile = "3"
 anstream = "0.6"
 anstyle = "1"
+assert_cmd = "2"
 
 # Single static binary: optimize for size, strip, LTO (SPEC §8 goal).
 [profile.release]
