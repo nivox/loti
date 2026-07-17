@@ -115,24 +115,23 @@ hand-authored **SKILL.md** — concepts, workflow, and gotchas — that teaches 
 agent to drive the tracker correctly and points it at `loti --help-full` for the
 exact command surface.
 
-**Install the skill.** Ask your coding agent to install it, or do it yourself by
-writing the skill where your agent framework discovers skills. For example:
+**1. Install the skill.** Point your coding agent at the built-in instructions:
 
-```sh
-# Save the skill so an agent can load it (adapt the path to your framework)
-loti skill > SKILL.md
-```
+> Run `loti skill` and install its output as a skill your tools can load, so you
+> can drive the `loti` ticket tracker.
 
-A prompt that installs and then delegates autonomously looks like:
+**2. Delegate a feature.** Describe what you want built and ask the agent to plan
+it in `loti`:
 
-> Install the `loti` skill by running `loti skill` and saving its output as a
-> skill your tools can load. Then use `loti` to track your work on this task:
-> create an epic for the feature, break it into tickets (and subtickets where
-> useful), keep each ticket's status current as you work (`in-progress`,
-> `blocked` with a reason, `done`), and leave a comment attributing each
-> meaningful change with `-a <your-name>`. Read state back with
-> `loti ticket list <epic>` and `loti ticket show <ref>` — never hand-edit the
-> store files.
+> I want to add **passwordless email-magic-link login** to our app. Using
+> `loti`, create an epic for this feature and break the work down into separate
+> tickets (use subtickets where a ticket needs finer steps). Give each ticket a
+> clear name and summary, and add labels where useful. When you're done, show me
+> the plan with `loti ticket list <epic>`.
+
+As work proceeds you can ask the agent to keep the plan live — moving tickets
+through `in-progress`, `blocked` (with a reason), and `done`, and attributing
+each meaningful change with a comment (`-a <your-name>`).
 
 Once the skill is loaded, the agent can operate the tracker on its own: it plans
 by creating epics and tickets, records progress through status transitions, and
