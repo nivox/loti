@@ -113,8 +113,11 @@ of work). Epics also have their **id**.
 
 A typical path:
 
-1. **Set up once.** `loti init` creates the store in the current directory. The
-   whole checkout then shares one store.
+1. **Set up once.** `loti init` creates the store in the current directory; the
+   whole checkout then shares one store, found from any depth by an upward walk
+   (like git). To keep the data elsewhere, `loti init --root <path>` (or a
+   positional `<dir>`) creates the store there and leaves a `.loti.conf` pointer
+   here. Init refuses if this scope is already inside a store.
 2. **Create an epic.** `loti epic create <epic-id> --name "..." --summary "..."`
    (pipe or `--file` a longer body if you want one).
 3. **Add tickets.** `loti ticket create <epic-id> --name "..." --summary "..."`.
@@ -142,13 +145,24 @@ comments over silent work.
 
 - **Numbers are per epic and never reused.** Deleting nothing gives numbers
   back; a reference always points at the same node for the life of the epic.
+  Numbers count on past deleted nodes, so a mistyped ref can still be valid and
+  hit the wrong node — every `edit`/`status` confirmation echoes the target's
+  **name** alongside the ref, so glance at it to catch a wrong number.
 - **`status` is set-only.** There is no status *reader* — use `show`.
 - **`done` is gated by descendants.** It is refused while any descendant is
   non-terminal; resolve or close them first.
 - **`close` needs a reason, and refuses open descendants** unless you pass
   cascade, which closes them too.
+- **Terminal is a resolution class, not a lock.** `done`/`closed` only gate the
+  two rules above; a node is never frozen. You can reclassify `done`→`closed`
+  (or the reverse), or move a terminal node back to an active state — the state
+  machine allows it.
 - **`blocked` is never automatic.** You set it and you clear it; moving to
-  another state clears the blocked-by.
+  another state clears the blocked-by. `--blocked-by` refs are a free
+  annotation: `loti` records them but does not check the blockers exist or are
+  still unresolved.
+- **An asset's name defaults to the file's basename with `--file`.** From stdin
+  there is nothing to infer, so `--name` is required there.
 - **Bodies, comment text, and asset data never take an inline flag.** Pipe them
   on stdin or pass `--file`. An interactive terminal with no input is treated as
   empty (it never hangs waiting).
@@ -160,6 +174,10 @@ comments over silent work.
 - **`--json` is the source of truth** on every read; the plain form is a
   convenience rendering of it (and carries the progress footer, which the
   machine formats omit).
+- **`--fields` drops the identifier unless you ask for it.** A projection like
+  `--fields name,status` has no `ref` column, so rows are hard to tell apart —
+  add `ref` yourself, or use `--json`/`--ndjson`/`--raw`, which always carry
+  `ref`/`number`/`parent`. Any single unknown leaf aborts the whole projection.
 
 ## The whole command surface
 

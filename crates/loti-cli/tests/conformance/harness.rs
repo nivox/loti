@@ -10,10 +10,10 @@
 //!     discovery / `.loti.conf`, which run the binary with its current dir set
 //!     to a tempdir instead of passing `--root`.
 //!
-//! The `init` verb intentionally ignores `--root` (it creates a store, so it
-//! resolves its own location from the current directory); every store here is
-//! therefore initialised by writing the store metadata directly, matching what
-//! `loti init` writes, so setup never depends on discovery.
+//! Setup never invokes `loti init`: every store here is created by writing the
+//! store metadata directly (matching what `loti init` writes), so a test's
+//! store is ready without depending on the current directory or discovery. The
+//! `init` verb's own behaviour is exercised separately in the storage suite.
 
 #![allow(dead_code)]
 

@@ -165,3 +165,37 @@ fn non_comment_operations_are_actor_agnostic() {
         "actor flags are not accepted outside comments: {err}"
     );
 }
+
+#[test]
+fn status_and_edit_confirmations_echo_the_target_name() {
+    // Refs are numeric, so a wrong-but-valid number would apply silently to the
+    // wrong node. Mutation confirmations therefore echo the resolved name, so a
+    // mistargeted command is caught by eye against the printed name.
+    let s = Store::new();
+    s.epic("checkout");
+    let t = s.ticket("checkout", "Add step-up prompt");
+
+    let moved = s.ok(&["ticket", "status", &t, "--in-progress"]);
+    assert!(
+        moved.contains("(Add step-up prompt)") && moved.contains("in-progress"),
+        "ticket status echoes the name: {moved}"
+    );
+
+    let edited = s.ok(&["ticket", "edit", &t, "--summary", "revised"]);
+    assert!(
+        edited.contains("(Add step-up prompt)"),
+        "ticket edit echoes the name: {edited}"
+    );
+
+    let epic_status = s.ok(&["epic", "status", "checkout", "--closed", "--reason", "r"]);
+    assert!(
+        epic_status.contains("(checkout)") && epic_status.contains("closed"),
+        "epic status echoes the name: {epic_status}"
+    );
+
+    let epic_edit = s.ok(&["epic", "edit", "checkout", "--summary", "revised"]);
+    assert!(
+        epic_edit.contains("(checkout)"),
+        "epic edit echoes the name: {epic_edit}"
+    );
+}

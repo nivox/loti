@@ -471,20 +471,18 @@ pub struct InitOutcome {
     pub config_pointer: Option<PathBuf>,
 }
 
-/// Initialise a store.
+/// Initialise a store whose data root is `root`, invoked from `here`.
 ///
-/// With no `data_dir`, the marker directory and metadata are created directly
-/// under `here`. With a `data_dir`, the marker and metadata are created there
-/// and a config-file pointer is written in `here` naming that root.
+/// The marker directory and metadata are created under `root`. When `root` is
+/// not the invocation directory `here`, a `.loti.conf` pointer naming `root` is
+/// written in `here` so commands run from `here` (or below) discover the store;
+/// an in-place init (root == here) writes no pointer. The caller resolves where
+/// `root` should be (default `here`, or a `--root`/positional target).
 ///
-/// Refuses to clobber an existing store: an existing marker directory at the
-/// chosen root is an error.
-pub fn init(here: &Path, data_dir: Option<&Path>) -> Result<InitOutcome, StoreError> {
-    let root = match data_dir {
-        Some(d) if d.is_absolute() => d.to_path_buf(),
-        Some(d) => here.join(d),
-        None => here.to_path_buf(),
-    };
+/// Refuses to clobber an existing store: an existing marker directory at `root`
+/// is an error.
+pub fn init(here: &Path, root: &Path) -> Result<InitOutcome, StoreError> {
+    let root = root.to_path_buf();
 
     let marker = root.join(MARKER_DIR);
     if marker.exists() {
@@ -501,22 +499,33 @@ pub fn init(here: &Path, data_dir: Option<&Path>) -> Result<InitOutcome, StoreEr
         },
     })?;
 
-    // Point the invocation directory at a data root that lives elsewhere.
-    let config_pointer = match data_dir {
-        Some(_) => {
-            let pointer = here.join(CONFIG_FILE);
-            let root_str = data_dir_config_value(here, &root);
-            let body = format!("loti-root = {}\n", toml_string(&root_str));
-            write_string(&pointer, &body)?;
-            Some(pointer)
-        }
-        None => None,
+    // A pointer is written only when the data root lives somewhere other than
+    // the invocation directory. Both paths exist now (meta::write created the
+    // root), so compare canonical forms to see through `.`/`..`/symlinks.
+    let config_pointer = if !same_dir(here, &root) {
+        let pointer = here.join(CONFIG_FILE);
+        let root_str = data_dir_config_value(here, &root);
+        let body = format!("loti-root = {}\n", toml_string(&root_str));
+        write_string(&pointer, &body)?;
+        Some(pointer)
+    } else {
+        None
     };
 
     Ok(InitOutcome {
         root,
         config_pointer,
     })
+}
+
+/// Whether two directories denote the same location, seeing through `.`/`..`
+/// and symlinks where the paths resolve; falls back to a literal comparison
+/// when canonicalisation is unavailable.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => a == b,
+    }
 }
 
 /// Whether `dir` sits inside a git working tree but is not that tree's root.
@@ -689,7 +698,7 @@ mod tests {
     #[test]
     fn init_in_place_creates_marker_and_meta() {
         let dir = tempfile::tempdir().unwrap();
-        let outcome = init(dir.path(), None).unwrap();
+        let outcome = init(dir.path(), dir.path()).unwrap();
         assert_eq!(outcome.root, dir.path());
         assert!(outcome.config_pointer.is_none());
         assert!(dir.path().join(MARKER_DIR).join("meta").is_file());
@@ -700,7 +709,7 @@ mod tests {
     #[test]
     fn init_with_data_dir_writes_a_config_pointer() {
         let dir = tempfile::tempdir().unwrap();
-        let outcome = init(dir.path(), Some(Path::new("store"))).unwrap();
+        let outcome = init(dir.path(), &dir.path().join("store")).unwrap();
         assert_eq!(outcome.root, dir.path().join("store"));
         let pointer = outcome.config_pointer.expect("expected a config pointer");
         assert_eq!(pointer, dir.path().join(CONFIG_FILE));
@@ -732,9 +741,9 @@ mod tests {
     #[test]
     fn init_refuses_to_clobber_an_existing_store() {
         let dir = tempfile::tempdir().unwrap();
-        init(dir.path(), None).unwrap();
+        init(dir.path(), dir.path()).unwrap();
         assert!(matches!(
-            init(dir.path(), None),
+            init(dir.path(), dir.path()),
             Err(StoreError::AlreadyInitialised { .. })
         ));
     }

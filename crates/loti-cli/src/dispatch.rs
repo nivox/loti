@@ -46,7 +46,7 @@ pub fn run<R: Read, O: Write, E: Write>(
     err: &mut E,
 ) -> Result<()> {
     match &cli.command {
-        Command::Init(args) => run_init(args, out, err),
+        Command::Init(args) => run_init(cli, args, out, err),
         Command::Skill => {
             // Printed verbatim: the skill is static, hand-authored prose, not a
             // rendering of the command model.
@@ -89,11 +89,56 @@ fn color_for(stdout_is_tty: bool) -> Color {
 // init
 // ---------------------------------------------------------------------------
 
-/// Create a store, reporting where its markers landed. Init is the one command
-/// that runs without an existing store, so it resolves its location from the
-/// current directory rather than upward discovery.
-fn run_init<O: Write, E: Write>(args: &InitArgs, out: &mut O, err: &mut E) -> Result<()> {
+/// Create a store, reporting where its markers landed.
+///
+/// A store is always the store *for the current directory*: the marker and
+/// metadata may live elsewhere (a `--root`/positional target), but a
+/// `.loti.conf` pointer is then dropped here so this scope discovers it. Init
+/// refuses when the current scope is already inside a store — the same
+/// git-like upward walk every other command uses — so a nested init cannot
+/// strand or shadow the enclosing store.
+fn run_init<O: Write, E: Write>(
+    cli: &Cli,
+    args: &InitArgs,
+    out: &mut O,
+    err: &mut E,
+) -> Result<()> {
     let here = std::env::current_dir().context("determining the current directory")?;
+
+    // Refuse if this scope already resolves a store (marker or config pointer,
+    // here or in any parent). A malformed config in scope also blocks init: it
+    // means a store scope already exists, just broken.
+    match loti_core::discovery::discover(&here) {
+        Ok(found) => {
+            return Err(anyhow!(
+                "a store is already initialised for this scope (found at {}); \
+                 run from a directory outside it to create a separate store",
+                found.root.display()
+            ));
+        }
+        Err(loti_core::discovery::DiscoveryError::NotFound) => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    // The data root: an explicit --root (global) or the positional DIR names
+    // where the store's files live; both are two spellings of the same target,
+    // so passing both is ambiguous. Absent both, the store is created in place.
+    let root = match (cli.root.as_deref(), args.dir.as_deref()) {
+        (Some(_), Some(_)) => {
+            return Err(anyhow!(
+                "name the store's location once — as --root or as the positional DIR, not both"
+            ));
+        }
+        (Some(target), None) | (None, Some(target)) => {
+            if target.is_absolute() {
+                target.to_path_buf()
+            } else {
+                here.join(target)
+            }
+        }
+        (None, None) => here.clone(),
+    };
+
     if store::inside_git_repo_but_not_root(&here) {
         writeln!(
             err,
@@ -102,7 +147,7 @@ fn run_init<O: Write, E: Write>(args: &InitArgs, out: &mut O, err: &mut E) -> Re
              so the whole checkout shares one store"
         )?;
     }
-    let outcome = store::init(&here, args.dir.as_deref())?;
+    let outcome = store::init(&here, &root)?;
     writeln!(
         out,
         "loti: initialised a store at {}",
@@ -253,7 +298,7 @@ fn run_epic<R: Read, O: Write, E: Write>(
         EpicCommand::Edit(a) => {
             let store = open_store(cli, err)?;
             let body = read_optional_text(a.content.file.as_deref(), stdin, stdin_is_tty)?;
-            ops::edit_epic(
+            let epic = ops::edit_epic(
                 &store,
                 &a.id,
                 EpicEdits {
@@ -262,17 +307,24 @@ fn run_epic<R: Read, O: Write, E: Write>(
                     body,
                 },
             )?;
-            writeln!(out, "loti: updated epic {}", a.id)?;
+            // Echo the name so a mistyped id/ref is caught by eye, not silently
+            // applied to the wrong target.
+            writeln!(
+                out,
+                "loti: updated epic {} ({})",
+                a.id, epic.frontmatter.name
+            )?;
         }
         EpicCommand::Status(a) => {
             let store = open_store(cli, err)?;
             // The clap group guarantees exactly one of closed/open.
             let closed = a.state.closed;
-            ops::set_epic_closed(&store, &a.id, closed, a.reason.clone())?;
+            let epic = ops::set_epic_closed(&store, &a.id, closed, a.reason.clone())?;
             writeln!(
                 out,
-                "loti: epic {} is now {}",
+                "loti: epic {} ({}) is now {}",
                 a.id,
+                epic.frontmatter.name,
                 if closed { "closed" } else { "open" }
             )?;
         }
@@ -341,7 +393,7 @@ fn run_ticket<R: Read, O: Write, E: Write>(
             let node_ref = NodeRef::parse(&a.reference)?;
             let body = read_optional_text(a.content.file.as_deref(), stdin, stdin_is_tty)?;
             let parent = a.parent.as_deref().map(NodeRef::parse).transpose()?;
-            ops::edit_node(
+            let node = ops::edit_node(
                 &store,
                 &node_ref,
                 NodeEdits {
@@ -351,7 +403,13 @@ fn run_ticket<R: Read, O: Write, E: Write>(
                     body,
                 },
             )?;
-            writeln!(out, "loti: updated ticket {node_ref}")?;
+            // Echo the name: refs are numeric, so a wrong-but-valid number would
+            // otherwise apply silently to the wrong ticket.
+            writeln!(
+                out,
+                "loti: updated ticket {node_ref} ({})",
+                node.frontmatter.name
+            )?;
         }
         TicketCommand::Status(a) => {
             let store = open_store(cli, err)?;
@@ -360,7 +418,8 @@ fn run_ticket<R: Read, O: Write, E: Write>(
             let node = ops::set_node_status(&store, &node_ref, change)?;
             writeln!(
                 out,
-                "loti: ticket {node_ref} is now {}",
+                "loti: ticket {node_ref} ({}) is now {}",
+                node.frontmatter.name,
                 node.frontmatter.status.wire_name()
             )?;
         }

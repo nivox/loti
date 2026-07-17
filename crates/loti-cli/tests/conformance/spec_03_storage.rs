@@ -185,3 +185,106 @@ fn numbers_may_collide_across_epics() {
     assert_eq!(na, "a/1");
     assert_eq!(nb, "b/1");
 }
+
+#[test]
+fn init_root_creates_the_store_elsewhere_with_a_pointer_here() {
+    // `loti init --root <path>` builds the store's files at <path> and leaves a
+    // `.loti.conf` in the invocation directory so this scope discovers it. The
+    // store is still "the store for here".
+    let work = tempfile::TempDir::new().unwrap();
+    let data = tempfile::TempDir::new().unwrap();
+    let store_root = data.path().join("elsewhere");
+
+    let out = assert_cmd::Command::cargo_bin("loti")
+        .unwrap()
+        .current_dir(work.path())
+        .env("NO_COLOR", "1")
+        .args(["--root"])
+        .arg(&store_root)
+        .arg("init")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "init --root should succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Marker landed at the target, and a pointer was written in the work dir.
+    assert!(store_root.join(".loti").join("meta").is_file());
+    let pointer = work.path().join(".loti.conf");
+    assert!(pointer.is_file(), "a .loti.conf pointer is written here");
+    assert!(std::fs::read_to_string(&pointer)
+        .unwrap()
+        .contains("loti-root"));
+
+    // A command run from the work dir (no --root) resolves through the pointer.
+    let created = assert_cmd::Command::cargo_bin("loti")
+        .unwrap()
+        .current_dir(work.path())
+        .env("NO_COLOR", "1")
+        .args(["epic", "create", "e", "--name", "n", "--summary", "s"])
+        .write_stdin("")
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "the pointer directs later commands: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    assert!(store_root.join("e").join("epic.md").is_file());
+}
+
+#[test]
+fn init_refuses_when_the_scope_is_already_inside_a_store() {
+    // A store found by the upward walk — from the same dir or a nested one, via
+    // either a marker or a config pointer — blocks a second init, so a nested
+    // init can never strand or shadow the enclosing store.
+    let root = tempfile::TempDir::new().unwrap();
+    write_meta_here(root.path());
+
+    // Same directory: refused.
+    let same = init_in(root.path());
+    assert!(!same.status.success(), "init atop a marker must be refused");
+    assert!(String::from_utf8_lossy(&same.stderr).contains("already initialised"));
+
+    // Nested directory: still refused (upward walk finds the marker).
+    let nested = root.path().join("a").join("b");
+    std::fs::create_dir_all(&nested).unwrap();
+    let deep = init_in(&nested);
+    assert!(!deep.status.success(), "a nested init must be refused too");
+    assert!(String::from_utf8_lossy(&deep.stderr).contains("already initialised"));
+}
+
+#[test]
+fn init_rejects_naming_the_target_twice() {
+    // --root and the positional DIR are two spellings of the same target, so
+    // supplying both is ambiguous and refused before anything is created.
+    let work = tempfile::TempDir::new().unwrap();
+    let out = assert_cmd::Command::cargo_bin("loti")
+        .unwrap()
+        .current_dir(work.path())
+        .env("NO_COLOR", "1")
+        .args(["--root", "/tmp/a", "init", "/tmp/b"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "both --root and DIR must be refused");
+    assert!(!work.path().join(".loti.conf").exists(), "nothing created");
+}
+
+/// Write store metadata directly at `dir`, creating its `.loti/` marker.
+fn write_meta_here(dir: &std::path::Path) {
+    let marker = dir.join(".loti");
+    std::fs::create_dir_all(&marker).unwrap();
+    std::fs::write(marker.join("meta"), "format-version = \"0.1\"\n").unwrap();
+}
+
+/// Run `loti init` with the current dir set to `dir` and no `--root`.
+fn init_in(dir: &std::path::Path) -> std::process::Output {
+    assert_cmd::Command::cargo_bin("loti")
+        .unwrap()
+        .current_dir(dir)
+        .env("NO_COLOR", "1")
+        .arg("init")
+        .output()
+        .unwrap()
+}

@@ -29,8 +29,10 @@ use clap::{Args, Parser, Subcommand};
     disable_help_subcommand = true
 )]
 pub struct Cli {
-    /// Use PATH as the data root, overriding upward `.loti/` discovery.
-    /// Flag only — there is no environment-variable override.
+    /// Use PATH as the data root, overriding upward `.loti/` discovery. For
+    /// `init`, PATH is where the new store's files are created (a `.loti.conf`
+    /// pointer is left in the current directory). Flag only — there is no
+    /// environment-variable override.
     #[arg(long, global = true, value_name = "PATH")]
     pub root: Option<PathBuf>,
 
@@ -46,9 +48,10 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Initialise a store: `.loti/` here by default, or a data dir at <DIR>
-    /// plus a `.loti.conf` pointer here. Warns if inside a git repo but not at
-    /// its root.
+    /// Initialise a store: `.loti/` here by default, or a data root elsewhere
+    /// (via --root or the positional <DIR>) plus a `.loti.conf` pointer here.
+    /// Refuses if this scope is already inside a store. Warns if inside a git
+    /// repo but not at its root.
     Init(InitArgs),
 
     /// Epics — the top-level units of work.
@@ -76,7 +79,8 @@ pub struct MigrateStoreArgs {
 #[derive(Debug, Args)]
 pub struct InitArgs {
     /// Data directory. Omitted: create `.loti/` in the current directory.
-    /// Given: create the data dir there and a `.loti.conf` pointer here.
+    /// Given: create the data root there and a `.loti.conf` pointer here.
+    /// Equivalent to (and mutually exclusive with) the global `--root`.
     #[arg(value_name = "DIR")]
     pub dir: Option<PathBuf>,
 }
