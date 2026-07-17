@@ -80,7 +80,11 @@ jobs:
       - name: Package
         run: |
           dist="loti-${{ matrix.target }}"
-          install -Dm755 "target/${{ matrix.target }}/release/loti" "$dist/loti"
+          # Portable across GNU and BSD (macOS) userlands: `install -D` is a
+          # GNU-only extension, so create the dir and copy explicitly instead.
+          mkdir -p "$dist"
+          cp "target/${{ matrix.target }}/release/loti" "$dist/loti"
+          chmod 755 "$dist/loti"
           tar -czf "$dist.tar.gz" "$dist"
           if command -v sha256sum >/dev/null; then
             sha256sum "$dist.tar.gz" > "$dist.tar.gz.sha256"
