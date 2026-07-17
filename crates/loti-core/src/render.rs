@@ -18,8 +18,8 @@ use std::fmt::Write as _;
 
 use serde_json::{json, Map, Value};
 
-use crate::domain::{epic_state, NodeStatus};
-use crate::model::{Attachment, Comment, EpicFile, NodeFile};
+use crate::domain::{epic_status, NodeStatus};
+use crate::model::{Asset, Comment, EpicFile, NodeFile};
 
 /// Why a read/projection could not be rendered as asked.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -80,7 +80,7 @@ pub fn node_to_json(epic_id: &str, node: &NodeFile) -> Value {
         "close-reason".into(),
         opt_string_json(fm.close_reason.as_deref()),
     );
-    map.insert("attachments".into(), attachments_json(&fm.attachments));
+    map.insert("assets".into(), assets_json(&fm.assets));
     map.insert("comments".into(), comments_json(&fm.comments));
     map.insert("created".into(), json!(fm.created.to_string()));
     map.insert("updated".into(), json!(fm.updated.to_string()));
@@ -98,11 +98,11 @@ pub fn epic_to_json(epic: &EpicFile, node_statuses: &[NodeStatus]) -> Value {
     map.insert("id".into(), json!(fm.id));
     map.insert("name".into(), json!(fm.name));
     map.insert("summary".into(), json!(fm.summary));
-    // `state` is computed, never stored: closed flag wins, else completed when
+    // `status` is computed, never stored: closed flag wins, else completed when
     // every node is terminal, else open (including an epic with no nodes).
     map.insert(
-        "state".into(),
-        json!(epic_state(fm.closed, node_statuses).wire_name()),
+        "status".into(),
+        json!(epic_status(fm.closed, node_statuses).wire_name()),
     );
     map.insert("closed".into(), json!(fm.closed));
     map.insert(
@@ -112,7 +112,7 @@ pub fn epic_to_json(epic: &EpicFile, node_statuses: &[NodeStatus]) -> Value {
     map.insert("labels".into(), json!(fm.labels));
     map.insert("next-number".into(), json!(fm.next_number));
     map.insert("nodes".into(), json!(node_statuses.len()));
-    map.insert("attachments".into(), attachments_json(&fm.attachments));
+    map.insert("assets".into(), assets_json(&fm.assets));
     map.insert("comments".into(), comments_json(&fm.comments));
     map.insert("created".into(), json!(fm.created.to_string()));
     map.insert("updated".into(), json!(fm.updated.to_string()));
@@ -131,7 +131,7 @@ fn blocked_by_json(b: &crate::model::BlockedBy) -> Value {
     })
 }
 
-fn attachments_json(atts: &[Attachment]) -> Value {
+fn assets_json(atts: &[Asset]) -> Value {
     Value::Array(
         atts.iter()
             .map(|a| {
@@ -285,7 +285,7 @@ fn collect(value: &Value, segments: &[&str], out: &mut Vec<Value>) {
 /// field as a single structured value (which raw then judges ambiguous).
 /// Intermediate arrays still distribute, so `comments.author` yields one author
 /// per comment (the terminal `author` is a scalar), while a bare `comments` or
-/// `attachments` yields the array itself.
+/// `assets` yields the array itself.
 fn project_terminal(value: &Value, path: &str) -> Vec<Value> {
     let segments: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
     let mut out = Vec::new();
@@ -495,7 +495,7 @@ pub fn show_markdown(
             "ref", "number", "status", "parent", "labels", "created", "updated",
         ]
     } else {
-        &["id", "state", "labels", "nodes", "created", "updated"]
+        &["id", "status", "labels", "nodes", "created", "updated"]
     };
     for key in meta_keys {
         if let Some(v) = value.get(*key) {
@@ -539,7 +539,7 @@ pub fn show_markdown(
     // -- assets table -------------------------------------------------------
     let _ = write!(s, "\n## Assets\n");
     let assets = value
-        .get("attachments")
+        .get("assets")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
@@ -724,8 +724,8 @@ pub struct ListEpic {
     pub id: String,
     /// Its one-line name.
     pub name: String,
-    /// Its computed state's wire name.
-    pub state: String,
+    /// Its computed status's wire name.
+    pub status: String,
     /// Its labels.
     pub labels: Vec<String>,
     /// How many nodes it holds.
@@ -808,19 +808,100 @@ fn render_node_line(node: &ListNode, depth: usize, color: Color) -> String {
     line
 }
 
-/// Render the plain-text `epic list` roster: one line per epic with its state,
+/// Node statuses in lifecycle order — the order the progress summary lists them.
+const STATUS_LIFECYCLE: &[&str] = &["to-do", "in-progress", "blocked", "done", "closed"];
+
+/// The per-status progress summary that closes the plain `ticket list`: a total
+/// plus one entry per non-empty status in lifecycle order (e.g.
+/// `8 tickets · 2 to-do · 1 in-progress · 1 blocked · 3 done · 1 closed`).
+///
+/// The count is always over the nodes actually listed — scope, `--shallow` and
+/// filters are already applied — so `filtered` tags the line, keeping a narrowed
+/// count from being read as the whole scope. An all-terminal set is marked done
+/// with a trailing check. Plain-text only: machine formats stay pure data and
+/// never carry this line.
+pub fn list_summary(nodes: &[ListNode], filtered: bool, color: Color) -> String {
+    let total = nodes.len();
+    let counts: Vec<(usize, &str)> = STATUS_LIFECYCLE
+        .iter()
+        .filter_map(|st| {
+            let c = nodes.iter().filter(|n| n.status == *st).count();
+            (c > 0).then_some((c, *st))
+        })
+        .collect();
+    // Terminal = done|closed; an all-terminal, non-empty set is "finished".
+    let all_terminal = total > 0
+        && nodes
+            .iter()
+            .all(|n| n.status == "done" || n.status == "closed");
+
+    let line = summary_line(total, &counts, all_terminal, filtered, color);
+    if total == 0 {
+        // Nothing to rule off against — the count stands on its own.
+        return format!("{line}\n");
+    }
+    // The divider spans the widest visible line so the summary reads as a footer;
+    // measured uncolored (ANSI has no width) and capped so it stays sane.
+    let plain_line = summary_line(total, &counts, all_terminal, filtered, Color::None);
+    let width = list_nodes_plain(nodes, Color::None)
+        .lines()
+        .map(|l| l.chars().count())
+        .chain(std::iter::once(plain_line.chars().count()))
+        .max()
+        .unwrap_or(0)
+        .clamp(1, 72);
+    let divider = paint(&"\u{2500}".repeat(width), dim(), color);
+    format!("{divider}\n{line}\n")
+}
+
+/// Build the one-line summary, painting each status count in its status colour
+/// when colour is enabled.
+fn summary_line(
+    total: usize,
+    counts: &[(usize, &str)],
+    all_terminal: bool,
+    filtered: bool,
+    color: Color,
+) -> String {
+    let ticket_word = if total == 1 { "ticket" } else { "tickets" };
+    let mut line = format!("{total} {ticket_word}");
+    for (c, st) in counts {
+        let _ = write!(
+            line,
+            " · {}",
+            paint(&format!("{c} {st}"), status_style(st), color)
+        );
+    }
+    if all_terminal {
+        let _ = write!(line, "  {}", paint("✓", status_style("done"), color));
+    }
+    if filtered {
+        let _ = write!(line, "  {}", paint("(filtered)", dim(), color));
+    }
+    line
+}
+
+/// Render the plain-text `epic list` roster: one line per epic with its status,
 /// node count and labels.
 pub fn list_epics_plain(epics: &[ListEpic], color: Color) -> String {
     let mut out = String::new();
     for e in epics {
         let id = paint(&e.id, dim(), color);
-        let state = paint(&format!("({})", e.state), epic_state_style(&e.state), color);
+        let status = paint(
+            &format!("({})", e.status),
+            epic_status_style(&e.status),
+            color,
+        );
         let labels = if e.labels.is_empty() {
             String::new()
         } else {
             format!(" [{}]", e.labels.join(", "))
         };
-        let _ = writeln!(out, "{id} {} {state} — {} node(s){labels}", e.name, e.nodes);
+        let _ = writeln!(
+            out,
+            "{id} {} {status} — {} node(s){labels}",
+            e.name, e.nodes
+        );
     }
     out
 }
@@ -893,7 +974,7 @@ pub fn list_epics_ndjson(epics: &[ListEpic]) -> String {
     out
 }
 
-/// Render `epic list --raw`: tab-separated `id  name  state  labels  nodes`.
+/// Render `epic list --raw`: tab-separated `id  name  status  labels  nodes`.
 pub fn list_epics_raw(epics: &[ListEpic]) -> String {
     let mut out = String::new();
     for e in epics {
@@ -902,7 +983,7 @@ pub fn list_epics_raw(epics: &[ListEpic]) -> String {
             "{}\t{}\t{}\t{}\t{}",
             e.id,
             e.name,
-            e.state,
+            e.status,
             e.labels.join(","),
             e.nodes
         );
@@ -914,7 +995,7 @@ fn list_epic_value(e: &ListEpic) -> Value {
     json!({
         "id": e.id,
         "name": e.name,
-        "state": e.state,
+        "status": e.status,
         "labels": e.labels,
         "nodes": e.nodes,
     })
@@ -927,10 +1008,10 @@ pub const LISTABLE_NODE_FIELDS: &[&str] = &[
 ];
 
 /// The epic roster fields `list` may serve via `--fields`.
-pub const LISTABLE_EPIC_FIELDS: &[&str] = &["id", "name", "state", "labels", "nodes"];
+pub const LISTABLE_EPIC_FIELDS: &[&str] = &["id", "name", "status", "labels", "nodes"];
 
 /// The heavy/structured fields that are `show`-only and rejected on `list`.
-pub const HEAVY_FIELDS: &[&str] = &["body", "comments", "assets", "attachments", "subtickets"];
+pub const HEAVY_FIELDS: &[&str] = &["body", "comments", "assets", "subtickets"];
 
 /// Validate that every requested `list` field is a listable summary field. A
 /// heavy/structured field, or any unknown field, is rejected so `list` never
@@ -1007,7 +1088,7 @@ fn status_style(status: &str) -> anstyle::Style {
     anstyle::Style::new().fg_color(Some(color.into()))
 }
 
-fn epic_state_style(state: &str) -> anstyle::Style {
+fn epic_status_style(state: &str) -> anstyle::Style {
     let color = match state {
         "completed" => anstyle::AnsiColor::Green,
         "closed" => anstyle::AnsiColor::BrightBlack,
@@ -1029,7 +1110,7 @@ mod tests {
             "status": "in-progress",
             "labels": ["a", "b"],
             "parent": Value::Null,
-            "attachments": [{"name": "x.png", "description": Value::Null}],
+            "assets": [{"name": "x.png", "description": Value::Null}],
             "comments": [
                 {"id": 1, "author": "human", "created": "t", "text": "hi", "deleted": false},
                 {"id": 2, "author": "agent:bot", "created": "t", "text": "yo", "deleted": false},
@@ -1079,7 +1160,7 @@ mod tests {
     #[test]
     fn raw_whole_structured_field_is_ambiguous() {
         // Selecting a whole repeated/structured field has no one-per-line form.
-        let err = show_raw(&sample(), &Projection::One("attachments".into())).unwrap_err();
+        let err = show_raw(&sample(), &Projection::One("assets".into())).unwrap_err();
         assert!(matches!(err, RenderError::RawAmbiguous { .. }));
     }
 
@@ -1192,6 +1273,54 @@ mod tests {
         assert!(lines[1].contains("[blocked: e/9; waiting]"));
     }
 
+    fn node(reference: &str, number: u64, status: &str) -> ListNode {
+        ListNode {
+            reference: reference.into(),
+            number,
+            name: "n".into(),
+            status: status.into(),
+            parent: None,
+            labels: vec![],
+            blocked: None,
+        }
+    }
+
+    #[test]
+    fn summary_counts_each_status_in_lifecycle_order() {
+        let ns = vec![
+            node("e/1", 1, "done"),
+            node("e/2", 2, "to-do"),
+            node("e/3", 3, "blocked"),
+            node("e/4", 4, "done"),
+        ];
+        let s = list_summary(&ns, false, Color::None);
+        let line = s.lines().last().unwrap();
+        // Total, then only non-empty statuses, in lifecycle order (to-do before
+        // blocked before done); no in-progress or closed entry appears.
+        assert_eq!(line, "4 tickets · 1 to-do · 1 blocked · 2 done");
+    }
+
+    #[test]
+    fn summary_marks_an_all_terminal_set_done_and_tags_a_filtered_one() {
+        let done = vec![node("e/1", 1, "done"), node("e/2", 2, "closed")];
+        assert!(
+            list_summary(&done, false, Color::None)
+                .lines()
+                .last()
+                .unwrap()
+                .ends_with("✓"),
+            "all-terminal set is marked finished"
+        );
+        let filtered = list_summary(&[node("e/1", 1, "to-do")], true, Color::None);
+        assert!(filtered.contains("(filtered)"), "narrowed count is tagged");
+    }
+
+    #[test]
+    fn summary_of_an_empty_set_is_a_bare_count_with_no_divider() {
+        let s = list_summary(&[], false, Color::None);
+        assert_eq!(s, "0 tickets\n");
+    }
+
     #[test]
     fn plain_list_colour_only_when_asked() {
         let plain = list_nodes_plain(&nodes(), Color::None);
@@ -1268,7 +1397,7 @@ mod tests {
                 closed: false,
                 close_reason: None,
                 labels: vec![],
-                attachments: vec![],
+                assets: vec![],
                 comments: vec![],
                 created: "2024-01-01T00:00:00Z".parse().unwrap(),
                 updated: "2024-01-01T00:00:00Z".parse().unwrap(),
@@ -1282,11 +1411,11 @@ mod tests {
             NodeStatus::new(2, NodeState::Closed),
         ];
         let v = epic_to_json(&epic, &done);
-        assert_eq!(v["state"], "completed");
+        assert_eq!(v["status"], "completed");
         assert_eq!(v["nodes"], 2);
         // No nodes => open.
         let v0 = epic_to_json(&epic, &[]);
-        assert_eq!(v0["state"], "open");
+        assert_eq!(v0["status"], "open");
     }
 
     #[test]

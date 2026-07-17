@@ -161,7 +161,7 @@ fn epic_with_no_nodes_is_open_not_completed() {
     s.epic("e");
     let json = s.ok(&["epic", "show", "e", "--json"]);
     assert!(
-        json.contains("\"state\": \"open\""),
+        json.contains("\"status\": \"open\""),
         "an epic with no nodes is open, got: {json}"
     );
 }
@@ -174,7 +174,7 @@ fn epic_is_completed_when_all_nodes_are_terminal() {
     s.ok(&["ticket", "status", &t, "--done"]);
     let json = s.ok(&["epic", "show", "e", "--json"]);
     assert!(
-        json.contains("\"state\": \"completed\""),
+        json.contains("\"status\": \"completed\""),
         "all nodes terminal => completed, got: {json}"
     );
 }
@@ -188,7 +188,7 @@ fn epic_open_when_any_node_is_non_terminal() {
     s.ok(&["ticket", "status", &a, "--done"]);
     let json = s.ok(&["epic", "show", "e", "--json"]);
     assert!(
-        json.contains("\"state\": \"open\""),
+        json.contains("\"status\": \"open\""),
         "one open node => epic open, got: {json}"
     );
 }
@@ -202,14 +202,14 @@ fn epic_closed_flag_takes_precedence_over_computed_state() {
     s.ok(&["epic", "status", "e", "--closed", "--reason", "cancelled"]);
     let json = s.ok(&["epic", "show", "e", "--json"]);
     assert!(
-        json.contains("\"state\": \"closed\""),
+        json.contains("\"status\": \"closed\""),
         "closed flag wins over completed, got: {json}"
     );
     // The flag is reversible: reopening returns to the computed state.
     s.ok(&["epic", "status", "e", "--open"]);
     let json = s.ok(&["epic", "show", "e", "--json"]);
     assert!(
-        json.contains("\"state\": \"completed\""),
+        json.contains("\"status\": \"completed\""),
         "reopening restores the computed state, got: {json}"
     );
 }

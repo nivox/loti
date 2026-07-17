@@ -708,8 +708,8 @@ fn projection_of(fields: &FieldSel) -> Projection {
 // ---------------------------------------------------------------------------
 
 /// Render `epic list` — the flat roster of every epic — in the chosen mode.
-/// `--recursive` is meaningless here and rejected upstream by the grammar;
-/// heavy `--fields` are rejected because the roster serves summary fields only.
+/// The roster has no scope depth (`--shallow` lives on `ticket list`); heavy
+/// `--fields` are rejected because the roster serves summary fields only.
 fn list_epics<O: Write>(
     store: &Store,
     fields: &FieldSel,
@@ -738,9 +738,10 @@ fn list_epics<O: Write>(
 }
 
 /// Render `ticket list <scope>` in the chosen mode. Scope is a whole epic
-/// (`<epic-id>`) or under a node (`<epic-id>/<n>`), with `--recursive` for the
-/// subtree. The plain form is a depth-first indented tree; the flat forms carry
-/// parent pointers.
+/// (`<epic-id>`) or under a node (`<epic-id>/<n>`); the default is the full tree
+/// rooted at the scope, and `--shallow` keeps only its immediate level. The
+/// plain form is a depth-first indented tree; the flat forms carry parent
+/// pointers.
 fn list_tickets<O: Write, E: Write>(
     store: &Store,
     a: &crate::cli::TicketListArgs,
@@ -752,7 +753,7 @@ fn list_tickets<O: Write, E: Write>(
     if !selected.is_empty() {
         render::validate_list_fields(&selected, render::LISTABLE_NODE_FIELDS)?;
     }
-    let scope = parse_list_scope(&a.scope, a.recursive)?;
+    let scope = parse_list_scope(&a.scope, a.shallow)?;
 
     // Validate the label/state families up front (conflicts, unknown states),
     // then apply scope → structured → match with AND across families.
@@ -778,10 +779,31 @@ fn list_tickets<O: Write, E: Write>(
     } else if a.format.raw {
         render::list_nodes_raw(&nodes)
     } else {
-        render::list_nodes_plain(&nodes, color)
+        // The default plain tree carries a per-status progress footer; the
+        // `filtered` flag tags it when a label/status/match family narrowed the
+        // set, so a partial count is never read as the whole scope.
+        let mut tree = render::list_nodes_plain(&nodes, color);
+        tree.push_str(&render::list_summary(
+            &nodes,
+            filters_narrowed(&a.filters),
+            color,
+        ));
+        tree
     };
     write!(out, "{text}")?;
     Ok(())
+}
+
+/// Whether any structured or match filter narrowed the listing. Scope and
+/// `--shallow` select what to list and are not filters, so they never set this.
+fn filters_narrowed(f: &ListFilterArgs) -> bool {
+    !f.label.is_empty()
+        || !f.not_label.is_empty()
+        || !f.status.is_empty()
+        || !f.not_status.is_empty()
+        || f.open
+        || f.resolved
+        || f.match_query.is_some()
 }
 
 /// Whether a list format is the default plain text (no machine-mode flag set).
@@ -796,8 +818,8 @@ fn build_filters(args: &ListFilterArgs) -> Result<StructuredFilters> {
     let input = FilterInput {
         labels: args.label.clone(),
         not_labels: args.not_label.clone(),
-        states: args.state.clone(),
-        not_states: args.not_state.clone(),
+        states: args.status.clone(),
+        not_states: args.not_status.clone(),
         open: args.open,
         resolved: args.resolved,
     };
@@ -841,14 +863,18 @@ fn list_field_paths(fields: &FieldSel) -> Vec<String> {
 }
 
 /// Parse a `ticket list` scope: `<epic-id>` selects a whole epic, `<epic-id>/<n>`
-/// selects the nodes under that node (subtree when `recursive`). A scope with
-/// more than one `/` is rejected — a reference never nests.
-fn parse_list_scope(scope: &str, recursive: bool) -> Result<ListScope> {
+/// selects the nodes under that node. Each defaults to the full tree rooted
+/// there; `shallow` keeps only the immediate level. A scope with more than one
+/// `/` is rejected — a reference never nests.
+fn parse_list_scope(scope: &str, shallow: bool) -> Result<ListScope> {
     if scope.contains('/') {
         let node = NodeRef::parse(scope)?;
-        Ok(ListScope::Under { node, recursive })
+        Ok(ListScope::Under { node, shallow })
     } else {
-        Ok(ListScope::Epic(scope.to_string()))
+        Ok(ListScope::Epic {
+            id: scope.to_string(),
+            shallow,
+        })
     }
 }
 
@@ -1075,7 +1101,7 @@ mod tests {
         let (out, _e, r) = invoke(&cli, b"");
         assert!(r.is_ok());
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["state"], "open");
+        assert_eq!(v["status"], "open");
         assert_eq!(v["nodes"], 2);
     }
 
@@ -1117,7 +1143,7 @@ mod tests {
         // Selecting a whole structured field is ambiguous — a hard error.
         let cli = cli_with_root(
             &root,
-            &["ticket", "show", "e/1", "--raw", "--field", "attachments"],
+            &["ticket", "show", "e/1", "--raw", "--field", "assets"],
         );
         let (_o, _e, r) = invoke(&cli, b"");
         let msg = r.expect_err("structured raw must error").to_string();
@@ -1322,7 +1348,7 @@ mod tests {
         seed_filterable(&root);
         let cli = cli_with_root(
             &root,
-            &["ticket", "list", "e", "--state", "to-do,done", "--json"],
+            &["ticket", "list", "e", "--status", "to-do,done", "--json"],
         );
         let (out, _e, r) = invoke(&cli, b"");
         assert!(r.is_ok());
@@ -1367,7 +1393,7 @@ mod tests {
         let cli = cli_with_root(
             &root,
             &[
-                "ticket", "list", "e", "--state", "done", "--match", "needle", "--json",
+                "ticket", "list", "e", "--status", "done", "--match", "needle", "--json",
             ],
         );
         let (out, _e, r) = invoke(&cli, b"");

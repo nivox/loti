@@ -54,13 +54,13 @@ impl BlockedBy {
     }
 }
 
-/// One entry in a file's attachments index. The bytes live in the companion
+/// One entry in a file's assets index. The bytes live in the companion
 /// directory beside the file; this records the name and an optional caption.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Attachment {
+pub struct Asset {
     /// File name within the companion directory; unique per node/epic.
     pub name: String,
-    /// Optional human caption for the attachment.
+    /// Optional human caption for the asset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 }
@@ -125,9 +125,9 @@ pub struct NodeFrontmatter {
         skip_serializing_if = "Option::is_none"
     )]
     pub close_reason: Option<String>,
-    /// Attachments index; the bytes live in the companion directory.
+    /// Assets index; the bytes live in the companion directory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub attachments: Vec<Attachment>,
+    pub assets: Vec<Asset>,
     /// Appended comments in id order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub comments: Vec<Comment>,
@@ -169,9 +169,9 @@ pub struct EpicFrontmatter {
     /// Free-form labels; carry no intrinsic semantics.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
-    /// Attachments index; the bytes live in the `epic/` companion directory.
+    /// Assets index; the bytes live in the `epic/` companion directory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub attachments: Vec<Attachment>,
+    pub assets: Vec<Asset>,
     /// Appended comments in id order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub comments: Vec<Comment>,
@@ -238,9 +238,9 @@ impl EpicFile {
     }
 }
 
-/// Add or replace an entry in an attachments index by name; returns the prior
+/// Add or replace an entry in an assets index by name; returns the prior
 /// entry when the name already existed. The bytes are copied in separately.
-pub fn upsert_attachment(index: &mut Vec<Attachment>, entry: Attachment) -> Option<Attachment> {
+pub fn upsert_asset(index: &mut Vec<Asset>, entry: Asset) -> Option<Asset> {
     if let Some(slot) = index.iter_mut().find(|a| a.name == entry.name) {
         Some(std::mem::replace(slot, entry))
     } else {
@@ -249,8 +249,8 @@ pub fn upsert_attachment(index: &mut Vec<Attachment>, entry: Attachment) -> Opti
     }
 }
 
-/// Remove an attachment index entry by name; returns it when present.
-pub fn remove_attachment(index: &mut Vec<Attachment>, name: &str) -> Option<Attachment> {
+/// Remove an asset index entry by name; returns it when present.
+pub fn remove_asset(index: &mut Vec<Asset>, name: &str) -> Option<Asset> {
     let pos = index.iter().position(|a| a.name == name)?;
     Some(index.remove(pos))
 }
@@ -518,19 +518,19 @@ mod tests {
     }
 
     #[test]
-    fn attachment_index_upsert_and_remove() {
+    fn asset_index_upsert_and_remove() {
         let mut index = Vec::new();
-        assert!(upsert_attachment(
+        assert!(upsert_asset(
             &mut index,
-            Attachment {
+            Asset {
                 name: "a.png".into(),
                 description: Some("first".into())
             }
         )
         .is_none());
-        let prior = upsert_attachment(
+        let prior = upsert_asset(
             &mut index,
-            Attachment {
+            Asset {
                 name: "a.png".into(),
                 description: Some("second".into()),
             },
@@ -538,9 +538,9 @@ mod tests {
         assert_eq!(prior.unwrap().description.as_deref(), Some("first"));
         assert_eq!(index.len(), 1);
         assert_eq!(index[0].description.as_deref(), Some("second"));
-        let removed = remove_attachment(&mut index, "a.png").unwrap();
+        let removed = remove_asset(&mut index, "a.png").unwrap();
         assert_eq!(removed.name, "a.png");
-        assert!(remove_attachment(&mut index, "a.png").is_none());
+        assert!(remove_asset(&mut index, "a.png").is_none());
     }
 
     fn minimal_node_frontmatter() -> NodeFrontmatter {
@@ -553,7 +553,7 @@ mod tests {
             parent: None,
             blocked_by: BlockedBy::default(),
             close_reason: None,
-            attachments: Vec::new(),
+            assets: Vec::new(),
             comments: Vec::new(),
             created: ts("2024-01-01T00:00:00Z"),
             updated: ts("2024-01-01T00:00:00Z"),
@@ -570,7 +570,7 @@ mod tests {
             closed: false,
             close_reason: None,
             labels: Vec::new(),
-            attachments: Vec::new(),
+            assets: Vec::new(),
             comments: Vec::new(),
             created: ts("2024-01-01T00:00:00Z"),
             updated: ts("2024-01-01T00:00:00Z"),

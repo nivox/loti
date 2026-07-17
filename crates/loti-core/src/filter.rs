@@ -14,7 +14,7 @@
 //!     rejected if it carries any excluded label (comma and repeat both union).
 //!   * **State.** A positive state selector is an OR set of states, and it may
 //!     be given only once (states are mutually exclusive as a positive filter,
-//!     so repeating the selector is a usage error). `--not-state` is the
+//!     so repeating the selector is a usage error). `--not-status` is the
 //!     symmetric exclusion. The `open` and `resolved` aggregators are shorthand
 //!     positive selectors and are mutually exclusive with each other and with an
 //!     explicit state selector.
@@ -90,10 +90,10 @@ pub struct FilterInput {
     pub labels: Vec<String>,
     /// Each element is one `--not-label` occurrence; commas union too.
     pub not_labels: Vec<String>,
-    /// Each element is one `--state` occurrence; commas are an OR list. More
+    /// Each element is one `--status` occurrence; commas are an OR list. More
     /// than one occurrence is a usage error.
     pub states: Vec<String>,
-    /// Each element is one `--not-state` occurrence; commas union.
+    /// Each element is one `--not-status` occurrence; commas union.
     pub not_states: Vec<String>,
     /// The `open` aggregator: to-do, in-progress, or blocked.
     pub open: bool,
@@ -307,7 +307,7 @@ mod tests {
                 parent: None,
                 blocked_by: Default::default(),
                 close_reason: None,
-                attachments: Vec::new(),
+                assets: Vec::new(),
                 comments: Vec::new(),
                 created: ts(),
                 updated: ts(),

@@ -8,7 +8,7 @@
 //! location, so reparenting is a single frontmatter edit, never a move. The
 //! tree is encoded solely by the `parent` field.
 //!
-//! Attachments live in lazily-created companion directories beside their file:
+//! Assets live in lazily-created companion directories beside their file:
 //! `<epic-id>/epic/` for the epic and `<epic-id>/<n>/` for a node.
 //!
 //! Every mutation here routes through the atomic write + temp-file advisory
@@ -46,7 +46,7 @@ const MAX_PROBE_STEPS: u64 = 1_000_000;
 /// The epic file name within an epic directory.
 pub const EPIC_FILE: &str = "epic.md";
 
-/// The epic's companion directory name for attachments.
+/// The epic's companion directory name for assets.
 pub const EPIC_ASSET_DIR: &str = "epic";
 
 /// A handle to a store rooted at a data-root directory. Cheap to clone.
@@ -186,12 +186,12 @@ impl Store {
         self.epic_dir(epic_id).join(format!("{number}.md"))
     }
 
-    /// The epic's companion attachment directory.
+    /// The epic's companion asset directory.
     pub fn epic_asset_dir(&self, epic_id: &str) -> PathBuf {
         self.epic_dir(epic_id).join(EPIC_ASSET_DIR)
     }
 
-    /// A node's companion attachment directory.
+    /// A node's companion asset directory.
     pub fn node_asset_dir(&self, epic_id: &str, number: u64) -> PathBuf {
         self.epic_dir(epic_id).join(number.to_string())
     }
@@ -580,7 +580,7 @@ fn remove_file(path: &Path) -> Result<(), StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Attachment, BlockedBy, EpicFrontmatter, NodeFrontmatter};
+    use crate::model::{Asset, BlockedBy, EpicFrontmatter, NodeFrontmatter};
     use crate::NodeState;
     use jiff::Timestamp;
     use serde_yaml::Mapping;
@@ -600,7 +600,7 @@ mod tests {
                 parent: None,
                 blocked_by: BlockedBy::default(),
                 close_reason: None,
-                attachments: Vec::new(),
+                assets: Vec::new(),
                 comments: Vec::new(),
                 created: ts(),
                 updated: ts(),
@@ -620,7 +620,7 @@ mod tests {
                 closed: false,
                 close_reason: None,
                 labels: Vec::new(),
-                attachments: Vec::new(),
+                assets: Vec::new(),
                 comments: Vec::new(),
                 created: ts(),
                 updated: ts(),
@@ -671,18 +671,18 @@ mod tests {
     }
 
     #[test]
-    fn attachment_index_and_bytes_are_managed_separately() {
+    fn asset_index_and_bytes_are_managed_separately() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path());
         let mut e = epic();
         store.copy_epic_asset("my-epic", "a.txt", b"hello").unwrap();
-        e.frontmatter.attachments.push(Attachment {
+        e.frontmatter.assets.push(Asset {
             name: "a.txt".into(),
             description: Some("greeting".into()),
         });
         store.write_epic("my-epic", &e).unwrap();
         let back = store.read_epic("my-epic").unwrap();
-        assert_eq!(back.frontmatter.attachments.len(), 1);
+        assert_eq!(back.frontmatter.assets.len(), 1);
         assert!(store.epic_asset_dir("my-epic").join("a.txt").is_file());
     }
 

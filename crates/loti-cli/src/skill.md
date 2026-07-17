@@ -128,9 +128,12 @@ A typical path:
    explain a decision or a status change; `asset add` to attach proof.
    Organise with `label add`.
 6. **Read and report.** `loti ticket show <ref>` for one node,
-   `loti ticket list <epic-id>` for a scope (add `--recursive` for the subtree),
-   and `loti epic list` for the roster. Add `--json` to any read for the
-   canonical machine-readable form.
+   `loti ticket list <epic-id>` for a scope, and `loti epic list` for the
+   roster. A list defaults to the full tree rooted at the scope; add `--shallow`
+   for just the immediate level (an epic's top-level nodes, or a node's direct
+   children). The plain list closes with a per-status progress footer (totals
+   per status over what's listed) — handy for a status readout. Add `--json` to
+   any read for the canonical machine-readable form.
 
 Keep the human oriented: prefer small, frequent status changes and short
 comments over silent work.
@@ -155,7 +158,8 @@ comments over silent work.
   list under). There is no bare cross-epic listing; aggregate with `epic list`
   plus per-epic `ticket list`.
 - **`--json` is the source of truth** on every read; the plain form is a
-  convenience rendering of it.
+  convenience rendering of it (and carries the progress footer, which the
+  machine formats omit).
 
 ## The whole command surface
 

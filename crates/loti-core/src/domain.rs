@@ -279,7 +279,7 @@ pub fn validate_blocked(explicitly_requested: bool) -> Result<(), TransitionErro
 /// The three states an epic can be in. `Closed` is stored; the other two are
 /// computed from the epic's nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EpicState {
+pub enum EpicStatus {
     /// Explicitly closed via the stored flag. Takes precedence over the
     /// computed states and is reversible (reopening clears the flag).
     Closed,
@@ -289,18 +289,18 @@ pub enum EpicState {
     Open,
 }
 
-impl EpicState {
+impl EpicStatus {
     /// The lower-case name used in output.
     pub fn wire_name(self) -> &'static str {
         match self {
-            EpicState::Closed => "closed",
-            EpicState::Completed => "completed",
-            EpicState::Open => "open",
+            EpicStatus::Closed => "closed",
+            EpicStatus::Completed => "completed",
+            EpicStatus::Open => "open",
         }
     }
 }
 
-impl fmt::Display for EpicState {
+impl fmt::Display for EpicStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.wire_name())
     }
@@ -312,14 +312,14 @@ impl fmt::Display for EpicState {
 /// `completed` when there is at least one node and all nodes are terminal,
 /// `open` in every other case — including an epic with no nodes, which is open,
 /// not completed.
-pub fn epic_state(closed_flag: bool, nodes: &[NodeStatus]) -> EpicState {
+pub fn epic_status(closed_flag: bool, nodes: &[NodeStatus]) -> EpicStatus {
     if closed_flag {
-        return EpicState::Closed;
+        return EpicStatus::Closed;
     }
     if !nodes.is_empty() && nodes.iter().all(|n| n.state.is_terminal()) {
-        EpicState::Completed
+        EpicStatus::Completed
     } else {
-        EpicState::Open
+        EpicStatus::Open
     }
 }
 
@@ -549,34 +549,34 @@ mod tests {
     #[test]
     fn epic_closed_flag_takes_precedence() {
         // Even with all nodes terminal, the stored closed flag wins.
-        assert_eq!(epic_state(true, &[done(1)]), EpicState::Closed);
+        assert_eq!(epic_status(true, &[done(1)]), EpicStatus::Closed);
         // And even with open nodes.
-        assert_eq!(epic_state(true, &[open(1)]), EpicState::Closed);
+        assert_eq!(epic_status(true, &[open(1)]), EpicStatus::Closed);
     }
 
     #[test]
     fn epic_completed_requires_at_least_one_node_all_terminal() {
         assert_eq!(
-            epic_state(false, &[done(1), closed(2)]),
-            EpicState::Completed
+            epic_status(false, &[done(1), closed(2)]),
+            EpicStatus::Completed
         );
     }
 
     #[test]
     fn epic_with_no_nodes_is_open_not_completed() {
-        assert_eq!(epic_state(false, &[]), EpicState::Open);
+        assert_eq!(epic_status(false, &[]), EpicStatus::Open);
     }
 
     #[test]
     fn epic_with_any_open_node_is_open() {
-        assert_eq!(epic_state(false, &[done(1), open(2)]), EpicState::Open);
+        assert_eq!(epic_status(false, &[done(1), open(2)]), EpicStatus::Open);
     }
 
     #[test]
-    fn epic_state_names() {
-        assert_eq!(EpicState::Closed.to_string(), "closed");
-        assert_eq!(EpicState::Completed.to_string(), "completed");
-        assert_eq!(EpicState::Open.to_string(), "open");
+    fn epic_status_names() {
+        assert_eq!(EpicStatus::Closed.to_string(), "closed");
+        assert_eq!(EpicStatus::Completed.to_string(), "completed");
+        assert_eq!(EpicStatus::Open.to_string(), "open");
     }
 
     // -- attribution -------------------------------------------------------

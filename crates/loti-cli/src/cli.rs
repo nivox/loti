@@ -100,7 +100,8 @@ pub enum EpicCommand {
     Show(ShowArgs),
     /// Edit plain scalar fields (name/summary/body).
     Edit(EpicEditArgs),
-    /// Set epic state (set-only; read via `show`).
+    /// Set epic status: only closed/open is settable (completed is computed
+    /// from the tickets). Set-only; read via `show`.
     Status(EpicStatusArgs),
     /// Manage labels (add/remove/list).
     Label(LabelArgs),
@@ -151,16 +152,16 @@ pub struct EpicStatusArgs {
     #[arg(value_name = "ID")]
     pub id: String,
     #[command(flatten)]
-    pub state: EpicStateSel,
+    pub state: EpicStatusSel,
     /// Close reason (inline; only with --closed).
     #[arg(long, value_name = "S", requires = "closed")]
     pub reason: Option<String>,
 }
 
-/// Epic state selector — exactly one of these is required.
+/// Epic status selector — exactly one of these is required.
 #[derive(Debug, Args)]
 #[group(required = true, multiple = false)]
-pub struct EpicStateSel {
+pub struct EpicStatusSel {
     /// Mark the epic closed (stored flag; takes precedence).
     #[arg(long)]
     pub closed: bool,
@@ -199,7 +200,7 @@ pub enum TicketCommand {
     Show(ShowArgs),
     /// Edit plain scalar fields (name/summary/parent/body).
     Edit(TicketEditArgs),
-    /// Set node state (set-only; read via `show`).
+    /// Set node status (set-only; read via `show`).
     Status(TicketStatusArgs),
     /// Manage labels (add/remove/list).
     Label(LabelArgs),
@@ -270,7 +271,7 @@ pub struct TicketStatusArgs {
     pub cascade: bool,
 }
 
-/// Node state selector — exactly one of these is required.
+/// Node status selector — exactly one of these is required.
 #[derive(Debug, Args)]
 #[group(required = true, multiple = false)]
 pub struct TicketStateSel {
@@ -295,9 +296,10 @@ pub struct TicketListArgs {
     /// node). There is no bare cross-epic list.
     #[arg(value_name = "EPIC-ID[/N]")]
     pub scope: String,
-    /// Recurse into the subtree (scope only).
+    /// List only the immediate level under the scope — an epic's top-level
+    /// nodes, or a node's direct children — instead of the full tree.
     #[arg(long)]
-    pub recursive: bool,
+    pub shallow: bool,
     #[command(flatten)]
     pub filters: ListFilterArgs,
     /// Restrict output to these summary fields (dotted leaf paths). Heavy
@@ -308,8 +310,8 @@ pub struct TicketListArgs {
     pub format: ListFormat,
 }
 
-/// The label/state/match filter families for `ticket list`. Families combine
-/// with AND. Structured families (label, state) are evaluated first; `--match`
+/// The label/status/match filter families for `ticket list`. Families combine
+/// with AND. Structured families (label, status) are evaluated first; `--match`
 /// runs over the survivors.
 #[derive(Debug, Args)]
 pub struct ListFilterArgs {
@@ -321,22 +323,22 @@ pub struct ListFilterArgs {
     /// both union.
     #[arg(long, value_name = "L[,L]")]
     pub not_label: Vec<String>,
-    /// Keep nodes in one of these states; comma is OR. Give once — states are
-    /// mutually exclusive, so several go in one comma-separated flag.
+    /// Keep nodes in one of these statuses; comma is OR. Give once — statuses
+    /// are mutually exclusive, so several go in one comma-separated flag.
     #[arg(
         long,
-        value_name = "STATE[,STATE]",
+        value_name = "STATUS[,STATUS]",
         conflicts_with_all = ["open", "resolved"]
     )]
-    pub state: Vec<String>,
-    /// Drop nodes in any of these states; comma and repeat union.
-    #[arg(long, value_name = "STATE[,STATE]")]
-    pub not_state: Vec<String>,
-    /// Shorthand for the non-terminal states (to-do, in-progress, blocked).
-    #[arg(long, conflicts_with_all = ["resolved", "state"])]
+    pub status: Vec<String>,
+    /// Drop nodes in any of these statuses; comma and repeat union.
+    #[arg(long, value_name = "STATUS[,STATUS]")]
+    pub not_status: Vec<String>,
+    /// Shorthand for the non-terminal statuses (to-do, in-progress, blocked).
+    #[arg(long, conflicts_with_all = ["resolved", "status"])]
     pub open: bool,
-    /// Shorthand for the terminal states (done, closed).
-    #[arg(long, conflicts_with_all = ["open", "state"])]
+    /// Shorthand for the terminal statuses (done, closed).
+    #[arg(long, conflicts_with_all = ["open", "status"])]
     pub resolved: bool,
     /// Keep nodes the matcher selects. The built-in `regex` matcher (default)
     /// tests name, summary and body; an external matcher is chosen with
@@ -668,7 +670,7 @@ mod tests {
             "b,c",
             "--not-label",
             "x",
-            "--state",
+            "--status",
             "to-do,blocked",
             "--match",
             "needle",
@@ -679,12 +681,12 @@ mod tests {
     #[test]
     fn list_state_aggregators_conflict_at_parse_time() {
         // --open and --resolved are mutually exclusive, and each conflicts with
-        // an explicit --state, so the grammar rejects the combinations.
+        // an explicit --status, so the grammar rejects the combinations.
         assert!(
             Cli::try_parse_from(["loti", "ticket", "list", "e", "--open", "--resolved"]).is_err()
         );
         assert!(
-            Cli::try_parse_from(["loti", "ticket", "list", "e", "--open", "--state", "done"])
+            Cli::try_parse_from(["loti", "ticket", "list", "e", "--open", "--status", "done"])
                 .is_err()
         );
         assert!(Cli::try_parse_from([
@@ -693,7 +695,7 @@ mod tests {
             "list",
             "e",
             "--resolved",
-            "--state",
+            "--status",
             "to-do"
         ])
         .is_err());

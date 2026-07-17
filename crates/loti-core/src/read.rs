@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
-use crate::domain::{epic_state, NodeRef, NodeStatus};
+use crate::domain::{epic_status, NodeRef, NodeStatus};
 use crate::filter::{RegexMatcher, StructuredFilters};
 use crate::matcher::{self, MatchWarning, MatcherError, MatcherRegistry, ResolvedMatcher};
 use crate::ops::{descendants_of, list_comments, load_epic_nodes, CommentView, OpError, Target};
@@ -82,7 +82,7 @@ pub fn list_epics(store: &Store) -> Result<Vec<ListEpic>, OpError> {
         out.push(ListEpic {
             id: epic.frontmatter.id.clone(),
             name: epic.frontmatter.name.clone(),
-            state: epic_state(epic.frontmatter.closed, &statuses)
+            status: epic_status(epic.frontmatter.closed, &statuses)
                 .wire_name()
                 .to_string(),
             labels: epic.frontmatter.labels.clone(),
@@ -92,35 +92,60 @@ pub fn list_epics(store: &Store) -> Result<Vec<ListEpic>, OpError> {
     Ok(out)
 }
 
-/// The scope a node `list` resolves over: a whole epic, or under one node.
+/// The scope a node `list` resolves over: a whole epic, or under one node. In
+/// both cases the default is the full tree rooted at the scope; `shallow`
+/// collapses it to just the immediate level (an epic's top-level nodes, or a
+/// node's direct children).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListScope {
-    /// Every node in an epic.
-    Epic(String),
-    /// The children of a node — direct only, or the whole subtree when
-    /// `recursive`.
+    /// Every node in an epic (full tree), or only its top-level nodes when
+    /// `shallow`.
+    Epic {
+        /// The epic id.
+        id: String,
+        /// Restrict to top-level nodes rather than the whole tree.
+        shallow: bool,
+    },
+    /// The subtree under a node (all descendants), or only its direct children
+    /// when `shallow`.
     Under {
-        /// The node whose descendants are listed.
+        /// The node whose descendants are listed. The anchor itself is never
+        /// part of its own listing.
         node: NodeRef,
-        /// Whether to include the whole subtree rather than direct children.
-        recursive: bool,
+        /// Restrict to direct children rather than the whole subtree.
+        shallow: bool,
     },
 }
 
-/// Resolve a node `list` scope to the flat set of nodes to render, each located
-/// by its reference and parent pointer. The set is flat by construction; the
-/// plain-text renderer reconstructs the tree from the parent pointers.
-pub fn list_nodes(store: &Store, scope: &ListScope) -> Result<Vec<ListNode>, OpError> {
-    let (epic_id, selected): (String, Vec<NodeFile>) = match scope {
-        ListScope::Epic(id) => {
-            let nodes = load_epic_nodes(store, id)?;
-            (id.clone(), nodes)
+/// Select the nodes a scope resolves to, paired with the epic id. The default
+/// (`shallow == false`) is the full tree rooted at the scope; `shallow` keeps
+/// only the immediate level. Both scopes share this one rule, so `list` has no
+/// depth flag that means different things at different scopes.
+fn select_scope_nodes(
+    store: &Store,
+    scope: &ListScope,
+) -> Result<(String, Vec<NodeFile>), OpError> {
+    match scope {
+        ListScope::Epic { id, shallow } => {
+            let all = load_epic_nodes(store, id)?;
+            let selected = if *shallow {
+                all.into_iter()
+                    .filter(|n| n.frontmatter.parent.is_none())
+                    .collect()
+            } else {
+                all
+            };
+            Ok((id.clone(), selected))
         }
-        ListScope::Under { node, recursive } => {
+        ListScope::Under { node, shallow } => {
             // Confirm the anchor node exists so an unknown scope is a clean error.
             read_node(store, node)?;
             let all = load_epic_nodes(store, &node.epic_id)?;
-            let selected = if *recursive {
+            let selected = if *shallow {
+                all.into_iter()
+                    .filter(|n| n.frontmatter.parent == Some(node.number))
+                    .collect()
+            } else {
                 let sub: std::collections::HashSet<u64> = descendants_of(store, node)?
                     .into_iter()
                     .map(|s| s.number)
@@ -128,15 +153,17 @@ pub fn list_nodes(store: &Store, scope: &ListScope) -> Result<Vec<ListNode>, OpE
                 all.into_iter()
                     .filter(|n| sub.contains(&n.frontmatter.number))
                     .collect()
-            } else {
-                all.into_iter()
-                    .filter(|n| n.frontmatter.parent == Some(node.number))
-                    .collect()
             };
-            (node.epic_id.clone(), selected)
+            Ok((node.epic_id.clone(), selected))
         }
-    };
+    }
+}
 
+/// Resolve a node `list` scope to the flat set of nodes to render, each located
+/// by its reference and parent pointer. The set is flat by construction; the
+/// plain-text renderer reconstructs the tree from the parent pointers.
+pub fn list_nodes(store: &Store, scope: &ListScope) -> Result<Vec<ListNode>, OpError> {
+    let (epic_id, selected) = select_scope_nodes(store, scope)?;
     let mut rows: Vec<ListNode> = selected.iter().map(|n| list_node(&epic_id, n)).collect();
     rows.sort_by_key(|n| n.number);
     Ok(rows)
@@ -224,7 +251,7 @@ pub fn list_nodes_filtered(
 /// The epic id a scope resolves within.
 fn scope_epic_id(scope: &ListScope) -> String {
     match scope {
-        ListScope::Epic(id) => id.clone(),
+        ListScope::Epic { id, .. } => id.clone(),
         ListScope::Under { node, .. } => node.epic_id.clone(),
     }
 }
@@ -236,27 +263,7 @@ fn resolve_candidates(
     store: &Store,
     scope: &ListScope,
 ) -> Result<Vec<(NodeFile, PathBuf)>, OpError> {
-    let (epic_id, selected): (String, Vec<NodeFile>) = match scope {
-        ListScope::Epic(id) => (id.clone(), load_epic_nodes(store, id)?),
-        ListScope::Under { node, recursive } => {
-            read_node(store, node)?;
-            let all = load_epic_nodes(store, &node.epic_id)?;
-            let selected = if *recursive {
-                let sub: std::collections::HashSet<u64> = descendants_of(store, node)?
-                    .into_iter()
-                    .map(|s| s.number)
-                    .collect();
-                all.into_iter()
-                    .filter(|n| sub.contains(&n.frontmatter.number))
-                    .collect()
-            } else {
-                all.into_iter()
-                    .filter(|n| n.frontmatter.parent == Some(node.number))
-                    .collect()
-            };
-            (node.epic_id.clone(), selected)
-        }
-    };
+    let (epic_id, selected) = select_scope_nodes(store, scope)?;
     Ok(selected
         .into_iter()
         .map(|n| {
@@ -466,12 +473,12 @@ mod tests {
     }
 
     #[test]
-    fn epic_json_carries_computed_state_and_node_count() {
+    fn epic_json_carries_computed_status_and_node_count() {
         let (_d, s) = seeded();
         create_epic(&s, new_epic("e")).unwrap();
         create_node(&s, new_node("e", None, "a")).unwrap();
         let value = epic_json(&s, "e").unwrap();
-        assert_eq!(value["state"], "open");
+        assert_eq!(value["status"], "open");
         assert_eq!(value["nodes"], 1);
         assert_eq!(value["id"], "e");
     }
@@ -483,7 +490,14 @@ mod tests {
         let a = create_node(&s, new_node("e", None, "a")).unwrap();
         let ar = NodeRef::new("e", a.frontmatter.number);
         create_node(&s, new_node("e", Some(ar.clone()), "b")).unwrap();
-        let rows = list_nodes(&s, &ListScope::Epic("e".into())).unwrap();
+        let rows = list_nodes(
+            &s,
+            &ListScope::Epic {
+                id: "e".into(),
+                shallow: false,
+            },
+        )
+        .unwrap();
         assert_eq!(rows.len(), 2);
         // The child carries a parent pointer; the parent has none.
         let child = rows.iter().find(|r| r.name == "b").unwrap();
@@ -493,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn list_scope_under_node_direct_vs_recursive() {
+    fn list_scope_under_node_shallow_vs_full_subtree() {
         let (_d, s) = seeded();
         create_epic(&s, new_epic("e")).unwrap();
         let a = create_node(&s, new_node("e", None, "a")).unwrap();
@@ -502,22 +516,24 @@ mod tests {
         let br = NodeRef::new("e", b.frontmatter.number);
         create_node(&s, new_node("e", Some(br), "c")).unwrap();
 
+        // shallow: only the anchor's direct children.
         let direct = list_nodes(
             &s,
             &ListScope::Under {
                 node: ar.clone(),
-                recursive: false,
+                shallow: true,
             },
         )
         .unwrap();
         assert_eq!(direct.len(), 1);
         assert_eq!(direct[0].name, "b");
 
+        // default: the whole subtree beneath the anchor.
         let subtree = list_nodes(
             &s,
             &ListScope::Under {
                 node: ar,
-                recursive: true,
+                shallow: false,
             },
         )
         .unwrap();
@@ -539,7 +555,14 @@ mod tests {
             },
         )
         .unwrap();
-        let rows = list_nodes(&s, &ListScope::Epic("e".into())).unwrap();
+        let rows = list_nodes(
+            &s,
+            &ListScope::Epic {
+                id: "e".into(),
+                shallow: false,
+            },
+        )
+        .unwrap();
         let tag = rows[0].blocked.as_ref().expect("blocked tag");
         assert_eq!(tag.refs, vec!["e/99"]);
         assert_eq!(tag.reason.as_deref(), Some("waiting"));

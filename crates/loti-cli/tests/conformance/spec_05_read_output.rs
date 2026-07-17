@@ -10,6 +10,8 @@
 //!   * `list` has a default indented tree, a flat `--json` array with parent
 //!     pointers, an `--ndjson` stream, and a tab-separated `--raw`; it rejects
 //!     heavy/structured fields;
+//!   * the default plain tree closes with a per-status progress footer over the
+//!     nodes listed; machine formats carry no such footer;
 //!   * machine formats (`--json`/`--ndjson`/`--raw`) are never coloured.
 
 use super::harness::{contains_ansi, Store};
@@ -27,15 +29,7 @@ fn show_json_is_canonical_with_all_fields() {
     // The whole entity: identity, status, the body, and the empty collections
     // are all present in the canonical form.
     for key in [
-        "ref",
-        "number",
-        "name",
-        "summary",
-        "status",
-        "body",
-        "labels",
-        "comments",
-        "attachments",
+        "ref", "number", "name", "summary", "status", "body", "labels", "comments", "assets",
     ] {
         assert!(v.get(key).is_some(), "canonical JSON missing {key}: {json}");
     }
@@ -102,6 +96,40 @@ fn show_raw_structured_selection_is_a_hard_error() {
 }
 
 #[test]
+fn plain_list_closes_with_a_per_status_progress_footer_absent_from_machine_forms() {
+    let s = Store::new();
+    s.epic("e");
+    s.ticket("e", "a"); // e/1 to-do
+    s.ticket("e", "b"); // e/2 to-do
+    s.ticket("e", "c"); // e/3 -> done
+    s.ok(&["ticket", "status", "e/3", "--done"]);
+
+    let plain = s.ok(&["ticket", "list", "e"]);
+    let footer = plain.lines().last().unwrap();
+    assert_eq!(
+        footer, "3 tickets · 2 to-do · 1 done",
+        "plain list closes with the progress footer: {plain}"
+    );
+
+    // A narrowed listing tags the footer so a partial count is not read as the
+    // whole scope.
+    let narrowed = s.ok(&["ticket", "list", "e", "--status", "to-do"]);
+    assert!(
+        narrowed.lines().last().unwrap().contains("(filtered)"),
+        "filtered count is tagged: {narrowed}"
+    );
+
+    // Machine formats stay pure data — no footer text leaks in.
+    for mode in ["--json", "--ndjson", "--raw"] {
+        let out = s.ok(&["ticket", "list", "e", mode]);
+        assert!(
+            !out.contains("tickets") && !out.contains('\u{2500}'),
+            "{mode} carries no progress footer: {out}"
+        );
+    }
+}
+
+#[test]
 fn list_default_is_an_indented_depth_first_tree_with_blocked_tag() {
     let s = Store::new();
     s.epic("e");
@@ -118,7 +146,7 @@ fn list_default_is_an_indented_depth_first_tree_with_blocked_tag() {
     ]);
     let _ = other;
 
-    let out = s.ok(&["ticket", "list", "e", "--recursive"]);
+    let out = s.ok(&["ticket", "list", "e"]);
     let lines: Vec<&str> = out.lines().collect();
     // Depth-first: the child line immediately follows its parent, and is
     // indented relative to it.
@@ -141,7 +169,7 @@ fn list_json_is_a_flat_array_with_parent_pointers() {
     s.epic("e");
     let parent = s.ticket("e", "parent");
     let _child = s.subticket("e", &parent, "child");
-    let out = s.ok(&["ticket", "list", "e", "--recursive", "--json"]);
+    let out = s.ok(&["ticket", "list", "e", "--json"]);
     let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
     let arr = v.as_array().expect("flat array");
     assert_eq!(arr.len(), 2, "flat, not nested: {out}");

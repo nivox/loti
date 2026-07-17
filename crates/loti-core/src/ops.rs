@@ -22,8 +22,8 @@ use crate::domain::{
 };
 use crate::lock::{self, Force};
 use crate::model::{
-    next_comment_id, remove_attachment, upsert_attachment, Attachment, Comment, EpicFile,
-    EpicFrontmatter, NodeFile, NodeFrontmatter,
+    next_comment_id, remove_asset, upsert_asset, Asset, Comment, EpicFile, EpicFrontmatter,
+    NodeFile, NodeFrontmatter,
 };
 use crate::store::{Store, StoreError};
 use crate::{Actor, NodeState};
@@ -158,7 +158,7 @@ pub fn create_epic(store: &Store, new: NewEpic) -> Result<EpicFile, OpError> {
             closed: false,
             close_reason: None,
             labels: dedup_preserving_order(new.labels),
-            attachments: Vec::new(),
+            assets: Vec::new(),
             comments: Vec::new(),
             created: ts,
             updated: ts,
@@ -223,7 +223,7 @@ pub fn create_node(store: &Store, new: NewNode) -> Result<NodeFile, OpError> {
             parent: parent_number,
             blocked_by: Default::default(),
             close_reason: None,
-            attachments: Vec::new(),
+            assets: Vec::new(),
             comments: Vec::new(),
             created: ts,
             updated: ts,
@@ -759,8 +759,8 @@ pub fn add_asset(
     name: &str,
     description: Option<String>,
     bytes: &[u8],
-) -> Result<Attachment, OpError> {
-    let entry = Attachment {
+) -> Result<Asset, OpError> {
+    let entry = Asset {
         name: name.to_string(),
         description,
     };
@@ -769,14 +769,14 @@ pub fn add_asset(
             let mut epic = read_epic(store, id)?;
             // Land the bytes first; the index write below is the guarded RMW.
             store.copy_epic_asset(id, name, bytes)?;
-            upsert_attachment(&mut epic.frontmatter.attachments, entry.clone());
+            upsert_asset(&mut epic.frontmatter.assets, entry.clone());
             epic.frontmatter.updated = now();
             store.write_epic(id, &epic)?;
         }
         Target::Node(r) => {
             let mut node = read_node(store, r)?;
             store.copy_node_asset(&r.epic_id, r.number, name, bytes)?;
-            upsert_attachment(&mut node.frontmatter.attachments, entry.clone());
+            upsert_asset(&mut node.frontmatter.assets, entry.clone());
             node.frontmatter.updated = now();
             store.write_node(&r.epic_id, r.number, &node)?;
         }
@@ -786,11 +786,11 @@ pub fn add_asset(
 
 /// Hard-delete an asset: remove both the index entry and the bytes. Refuses if
 /// the name is not indexed. Returns the removed entry.
-pub fn delete_asset(store: &Store, target: &Target, name: &str) -> Result<Attachment, OpError> {
+pub fn delete_asset(store: &Store, target: &Target, name: &str) -> Result<Asset, OpError> {
     match target {
         Target::Epic(id) => {
             let mut epic = read_epic(store, id)?;
-            let removed = remove_attachment(&mut epic.frontmatter.attachments, name)
+            let removed = remove_asset(&mut epic.frontmatter.assets, name)
                 .ok_or_else(|| OpError::NoSuchAsset(name.to_string()))?;
             epic.frontmatter.updated = now();
             store.write_epic(id, &epic)?;
@@ -801,7 +801,7 @@ pub fn delete_asset(store: &Store, target: &Target, name: &str) -> Result<Attach
         }
         Target::Node(r) => {
             let mut node = read_node(store, r)?;
-            let removed = remove_attachment(&mut node.frontmatter.attachments, name)
+            let removed = remove_asset(&mut node.frontmatter.assets, name)
                 .ok_or_else(|| OpError::NoSuchAsset(name.to_string()))?;
             node.frontmatter.updated = now();
             store.write_node(&r.epic_id, r.number, &node)?;
@@ -812,10 +812,10 @@ pub fn delete_asset(store: &Store, target: &Target, name: &str) -> Result<Attach
 }
 
 /// List a target's assets (the index entries).
-pub fn list_assets(store: &Store, target: &Target) -> Result<Vec<Attachment>, OpError> {
+pub fn list_assets(store: &Store, target: &Target) -> Result<Vec<Asset>, OpError> {
     Ok(match target {
-        Target::Epic(id) => read_epic(store, id)?.frontmatter.attachments,
-        Target::Node(r) => read_node(store, r)?.frontmatter.attachments,
+        Target::Epic(id) => read_epic(store, id)?.frontmatter.assets,
+        Target::Node(r) => read_node(store, r)?.frontmatter.assets,
     })
 }
 

@@ -1,11 +1,13 @@
 //! Conformance: the filtering model for `list`.
 //!
 //! The normative rules exercised here:
+//!   * scope depth is one rule at both scopes — the default is the full tree
+//!     rooted at the scope, and `--shallow` keeps only the immediate level;
 //!   * the four filter families combine with AND;
 //!   * `--label` repeated is AND, a comma within one `--label` is an OR-group,
 //!     `--not-label` is "has none of";
-//!   * `--state` comma is OR and repeating it is an error; `--open`/`--resolved`
-//!     aggregators conflict with each other and with `--state`;
+//!   * `--status` comma is OR and repeating it is an error; `--open`/`--resolved`
+//!     aggregators conflict with each other and with `--status`;
 //!   * the built-in `regex` matcher is the default and matches name + summary +
 //!     body with zero external dependency;
 //!   * an external matcher, configured as an argv template in `.loti.conf`,
@@ -61,6 +63,36 @@ fn refs(raw: &str) -> Vec<String> {
 }
 
 #[test]
+fn scope_defaults_to_full_tree_and_shallow_keeps_only_the_immediate_level() {
+    // The scope depth rule is one rule at both scopes: the default is the full
+    // tree rooted at the scope; `--shallow` keeps only the immediate level (an
+    // epic's top-level nodes, or a node's direct children).
+    let s = Store::new();
+    s.epic("e");
+    let top = s.ticket("e", "top"); // e/1
+    let child = s.subticket("e", &top, "child"); // e/2 under e/1
+    let _grand = s.subticket("e", &child, "grand"); // e/3 under e/2
+    let _top2 = s.ticket("e", "top2"); // e/4
+
+    // Epic scope, default: the whole tree.
+    let all = s.ok(&["ticket", "list", "e", "--raw"]);
+    assert_eq!(refs(&all), vec!["e/1", "e/2", "e/3", "e/4"], "got: {all}");
+
+    // Epic scope, shallow: only the top-level nodes.
+    let top_only = s.ok(&["ticket", "list", "e", "--shallow", "--raw"]);
+    assert_eq!(refs(&top_only), vec!["e/1", "e/4"], "got: {top_only}");
+
+    // Node scope, default: the whole subtree beneath the anchor (anchor itself
+    // excluded).
+    let subtree = s.ok(&["ticket", "list", "e/1", "--raw"]);
+    assert_eq!(refs(&subtree), vec!["e/2", "e/3"], "got: {subtree}");
+
+    // Node scope, shallow: only the anchor's direct children.
+    let direct = s.ok(&["ticket", "list", "e/1", "--shallow", "--raw"]);
+    assert_eq!(refs(&direct), vec!["e/2"], "got: {direct}");
+}
+
+#[test]
 fn label_repeated_is_and_comma_is_or_group() {
     let s = Store::new();
     seed(&s);
@@ -70,7 +102,6 @@ fn label_repeated_is_and_comma_is_or_group() {
         "ticket",
         "list",
         "e",
-        "--recursive",
         "--raw",
         "--label",
         "urgent",
@@ -84,15 +115,7 @@ fn label_repeated_is_and_comma_is_or_group() {
 fn not_label_excludes_any_of_the_named() {
     let s = Store::new();
     seed(&s);
-    let out = s.ok(&[
-        "ticket",
-        "list",
-        "e",
-        "--recursive",
-        "--raw",
-        "--not-label",
-        "urgent",
-    ]);
+    let out = s.ok(&["ticket", "list", "e", "--raw", "--not-label", "urgent"]);
     assert_eq!(refs(&out), vec!["e/1"], "only the non-urgent node: {out}");
 }
 
@@ -100,15 +123,7 @@ fn not_label_excludes_any_of_the_named() {
 fn state_comma_is_or() {
     let s = Store::new();
     seed(&s);
-    let out = s.ok(&[
-        "ticket",
-        "list",
-        "e",
-        "--recursive",
-        "--raw",
-        "--state",
-        "to-do,done",
-    ]);
+    let out = s.ok(&["ticket", "list", "e", "--raw", "--status", "to-do,done"]);
     assert_eq!(refs(&out), vec!["e/2", "e/3"], "got: {out}");
 }
 
@@ -117,18 +132,11 @@ fn state_repeated_is_an_error() {
     let s = Store::new();
     seed(&s);
     let err = s.fail(&[
-        "ticket",
-        "list",
-        "e",
-        "--recursive",
-        "--state",
-        "to-do",
-        "--state",
-        "done",
+        "ticket", "list", "e", "--status", "to-do", "--status", "done",
     ]);
     assert!(
         !err.is_empty(),
-        "repeating --state must be an error, got empty stderr"
+        "repeating --status must be an error, got empty stderr"
     );
 }
 
@@ -136,7 +144,7 @@ fn state_repeated_is_an_error() {
 fn open_aggregator_selects_non_terminal() {
     let s = Store::new();
     seed(&s);
-    let out = s.ok(&["ticket", "list", "e", "--recursive", "--raw", "--open"]);
+    let out = s.ok(&["ticket", "list", "e", "--raw", "--open"]);
     assert_eq!(
         refs(&out),
         vec!["e/1", "e/2"],
@@ -148,7 +156,7 @@ fn open_aggregator_selects_non_terminal() {
 fn resolved_aggregator_selects_terminal() {
     let s = Store::new();
     seed(&s);
-    let out = s.ok(&["ticket", "list", "e", "--recursive", "--raw", "--resolved"]);
+    let out = s.ok(&["ticket", "list", "e", "--raw", "--resolved"]);
     assert_eq!(refs(&out), vec!["e/3"], "resolved = done|closed: {out}");
 }
 
@@ -156,18 +164,10 @@ fn resolved_aggregator_selects_terminal() {
 fn open_and_state_conflict() {
     let s = Store::new();
     seed(&s);
-    let err = s.fail(&[
-        "ticket",
-        "list",
-        "e",
-        "--recursive",
-        "--open",
-        "--state",
-        "done",
-    ]);
+    let err = s.fail(&["ticket", "list", "e", "--open", "--status", "done"]);
     assert!(
         !err.is_empty(),
-        "--open with --state must conflict, got empty stderr"
+        "--open with --status must conflict, got empty stderr"
     );
 }
 
@@ -175,7 +175,7 @@ fn open_and_state_conflict() {
 fn open_and_resolved_conflict() {
     let s = Store::new();
     seed(&s);
-    let err = s.fail(&["ticket", "list", "e", "--recursive", "--open", "--resolved"]);
+    let err = s.fail(&["ticket", "list", "e", "--open", "--resolved"]);
     assert!(!err.is_empty(), "--open with --resolved must conflict");
 }
 
@@ -184,26 +184,10 @@ fn builtin_regex_matches_name_summary_and_body() {
     let s = Store::new();
     seed(&s);
     // "alpha" appears only in e/1's body — the built-in default reaches bodies.
-    let by_body = s.ok(&[
-        "ticket",
-        "list",
-        "e",
-        "--recursive",
-        "--raw",
-        "--match",
-        "alpha",
-    ]);
+    let by_body = s.ok(&["ticket", "list", "e", "--raw", "--match", "alpha"]);
     assert_eq!(refs(&by_body), vec!["e/1"], "body match: {by_body}");
     // A name match ("Three") also works with no --match-impl given (regex default).
-    let by_name = s.ok(&[
-        "ticket",
-        "list",
-        "e",
-        "--recursive",
-        "--raw",
-        "--match",
-        "Three",
-    ]);
+    let by_name = s.ok(&["ticket", "list", "e", "--raw", "--match", "Three"]);
     assert_eq!(refs(&by_name), vec!["e/3"], "name match: {by_name}");
 }
 
@@ -213,15 +197,7 @@ fn structured_filters_and_match_combine_with_and() {
     seed(&s);
     // backend AND body-matches-"gamma" => only e/3 (e/1 is backend but body alpha).
     let out = s.ok(&[
-        "ticket",
-        "list",
-        "e",
-        "--recursive",
-        "--raw",
-        "--label",
-        "backend",
-        "--match",
-        "gamma",
+        "ticket", "list", "e", "--raw", "--label", "backend", "--match", "gamma",
     ]);
     assert_eq!(refs(&out), vec!["e/3"], "AND across families: {out}");
 }
@@ -234,7 +210,6 @@ fn unknown_match_impl_errors_listing_available() {
         "ticket",
         "list",
         "e",
-        "--recursive",
         "--match",
         "x",
         "--match-impl",
@@ -300,7 +275,6 @@ done
         "ticket",
         "list",
         "e",
-        "--recursive",
         "--raw",
         "--match",
         "gamma",
@@ -315,7 +289,6 @@ done
         "ticket",
         "list",
         "e",
-        "--recursive",
         "--raw",
         "--match",
         "body",
@@ -348,7 +321,6 @@ printf '%s\n/not/a/candidate/999.md\n' "$first"
         "ticket",
         "list",
         "e",
-        "--recursive",
         "--raw",
         "--match",
         "anything",
@@ -373,7 +345,6 @@ fn external_matcher_nonzero_empty_stdout_is_zero_matches() {
         "ticket",
         "list",
         "e",
-        "--recursive",
         "--raw",
         "--match",
         "x",
