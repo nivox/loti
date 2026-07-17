@@ -415,13 +415,28 @@ fn run_ticket<R: Read, O: Write, E: Write>(
             let store = open_store(cli, err)?;
             let node_ref = NodeRef::parse(&a.reference)?;
             let change = status_change_from_args(a)?;
-            let node = ops::set_node_status(&store, &node_ref, change)?;
+            let outcome = ops::set_node_status(&store, &node_ref, change)?;
             writeln!(
                 out,
                 "loti: ticket {node_ref} ({}) is now {}",
-                node.frontmatter.name,
-                node.frontmatter.status.wire_name()
+                outcome.node.frontmatter.name,
+                outcome.node.frontmatter.status.wire_name()
             )?;
+            // A cascade close also resolves descendants; name them so the wider
+            // effect is never silent.
+            if !outcome.cascaded_closed.is_empty() {
+                let refs = outcome
+                    .cascaded_closed
+                    .iter()
+                    .map(|n| format!("{}/{n}", node_ref.epic_id))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                writeln!(
+                    out,
+                    "loti: cascade also closed {} descendant(s): {refs}",
+                    outcome.cascaded_closed.len()
+                )?;
+            }
         }
         TicketCommand::Label(a) => run_label(cli, &a.command, Kind::Ticket, out, err)?,
         TicketCommand::Comment(a) => {

@@ -88,7 +88,7 @@ fn cascade_close_resolves_the_descendants_too() {
     s.epic("e");
     let parent = s.ticket("e", "parent");
     let child = s.subticket("e", &parent, "child");
-    s.ok(&[
+    let confirm = s.ok(&[
         "ticket",
         "status",
         &parent,
@@ -97,6 +97,12 @@ fn cascade_close_resolves_the_descendants_too() {
         "superseded",
         "--cascade",
     ]);
+    // The confirmation names the descendants the cascade also closed, so the
+    // wider effect is never silent.
+    assert!(
+        confirm.contains("cascade also closed") && confirm.contains(&child),
+        "cascade must report the closed descendants: {confirm}"
+    );
     // Both the node and its descendant are now closed with the reason.
     let pj = s.ok(&["ticket", "show", &parent, "--json"]);
     let cj = s.ok(&["ticket", "show", &child, "--json"]);

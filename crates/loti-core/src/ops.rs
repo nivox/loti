@@ -407,15 +407,30 @@ pub enum NodeStatusChange {
     },
 }
 
+/// The result of a node status change: the updated node, plus the descendants a
+/// cascade close resolved along with it. `cascaded_closed` lists their node
+/// numbers in ascending order and is empty unless a cascade actually closed
+/// something, so a caller can report the wider effect a cascade had.
+#[derive(Debug, Clone)]
+pub struct StatusOutcome {
+    /// The node whose status was set.
+    pub node: NodeFile,
+    /// Descendants closed by a cascade, ascending; empty for a non-cascade or
+    /// non-closing change.
+    pub cascaded_closed: Vec<u64>,
+}
+
 /// Apply a node state transition, enforcing the state machine. Returns the
-/// updated node. For a cascade close, the descendants are closed too (ascending
-/// order, per-file, idempotent); a partial failure is reported.
+/// updated node and any descendants a cascade close resolved with it. For a
+/// cascade close, the descendants are closed too (ascending order, per-file,
+/// idempotent); a partial failure is reported.
 pub fn set_node_status(
     store: &Store,
     node_ref: &NodeRef,
     change: NodeStatusChange,
-) -> Result<NodeFile, OpError> {
+) -> Result<StatusOutcome, OpError> {
     let mut node = read_node(store, node_ref)?;
+    let mut cascaded_closed: Vec<u64> = Vec::new();
 
     match change {
         NodeStatusChange::ToDo => {
@@ -465,6 +480,7 @@ pub fn set_node_status(
                     &plan.cascade_targets,
                     reason.clone(),
                 )?;
+                cascaded_closed = plan.cascade_targets.clone();
             }
             node.frontmatter.status = NodeState::Closed;
             node.frontmatter.close_reason = reason;
@@ -474,7 +490,10 @@ pub fn set_node_status(
 
     node.frontmatter.updated = now();
     store.write_node(&node_ref.epic_id, node_ref.number, &node)?;
-    Ok(node)
+    Ok(StatusOutcome {
+        node,
+        cascaded_closed,
+    })
 }
 
 /// Close each listed descendant, in the given (ascending) order, as an
@@ -1144,9 +1163,9 @@ mod tests {
         let n = create_node(&s, new_node("e", None)).unwrap();
         let r = NodeRef::new("e", n.frontmatter.number);
         let ip = set_node_status(&s, &r, NodeStatusChange::InProgress).unwrap();
-        assert_eq!(ip.frontmatter.status, NodeState::InProgress);
+        assert_eq!(ip.node.frontmatter.status, NodeState::InProgress);
         let td = set_node_status(&s, &r, NodeStatusChange::ToDo).unwrap();
-        assert_eq!(td.frontmatter.status, NodeState::ToDo);
+        assert_eq!(td.node.frontmatter.status, NodeState::ToDo);
     }
 
     #[test]
@@ -1164,10 +1183,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(blocked.frontmatter.status, NodeState::Blocked);
-        assert_eq!(blocked.frontmatter.blocked_by.refs, vec!["e/99"]);
+        assert_eq!(blocked.node.frontmatter.status, NodeState::Blocked);
+        assert_eq!(blocked.node.frontmatter.blocked_by.refs, vec!["e/99"]);
         assert_eq!(
-            blocked.frontmatter.blocked_by.reason.as_deref(),
+            blocked.node.frontmatter.blocked_by.reason.as_deref(),
             Some("waiting on a key")
         );
     }
@@ -1190,7 +1209,7 @@ mod tests {
         // Resolve the child, then the parent can be done.
         set_node_status(&s, &cr, NodeStatusChange::Done).unwrap();
         let done = set_node_status(&s, &pr, NodeStatusChange::Done).unwrap();
-        assert_eq!(done.frontmatter.status, NodeState::Done);
+        assert_eq!(done.node.frontmatter.status, NodeState::Done);
     }
 
     #[test]
@@ -1248,8 +1267,13 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(closed.frontmatter.status, NodeState::Closed);
-        assert_eq!(closed.frontmatter.close_reason.as_deref(), Some("obsolete"));
+        assert_eq!(closed.node.frontmatter.status, NodeState::Closed);
+        assert_eq!(
+            closed.node.frontmatter.close_reason.as_deref(),
+            Some("obsolete")
+        );
+        // The cascade's wider effect is reported: the child is listed.
+        assert_eq!(closed.cascaded_closed, vec![cr.number]);
         let child_after = s.read_node("e", cr.number).unwrap();
         assert_eq!(child_after.frontmatter.status, NodeState::Closed);
         assert_eq!(
@@ -1275,18 +1299,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            closed.frontmatter.close_reason.as_deref(),
+            closed.node.frontmatter.close_reason.as_deref(),
             Some("superseded")
         );
 
         // Moving back to an active state must not keep the stale reason.
         let reopened = set_node_status(&s, &r, NodeStatusChange::InProgress).unwrap();
-        assert_eq!(reopened.frontmatter.status, NodeState::InProgress);
-        assert_eq!(reopened.frontmatter.close_reason, None);
+        assert_eq!(reopened.node.frontmatter.status, NodeState::InProgress);
+        assert_eq!(reopened.node.frontmatter.close_reason, None);
 
         // `done` is terminal but not `closed`, so it carries no reason either.
         let done = set_node_status(&s, &r, NodeStatusChange::Done).unwrap();
-        assert_eq!(done.frontmatter.close_reason, None);
+        assert_eq!(done.node.frontmatter.close_reason, None);
     }
 
     #[test]
