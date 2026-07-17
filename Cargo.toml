@@ -6,7 +6,11 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.0"
+# Main always carries the NEXT release with a `-dev` pre-release suffix, so
+# flake/`--version` builds off main sort before (and are visibly distinct from)
+# the final release. A release commit strips the suffix; the release workflow
+# refuses to build a tag whose version still carries `-dev`.
+version = "0.1.0-dev"
 edition = "2021"
 rust-version = "1.96"
 license = "MIT"
