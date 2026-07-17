@@ -168,6 +168,10 @@ pub enum TransitionError {
     /// cleared) as a side effect of another operation.
     #[error("the blocked state is only ever set explicitly, never automatically")]
     BlockedMustBeExplicit,
+    /// `blocked` must carry a non-empty structured blocker: at least one node
+    /// reference or a free-form reason, so a blocked node always says why.
+    #[error("blocking a node requires a blocker: pass --blocked-by and/or --reason")]
+    BlockedNeedsBlocker,
 }
 
 /// Whether a set of descendant statuses are all resolved (terminal). An empty
@@ -263,17 +267,22 @@ pub fn plan_close(
 
 /// Validate a request to enter the `blocked` state.
 ///
-/// This exists to make the "explicit only" rule checkable: `loti` never sets or
-/// clears `blocked` as a side effect. `explicitly_requested` must be true — a
-/// value of false means some path tried to reach `blocked` implicitly, which is
-/// refused. The structured blocker itself (references and/or a free-form
-/// reason) is modelled by the frontmatter and may be empty.
-pub fn validate_blocked(explicitly_requested: bool) -> Result<(), TransitionError> {
-    if explicitly_requested {
-        Ok(())
-    } else {
-        Err(TransitionError::BlockedMustBeExplicit)
+/// Two rules hold. First, `loti` never sets or clears `blocked` as a side
+/// effect: `explicitly_requested` must be true — false means some path tried to
+/// reach `blocked` implicitly, which is refused. Second, the blocker must not be
+/// empty: `has_blocker` records whether at least one node reference or a
+/// free-form reason was supplied, so a blocked node always states why.
+pub fn validate_blocked(
+    explicitly_requested: bool,
+    has_blocker: bool,
+) -> Result<(), TransitionError> {
+    if !explicitly_requested {
+        return Err(TransitionError::BlockedMustBeExplicit);
     }
+    if !has_blocker {
+        return Err(TransitionError::BlockedNeedsBlocker);
+    }
+    Ok(())
 }
 
 /// The three states an epic can be in. `Closed` is stored; the other two are
@@ -537,10 +546,19 @@ mod tests {
 
     #[test]
     fn blocked_must_be_explicit() {
-        assert!(validate_blocked(true).is_ok());
+        assert!(validate_blocked(true, true).is_ok());
         assert_eq!(
-            validate_blocked(false),
+            validate_blocked(false, true),
             Err(TransitionError::BlockedMustBeExplicit)
+        );
+    }
+
+    #[test]
+    fn blocked_requires_a_non_empty_blocker() {
+        // An explicit request with neither a ref nor a reason is refused.
+        assert_eq!(
+            validate_blocked(true, false),
+            Err(TransitionError::BlockedNeedsBlocker)
         );
     }
 

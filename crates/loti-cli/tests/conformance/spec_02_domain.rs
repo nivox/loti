@@ -131,6 +131,46 @@ fn blocked_carries_its_structured_blocked_by() {
 }
 
 #[test]
+fn blocked_refuses_an_empty_blocker() {
+    // `--blocked` with neither a ref nor a reason is refused: a blocked node
+    // must always state why it is blocked.
+    let s = Store::new();
+    s.epic("e");
+    let a = s.ticket("e", "a");
+    let err = s.fail(&["ticket", "status", &a, "--blocked"]);
+    assert!(
+        err.contains("requires a blocker"),
+        "empty blocker must be refused: {err}"
+    );
+    // The node stays in its prior state, not moved to blocked.
+    let json = s.ok(&["ticket", "show", &a, "--json"]);
+    assert!(json.contains("\"status\": \"to-do\""), "unchanged: {json}");
+}
+
+#[test]
+fn reactivating_a_closed_node_drops_its_close_reason() {
+    // A non-closed node must not carry a close-reason; leaving `closed` clears
+    // it, mirroring how leaving `blocked` clears blocked-by.
+    let s = Store::new();
+    s.epic("e");
+    let a = s.ticket("e", "a");
+    s.ok(&["ticket", "status", &a, "--closed", "--reason", "superseded"]);
+    let closed = s.ok(&["ticket", "show", &a, "--json"]);
+    assert!(closed.contains("superseded"), "reason stored: {closed}");
+
+    s.ok(&["ticket", "status", &a, "--in-progress"]);
+    let reopened = s.ok(&["ticket", "show", &a, "--json"]);
+    assert!(
+        reopened.contains("\"status\": \"in-progress\""),
+        "reactivated: {reopened}"
+    );
+    assert!(
+        reopened.contains("\"close-reason\": null"),
+        "stale close-reason must be cleared: {reopened}"
+    );
+}
+
+#[test]
 fn blocked_is_never_set_automatically_by_other_operations() {
     let s = Store::new();
     s.epic("e");

@@ -421,26 +421,35 @@ pub fn set_node_status(
         NodeStatusChange::ToDo => {
             node.frontmatter.status = NodeState::ToDo;
             node.frontmatter.blocked_by = Default::default();
+            // A non-closed node carries no close-reason; clear any left from a
+            // prior close so reactivating a node never keeps a stale reason.
+            node.frontmatter.close_reason = None;
         }
         NodeStatusChange::InProgress => {
             node.frontmatter.status = NodeState::InProgress;
             node.frontmatter.blocked_by = Default::default();
+            node.frontmatter.close_reason = None;
         }
         NodeStatusChange::Blocked { refs, reason } => {
-            // `blocked` is only ever set explicitly; reaching this arm is that
-            // explicit request, so the rule is satisfied by construction.
-            validate_blocked(true)?;
+            // `blocked` is set only explicitly (this arm) and must carry a
+            // non-empty blocker — at least one ref or a non-blank reason.
+            let has_blocker =
+                !refs.is_empty() || reason.as_deref().map(|r| !r.trim().is_empty()) == Some(true);
+            validate_blocked(true, has_blocker)?;
             node.frontmatter.status = NodeState::Blocked;
             node.frontmatter.blocked_by = crate::model::BlockedBy {
                 refs: refs.iter().map(|r| r.to_string()).collect(),
                 reason,
             };
+            node.frontmatter.close_reason = None;
         }
         NodeStatusChange::Done => {
             let descendants = descendants_of(store, node_ref)?;
             validate_done(&descendants)?;
             node.frontmatter.status = NodeState::Done;
             node.frontmatter.blocked_by = Default::default();
+            // `done` is terminal but not `closed`; it never carries a reason.
+            node.frontmatter.close_reason = None;
         }
         NodeStatusChange::Closed { reason, cascade } => {
             let descendants = descendants_of(store, node_ref)?;
@@ -1247,6 +1256,58 @@ mod tests {
             child_after.frontmatter.close_reason.as_deref(),
             Some("obsolete")
         );
+    }
+
+    #[test]
+    fn reactivating_a_closed_node_clears_its_close_reason() {
+        let (_d, s) = seeded();
+        create_epic(&s, new_epic("e")).unwrap();
+        let n = create_node(&s, new_node("e", None)).unwrap();
+        let r = NodeRef::new("e", n.frontmatter.number);
+
+        let closed = set_node_status(
+            &s,
+            &r,
+            NodeStatusChange::Closed {
+                reason: Some("superseded".into()),
+                cascade: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            closed.frontmatter.close_reason.as_deref(),
+            Some("superseded")
+        );
+
+        // Moving back to an active state must not keep the stale reason.
+        let reopened = set_node_status(&s, &r, NodeStatusChange::InProgress).unwrap();
+        assert_eq!(reopened.frontmatter.status, NodeState::InProgress);
+        assert_eq!(reopened.frontmatter.close_reason, None);
+
+        // `done` is terminal but not `closed`, so it carries no reason either.
+        let done = set_node_status(&s, &r, NodeStatusChange::Done).unwrap();
+        assert_eq!(done.frontmatter.close_reason, None);
+    }
+
+    #[test]
+    fn blocked_requires_a_blocker() {
+        let (_d, s) = seeded();
+        create_epic(&s, new_epic("e")).unwrap();
+        let n = create_node(&s, new_node("e", None)).unwrap();
+        let r = NodeRef::new("e", n.frontmatter.number);
+        assert!(matches!(
+            set_node_status(
+                &s,
+                &r,
+                NodeStatusChange::Blocked {
+                    refs: vec![],
+                    reason: None,
+                },
+            ),
+            Err(OpError::Transition(
+                domain::TransitionError::BlockedNeedsBlocker
+            ))
+        ));
     }
 
     #[test]

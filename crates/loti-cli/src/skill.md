@@ -56,10 +56,11 @@ A node is in exactly one state:
 
 - **to-do** — created, not started.
 - **in-progress** — actively being worked.
-- **blocked** — cannot proceed. Carries a structured **blocked-by**: zero or
-  more node references and/or a free-form reason (for a non-ticket blocker, such
-  as waiting on an external key). `loti` never sets or clears `blocked` for you —
-  it is always an explicit choice.
+- **blocked** — cannot proceed. Carries a structured **blocked-by** that must
+  not be empty: at least one node reference and/or a free-form reason (for a
+  non-ticket blocker, such as waiting on an external key), so a blocked node
+  always says why. `loti` never sets or clears `blocked` for you — it is always
+  an explicit choice.
 - **done** — delivered successfully. Terminal.
 - **closed** — resolved *without* completing (won't-do, cancelled, obsolete,
   duplicate, superseded). Carries a **reason**. Terminal.
@@ -157,10 +158,11 @@ comments over silent work.
   two rules above; a node is never frozen. You can reclassify `done`→`closed`
   (or the reverse), or move a terminal node back to an active state — the state
   machine allows it.
-- **`blocked` is never automatic.** You set it and you clear it; moving to
-  another state clears the blocked-by. `--blocked-by` refs are a free
-  annotation: `loti` records them but does not check the blockers exist or are
-  still unresolved.
+- **`blocked` is never automatic, and never empty.** You set it and you clear
+  it; moving to another state clears the blocked-by. `--blocked` requires at
+  least one of `--blocked-by`/`--reason` (an empty blocker is refused). The
+  `--blocked-by` refs are a free annotation: `loti` records them but does not
+  check the blockers exist or are still unresolved.
 - **An asset's name defaults to the file's basename with `--file`.** From stdin
   there is nothing to infer, so `--name` is required there.
 - **Bodies, comment text, and asset data never take an inline flag.** Pipe them
