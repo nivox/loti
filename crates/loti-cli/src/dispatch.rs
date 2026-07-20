@@ -14,7 +14,7 @@
 use std::io::{Read, Write};
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use loti_core::domain::NodeRef;
 use loti_core::filter::{self, FilterInput, StructuredFilters};
@@ -610,6 +610,31 @@ fn run_asset<R: Read, O: Write, E: Write>(
             let bytes = read_bytes(a.content.file.as_deref(), stdin, stdin_is_tty, true)?;
             let entry = ops::add_asset(&store, &target, &name, a.description.clone(), &bytes)?;
             writeln!(out, "loti: added asset {}", entry.name)?;
+        }
+        AssetCommand::Update(a) => {
+            let store = open_store(cli, err)?;
+            let target = target_of(kind, &a.reference)?;
+            // Data is optional here: absent source ⇒ keep current bytes. An
+            // update with neither new data nor a --description has nothing to
+            // persist and is rejected rather than silently touching `updated`.
+            let bytes =
+                content_input::resolve_content(a.content.file.as_deref(), stdin, stdin_is_tty, false)?;
+            let description = a.description.clone().map(|d| if d.is_empty() { None } else { Some(d) });
+            if bytes.is_none() && description.is_none() {
+                bail!(
+                    "nothing to update: pass --description, or new data via stdin/--file"
+                );
+            }
+            let entry = ops::update_asset(&store, &target, &a.name, description, bytes.as_deref())?;
+            writeln!(out, "loti: updated asset {}", entry.name)?;
+        }
+        AssetCommand::Show(a) => {
+            let store = open_store(cli, err)?;
+            let target = target_of(kind, &a.reference)?;
+            // Verbatim bytes to stdout — no trailing newline, so binary assets
+            // round-trip byte-for-byte through a pipe.
+            let bytes = ops::read_asset(&store, &target, &a.name)?;
+            out.write_all(&bytes)?;
         }
         AssetCommand::Delete(a) => {
             let store = open_store(cli, err)?;

@@ -111,7 +111,7 @@ pub enum EpicCommand {
     Label(LabelArgs),
     /// Manage comments (add/edit/delete/list). Actor required on mutations.
     Comment(CommentArgs),
-    /// Manage assets (add/delete/list). Delete is hard.
+    /// Manage assets (add/update/show/delete/list). Delete is hard.
     Asset(AssetArgs),
     /// List epics — a flat roster.
     List(EpicListArgs),
@@ -210,7 +210,7 @@ pub enum TicketCommand {
     Label(LabelArgs),
     /// Manage comments (add/edit/delete/list). Actor required on mutations.
     Comment(CommentArgs),
-    /// Manage assets (add/delete/list). Delete is hard.
+    /// Manage assets (add/update/show/delete/list). Delete is hard.
     Asset(AssetArgs),
     /// List nodes under a required scope.
     List(TicketListArgs),
@@ -472,9 +472,15 @@ pub struct AssetArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum AssetCommand {
-    /// Add an asset. Data ← stdin or --file (never inline). --name defaults to
-    /// the --file basename.
+    /// Add a new asset (create-only; a name already present is refused — use
+    /// `update` to replace one). Data ← stdin or --file (never inline). --name
+    /// defaults to the --file basename.
     Add(AssetAddArgs),
+    /// Update an asset in place: replace its data and/or description. Data ←
+    /// stdin or --file (never inline). Use `add` to create a new asset.
+    Update(AssetUpdateArgs),
+    /// Read an asset's data back to stdout, verbatim.
+    Show(AssetShowArgs),
     /// Delete an asset by name — HARD delete.
     Delete(AssetDeleteArgs),
     /// List assets.
@@ -494,6 +500,29 @@ pub struct AssetAddArgs {
     /// Asset data: stdin or --file (never inline).
     #[command(flatten)]
     pub content: ContentInput,
+}
+
+#[derive(Debug, Args)]
+pub struct AssetUpdateArgs {
+    #[arg(value_name = "REF")]
+    pub reference: String,
+    #[arg(value_name = "NAME")]
+    pub name: String,
+    /// Replace the description (inline). Pass an empty string to clear it.
+    #[arg(long, value_name = "S")]
+    pub description: Option<String>,
+    /// Replacement data: stdin or --file (never inline). Omit to keep the
+    /// current data and update only the description.
+    #[command(flatten)]
+    pub content: ContentInput,
+}
+
+#[derive(Debug, Args)]
+pub struct AssetShowArgs {
+    #[arg(value_name = "REF")]
+    pub reference: String,
+    #[arg(value_name = "NAME")]
+    pub name: String,
 }
 
 #[derive(Debug, Args)]

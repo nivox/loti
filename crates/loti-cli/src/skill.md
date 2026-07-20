@@ -18,18 +18,26 @@ the human always has a legible picture of what happened and why.
 
 ## The one hard rule (read this first)
 
-**Never hand-author or hand-edit the store files. Never bypass the CLI.**
+**Never touch the store files directly — for reading or writing. Every
+operation goes through the `loti` CLI.**
 
 The store is plain markdown so a **human can read it** — that legibility is for
-inspection only, never an authoring path. Every correctness guarantee
-(numbering, state transitions, attribution, locking, format versioning) is
-enforced by the CLI, **not** by the files. Editing a file by hand — or writing
-one directly instead of running a command — silently breaks those guarantees:
-duplicate or reused numbers, illegal state changes, corrupted concurrent writes,
-lost audit trail.
+human inspection only, never a path for a tool or agent to read or write. Every
+correctness guarantee (numbering, state transitions, attribution, locking,
+format versioning) is enforced by the CLI, **not** by the files. Editing a file
+by hand — or writing one directly instead of running a command — silently breaks
+those guarantees: duplicate or reused numbers, illegal state changes, corrupted
+concurrent writes, lost audit trail.
 
-So: **drive every change through a `loti` command.** If a command to do what you
-need does not seem to exist, re-read the help — do not reach for the files.
+Reading directly is banned too, not just as a courtesy: file paths, layout, and
+on-disk format are internal and may change, and a read that sidesteps the CLI
+teaches the wrong habit and invites the next step of writing directly. This
+covers **assets** as well — never open, copy, or search an asset's file on
+disk; read it back with `asset show` and change it with `asset update`.
+
+So: **drive every operation, read and write alike, through a `loti` command.**
+If a command to do what you need does not seem to exist, re-read the help — do
+not reach for the files.
 
 ## Core concepts
 
@@ -129,8 +137,10 @@ A typical path:
    (add `--cascade` to close open descendants too) when work is dropped rather
    than finished. Status is set-only — read it back with `show`.
 5. **Attribute and evidence.** Add a `comment` (with `-u` or `-a <name>`) to
-   explain a decision or a status change; `asset add` to attach proof.
-   Organise with `label add`.
+   explain a decision or a status change; `asset add` to attach proof. Read an
+   asset back with `asset show <ref> <name>` (bytes to stdout, verbatim) and
+   change it with `asset update <ref> <name>` (new data via stdin/`--file`
+   and/or a new `--description`). Organise with `label add`.
 6. **Read and report.** `loti ticket show <ref>` for one node,
    `loti ticket list <epic-id>` for a scope, and `loti epic list` for the
    roster. A list defaults to the full tree rooted at the scope; add `--shallow`
@@ -165,6 +175,14 @@ comments over silent work.
   check the blockers exist or are still unresolved.
 - **An asset's name defaults to the file's basename with `--file`.** From stdin
   there is nothing to infer, so `--name` is required there.
+- **Never read an asset off disk — use `asset show`.** Its bytes come back on
+  stdout exactly as stored (no trailing newline), so binary assets round-trip
+  through a pipe. `asset add` is **create-only** — a name already present is
+  refused, mirroring `epic create` refusing a duplicate id; `asset update`
+  replaces the data and/or description in place and refuses an unknown name.
+  Create with `add`, change with `update` — neither silently clobbers. "I was
+  only reading it" is not an exception to the hard rule: reads go through the
+  CLI too.
 - **Bodies, comment text, and asset data never take an inline flag.** Pipe them
   on stdin or pass `--file`. An interactive terminal with no input is treated as
   empty (it never hangs waiting).

@@ -22,7 +22,7 @@ use crate::domain::{
 };
 use crate::lock::{self, Force};
 use crate::model::{
-    next_comment_id, remove_asset, upsert_asset, Asset, Comment, EpicFile, EpicFrontmatter,
+    insert_asset, next_comment_id, remove_asset, Asset, Comment, EpicFile, EpicFrontmatter,
     NodeFile, NodeFrontmatter,
 };
 use crate::store::{Store, StoreError};
@@ -76,9 +76,13 @@ pub enum OpError {
     /// Addressing a comment id that does not exist on the target.
     #[error("comment #{0} does not exist here")]
     NoSuchComment(u64),
-    /// Deleting an asset that is not indexed on the target.
+    /// Deleting/reading/updating an asset that is not indexed on the target.
     #[error("asset '{0}' does not exist here")]
     NoSuchAsset(String),
+    /// Adding an asset whose name is already taken. An asset name is a
+    /// caller-chosen key; `add` never overwrites — use `update` to replace one.
+    #[error("asset '{0}' already exists here; use `asset update` to replace it")]
+    AssetExists(String),
     /// An asset add was given no name and no --file to derive one from.
     #[error("an asset needs a name: pass --name, or --file so the basename can be used")]
     AssetNeedsName,
@@ -778,9 +782,10 @@ fn with_comments<T>(
 // ---------------------------------------------------------------------------
 
 /// Add an asset to a target: copy the bytes verbatim into the companion
-/// directory and upsert the frontmatter index. `name` is required (the CLI
-/// derives a default from the --file basename before calling). A repeat name
-/// replaces both the bytes and the index entry. Returns the resulting entry.
+/// directory and insert the frontmatter index entry. `name` is required (the
+/// CLI derives a default from the --file basename before calling). `add` is
+/// create-only — a name already indexed here is refused with `AssetExists`;
+/// replacing an existing asset is `update_asset`'s job. Returns the new entry.
 pub fn add_asset(
     store: &Store,
     target: &Target,
@@ -795,16 +800,21 @@ pub fn add_asset(
     match target {
         Target::Epic(id) => {
             let mut epic = read_epic(store, id)?;
-            // Land the bytes first; the index write below is the guarded RMW.
+            // Reject a duplicate before landing bytes, so a refused add never
+            // touches the companion dir. `add` creates; `update` replaces.
+            if !insert_asset(&mut epic.frontmatter.assets, entry.clone()) {
+                return Err(OpError::AssetExists(name.to_string()));
+            }
             store.copy_epic_asset(id, name, bytes)?;
-            upsert_asset(&mut epic.frontmatter.assets, entry.clone());
             epic.frontmatter.updated = now();
             store.write_epic(id, &epic)?;
         }
         Target::Node(r) => {
             let mut node = read_node(store, r)?;
+            if !insert_asset(&mut node.frontmatter.assets, entry.clone()) {
+                return Err(OpError::AssetExists(name.to_string()));
+            }
             store.copy_node_asset(&r.epic_id, r.number, name, bytes)?;
-            upsert_asset(&mut node.frontmatter.assets, entry.clone());
             node.frontmatter.updated = now();
             store.write_node(&r.epic_id, r.number, &node)?;
         }
@@ -835,6 +845,83 @@ pub fn delete_asset(store: &Store, target: &Target, name: &str) -> Result<Asset,
             store.write_node(&r.epic_id, r.number, &node)?;
             let _ = store.remove_node_asset(&r.epic_id, r.number, name);
             Ok(removed)
+        }
+    }
+}
+
+/// Read an asset's bytes. Refuses if the name is not indexed, so a caller never
+/// races the index against stray files on disk — the index is authoritative.
+pub fn read_asset(store: &Store, target: &Target, name: &str) -> Result<Vec<u8>, OpError> {
+    match target {
+        Target::Epic(id) => {
+            let epic = read_epic(store, id)?;
+            if !epic.frontmatter.assets.iter().any(|a| a.name == name) {
+                return Err(OpError::NoSuchAsset(name.to_string()));
+            }
+            Ok(store.read_epic_asset(id, name)?)
+        }
+        Target::Node(r) => {
+            let node = read_node(store, r)?;
+            if !node.frontmatter.assets.iter().any(|a| a.name == name) {
+                return Err(OpError::NoSuchAsset(name.to_string()));
+            }
+            Ok(store.read_node_asset(&r.epic_id, r.number, name)?)
+        }
+    }
+}
+
+/// Update an existing asset in place: replace its bytes and/or its description.
+/// Refuses if the name is not indexed (use `add_asset` to create). `description`
+/// is `Some` to set/clear it, `None` to leave it; `bytes` is `Some` to replace
+/// the payload, `None` to leave it. The caller guarantees at least one is set —
+/// a no-op update has nothing to persist.
+pub fn update_asset(
+    store: &Store,
+    target: &Target,
+    name: &str,
+    description: Option<Option<String>>,
+    bytes: Option<&[u8]>,
+) -> Result<Asset, OpError> {
+    match target {
+        Target::Epic(id) => {
+            let mut epic = read_epic(store, id)?;
+            let entry = epic
+                .frontmatter
+                .assets
+                .iter_mut()
+                .find(|a| a.name == name)
+                .ok_or_else(|| OpError::NoSuchAsset(name.to_string()))?;
+            if let Some(desc) = description {
+                entry.description = desc;
+            }
+            let updated = entry.clone();
+            // Land replacement bytes first (an overwrite), then the guarded
+            // index write; the name is unchanged so no stale file is orphaned.
+            if let Some(bytes) = bytes {
+                store.copy_epic_asset(id, name, bytes)?;
+            }
+            epic.frontmatter.updated = now();
+            store.write_epic(id, &epic)?;
+            Ok(updated)
+        }
+        Target::Node(r) => {
+            let mut node = read_node(store, r)?;
+            let entry = node
+                .frontmatter
+                .assets
+                .iter_mut()
+                .find(|a| a.name == name)
+                .ok_or_else(|| OpError::NoSuchAsset(name.to_string()))?;
+            if let Some(desc) = description {
+                entry.description = desc;
+            }
+            let updated = entry.clone();
+            if let Some(bytes) = bytes {
+                store.copy_node_asset(&r.epic_id, r.number, name, bytes)?;
+            }
+            node.frontmatter.updated = now();
+            store.write_node(&r.epic_id, r.number, &node)?;
+            Ok(updated)
         }
     }
 }
@@ -1484,18 +1571,23 @@ mod tests {
     }
 
     #[test]
-    fn asset_add_replaces_same_name() {
+    fn asset_add_refuses_duplicate_name() {
         let (_d, s) = seeded();
         create_epic(&s, new_epic("e")).unwrap();
         let target = Target::Epic("e".into());
         add_asset(&s, &target, "a.txt", None, b"first").unwrap();
-        add_asset(&s, &target, "a.txt", Some("second".into()), b"second").unwrap();
+        // A repeat name is refused; `update` is the replace path.
+        assert!(matches!(
+            add_asset(&s, &target, "a.txt", Some("second".into()), b"second"),
+            Err(OpError::AssetExists(_))
+        ));
+        // The original entry and bytes are untouched by the refused add.
         let assets = list_assets(&s, &target).unwrap();
         assert_eq!(assets.len(), 1);
-        assert_eq!(assets[0].description.as_deref(), Some("second"));
+        assert_eq!(assets[0].description, None);
         assert_eq!(
             std::fs::read(s.epic_asset_dir("e").join("a.txt")).unwrap(),
-            b"second"
+            b"first"
         );
     }
 
@@ -1506,6 +1598,78 @@ mod tests {
         let target = Target::Epic("e".into());
         assert!(matches!(
             delete_asset(&s, &target, "ghost"),
+            Err(OpError::NoSuchAsset(_))
+        ));
+    }
+
+    #[test]
+    fn read_asset_returns_indexed_bytes() {
+        let (_d, s) = seeded();
+        create_epic(&s, new_epic("e")).unwrap();
+        let target = Target::Epic("e".into());
+        add_asset(&s, &target, "a.bin", None, &[0u8, 1, 2, 3]).unwrap();
+        assert_eq!(read_asset(&s, &target, "a.bin").unwrap(), vec![0u8, 1, 2, 3]);
+    }
+
+    #[test]
+    fn read_missing_asset_is_an_error() {
+        let (_d, s) = seeded();
+        create_epic(&s, new_epic("e")).unwrap();
+        let target = Target::Epic("e".into());
+        assert!(matches!(
+            read_asset(&s, &target, "ghost"),
+            Err(OpError::NoSuchAsset(_))
+        ));
+    }
+
+    #[test]
+    fn update_asset_replaces_bytes_and_description() {
+        let (_d, s) = seeded();
+        create_epic(&s, new_epic("e")).unwrap();
+        let target = Target::Epic("e".into());
+        add_asset(&s, &target, "a.txt", Some("old".into()), b"first").unwrap();
+
+        // Replace both data and description.
+        update_asset(
+            &s,
+            &target,
+            "a.txt",
+            Some(Some("new".into())),
+            Some(b"second"),
+        )
+        .unwrap();
+        let assets = list_assets(&s, &target).unwrap();
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].description.as_deref(), Some("new"));
+        assert_eq!(read_asset(&s, &target, "a.txt").unwrap(), b"second");
+    }
+
+    #[test]
+    fn update_asset_can_change_description_only() {
+        let (_d, s) = seeded();
+        create_epic(&s, new_epic("e")).unwrap();
+        let target = Target::Epic("e".into());
+        add_asset(&s, &target, "a.txt", Some("old".into()), b"keep").unwrap();
+
+        // Leaving bytes None must not disturb the stored payload.
+        update_asset(&s, &target, "a.txt", Some(Some("new".into())), None).unwrap();
+        assert_eq!(read_asset(&s, &target, "a.txt").unwrap(), b"keep");
+        let assets = list_assets(&s, &target).unwrap();
+        assert_eq!(assets[0].description.as_deref(), Some("new"));
+
+        // Clearing the description (Some(None)) leaves the bytes alone too.
+        update_asset(&s, &target, "a.txt", Some(None), None).unwrap();
+        assert_eq!(list_assets(&s, &target).unwrap()[0].description, None);
+        assert_eq!(read_asset(&s, &target, "a.txt").unwrap(), b"keep");
+    }
+
+    #[test]
+    fn update_missing_asset_is_an_error() {
+        let (_d, s) = seeded();
+        create_epic(&s, new_epic("e")).unwrap();
+        let target = Target::Epic("e".into());
+        assert!(matches!(
+            update_asset(&s, &target, "ghost", Some(Some("x".into())), None),
             Err(OpError::NoSuchAsset(_))
         ));
     }

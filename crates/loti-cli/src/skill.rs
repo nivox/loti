@@ -41,9 +41,13 @@ mod tests {
 
     #[test]
     fn carries_the_prominent_hard_rule() {
-        // The bypass prohibition must be present and stated as a rule.
+        // The bypass prohibition must be present, stated as a rule, and cover
+        // reads as well as writes so a "just reading" excuse cannot sidestep it.
         assert!(
-            SKILL.contains("Never hand-author or hand-edit the store files. Never bypass the CLI."),
+            SKILL.contains(
+                "Never touch the store files directly — for reading or writing. Every\n\
+                 operation goes through the `loti` CLI."
+            ),
             "the hard rule line must be present verbatim"
         );
     }

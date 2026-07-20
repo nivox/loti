@@ -455,6 +455,23 @@ impl Store {
         remove_file(&self.node_asset_dir(epic_id, number).join(name))
     }
 
+    /// Read an epic asset's bytes verbatim. The index is the source of truth for
+    /// which assets exist; callers gate on it, so a missing file here is a
+    /// store-corruption I/O error, not an absent asset.
+    pub fn read_epic_asset(&self, epic_id: &str, name: &str) -> Result<Vec<u8>, StoreError> {
+        read_bytes(&self.epic_asset_dir(epic_id).join(name))
+    }
+
+    /// Read a node asset's bytes verbatim.
+    pub fn read_node_asset(
+        &self,
+        epic_id: &str,
+        number: u64,
+        name: &str,
+    ) -> Result<Vec<u8>, StoreError> {
+        read_bytes(&self.node_asset_dir(epic_id, number).join(name))
+    }
+
     /// Read the store's format metadata.
     pub fn read_meta(&self) -> Result<Meta, meta::MetaError> {
         meta::read(&self.root)
@@ -581,6 +598,13 @@ fn create_dir_all(path: &Path) -> Result<(), StoreError> {
 
 fn remove_file(path: &Path) -> Result<(), StoreError> {
     std::fs::remove_file(path).map_err(|source| StoreError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn read_bytes(path: &Path) -> Result<Vec<u8>, StoreError> {
+    std::fs::read(path).map_err(|source| StoreError::Io {
         path: path.to_path_buf(),
         source,
     })

@@ -238,15 +238,16 @@ impl EpicFile {
     }
 }
 
-/// Add or replace an entry in an assets index by name; returns the prior
-/// entry when the name already existed. The bytes are copied in separately.
-pub fn upsert_asset(index: &mut Vec<Asset>, entry: Asset) -> Option<Asset> {
-    if let Some(slot) = index.iter_mut().find(|a| a.name == entry.name) {
-        Some(std::mem::replace(slot, entry))
-    } else {
-        index.push(entry);
-        None
+/// Insert a new entry into an assets index. Returns `false` without touching
+/// the index when the name already exists: an asset name is a caller-chosen key
+/// and `add` never overwrites — replacing an existing asset is `update`'s job.
+/// The bytes are copied in separately.
+pub fn insert_asset(index: &mut Vec<Asset>, entry: Asset) -> bool {
+    if index.iter().any(|a| a.name == entry.name) {
+        return false;
     }
+    index.push(entry);
+    true
 }
 
 /// Remove an asset index entry by name; returns it when present.
@@ -518,26 +519,25 @@ mod tests {
     }
 
     #[test]
-    fn asset_index_upsert_and_remove() {
+    fn asset_index_insert_refuses_duplicate_and_remove() {
         let mut index = Vec::new();
-        assert!(upsert_asset(
+        assert!(insert_asset(
             &mut index,
             Asset {
                 name: "a.png".into(),
                 description: Some("first".into())
             }
-        )
-        .is_none());
-        let prior = upsert_asset(
+        ));
+        // A duplicate name is refused and leaves the existing entry untouched.
+        assert!(!insert_asset(
             &mut index,
             Asset {
                 name: "a.png".into(),
                 description: Some("second".into()),
             },
-        );
-        assert_eq!(prior.unwrap().description.as_deref(), Some("first"));
+        ));
         assert_eq!(index.len(), 1);
-        assert_eq!(index[0].description.as_deref(), Some("second"));
+        assert_eq!(index[0].description.as_deref(), Some("first"));
         let removed = remove_asset(&mut index, "a.png").unwrap();
         assert_eq!(removed.name, "a.png");
         assert!(remove_asset(&mut index, "a.png").is_none());

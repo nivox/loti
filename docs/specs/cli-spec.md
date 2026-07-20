@@ -18,14 +18,22 @@ document assumes that model.
 - **Operations grouped by nature:** `edit` = plain scalar fields
   (`name`/`summary`/`body`/`parent`); `status` = the state machine (**set-only**;
   read via `show`); `label`/`comment`/`asset` = collections
-  (`add`/`remove`|`delete`/`list`); `show` = the **sole projectable reader**.
+  (`add`/`remove`|`delete`/`list`, plus asset `update`/`show`); `show` = the
+  **sole projectable reader** of nodes/epics.
+- **Create never overwrites; modify targets what exists.** Every creator refuses
+  a duplicate (`epic create` an existing id; `ticket create`/`comment add` cannot
+  collide — their keys are machine-allocated, never-reused numbers/ids); every
+  modifier (`edit`, `comment edit`, `asset update`) requires its target to exist.
+  An **asset** is keyed by a **caller-chosen name**, so `asset add` is
+  **create-only** — a name already present is refused (use `asset update` to
+  replace). Assets are read back verbatim with `asset show`, never off disk.
 - **Content input.** Free-form/binary payloads (epic & ticket `body`, comment
   text, asset data) come from **stdin or `--file <path>`** — never inline; absent
   source → empty for optional body, error for required content; never blocks on a
   TTY. One-liners stay inline flags (`--name`, `--summary`, `--reason`, …).
 - **Actor.** `-u|--user` xor `-a|--agent <name>` required **only** on comment
   add/edit/delete. Everything else is actor-agnostic (assets: anyone
-  add/delete/list; asset delete is **hard**).
+  add/update/show/delete/list; asset delete is **hard**).
 - **Mutation confirmations.** A successful `edit`/`status` on an epic or ticket
   confirms on stdout **naming the target** — the ref/id **and** its name — since
   refs are numeric and a mistyped but valid ref would otherwise apply silently
@@ -50,7 +58,7 @@ loti epic edit   <id> [--name <s>] [--summary <s>] [--file <path>]
 loti epic status <id> (--closed [--reason <s>] | --open)               # set-only
 loti epic label   (add|remove|list) <id> [<label>…]
 loti epic comment (add|edit|delete|list) <id> …
-loti epic asset   (add|delete|list) <id> …
+loti epic asset   (add|update|show|delete|list) <id> …
 loti epic list   [filters — see Filtering model for `list`]
 
 loti ticket create <epic-id> [--parent <ref>] --name <s> --summary <s> [--label <l>]...  # body ← stdin|--file
@@ -61,7 +69,7 @@ loti ticket status <ref> (--to-do | --in-progress |
                           --done | --closed --reason <s> [--cascade])   # set-only
 loti ticket label   (add|remove|list) <ref> [<label>…]
 loti ticket comment (add|edit|delete|list) <ref> …
-loti ticket asset   (add|delete|list) <ref> …
+loti ticket asset   (add|update|show|delete|list) <ref> …
 loti ticket list   <epic-id>[/<n>] [--shallow] [filters]              # scope required
 
 # Collections (identical under epic and ticket; <ref> = <id> or <epic-id>/<n>)
@@ -69,7 +77,9 @@ loti <e|t> comment add    <ref> (-u | -a <agent>) [--file <path>]      # text �
 loti <e|t> comment edit   <ref> <comment-id> (-u | -a <agent>) [--file <path>]  # own author only
 loti <e|t> comment delete <ref> <comment-id> (-u | -a <agent>)        # own author only; soft
 loti <e|t> comment list   <ref> [--include-deleted]
-loti <e|t> asset add    <ref> --name <name> [--file <path>] [--description <s>]  # data ← stdin|--file
+loti <e|t> asset add    <ref> --name <name> [--file <path>] [--description <s>]  # data ← stdin|--file; create-only
+loti <e|t> asset update <ref> <name> [--file <path>] [--description <s>]  # data ← stdin|--file; ≥1 change
+loti <e|t> asset show   <ref> <name>                                 # data → stdout, verbatim
 loti <e|t> asset delete <ref> <name>                                 # hard
 loti <e|t> asset list   <ref>
 
@@ -179,11 +189,15 @@ loti skill              # prints the static SKILL.md (see The `skill` subcommand
   agent's path is bounded: `loti skill` (concepts + workflow) → one `loti
   --help-full` (whole annotated surface).
 - **Content focus: CLI-only.** The skill teaches driving the CLI and nothing else;
-  the on-disk format is **not** an authoring path. The skill MUST carry an explicit
-  **MUST-NOT** rule: agents must not hand-author/hand-edit store files or bypass
-  the CLI (invariants are CLI-enforced, not file-enforced; see
-  [`core-spec.md`](core-spec.md) → *Concurrency & multi-actor safety*). Plain-text
-  legibility is a human-inspection affordance only.
+  the on-disk format is **not** an authoring path, nor a reading path. The skill
+  MUST carry an explicit **MUST-NOT** rule: agents must not read from or write to
+  store files directly (hand-author, hand-edit, copy, or search them) — **every
+  operation, read and write alike, goes through the CLI** (invariants are
+  CLI-enforced, not file-enforced, and the on-disk layout is internal and may
+  change; see [`core-spec.md`](core-spec.md) → *Concurrency & multi-actor
+  safety*). Plain-text legibility is a human-inspection affordance only. This
+  is why reading back and updating assets are first-class CLI operations rather
+  than a reason to touch files.
 - **SKILL.md structure (7 sections):** frontmatter → what/when → the hard rule
   (prominent) → distilled core concepts (self-contained, no external glossary) →
   lifecycle/workflow → gotchas → `--help-full` handoff.
