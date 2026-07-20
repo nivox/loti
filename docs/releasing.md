@@ -29,14 +29,20 @@ main resumes:    0.3.0-dev     next in-development version
 Run the release script from a clean `main` that is up to date with the remote:
 
 ```sh
-scripts/release.sh                 # release the -dev version, resume on next minor
-scripts/release.sh --next 0.2.1    # choose the next in-development version explicitly
-scripts/release.sh --push          # also push the branch and tag when done
+scripts/release.sh                          # release the -dev version, resume on next minor
+scripts/release.sh --next 0.2.1             # choose the next in-development version explicitly
+scripts/release.sh --version 0.2.0 --next 0.2.1  # release a version other than the planned -dev
+scripts/release.sh --push                   # also push the branch and tag when done
 ```
+
+Use `--version` to release a version other than the one main currently plans —
+for example, to cut a minor `0.2.0` while main only carries a patch `0.1.1-dev`,
+pointing the resume at the next patch: `--version 0.2.0 --next 0.2.1`.
 
 The script:
 
-1. reads the current `X.Y.Z-dev` version and strips the suffix to `X.Y.Z`;
+1. reads the current `X.Y.Z-dev` version and strips the suffix to `X.Y.Z` (or
+   uses `--version` when given);
 2. updates `Cargo.toml` + `Cargo.lock`, commits `release: vX.Y.Z`, and tags
    `vX.Y.Z`;
 3. bumps main to the next in-development version (default: next minor) and

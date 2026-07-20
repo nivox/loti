@@ -8,21 +8,27 @@
 # lockstep: Cargo.toml (authoritative) and the workspace entries in Cargo.lock.
 #
 # Usage:
-#   scripts/release.sh [--next X.Y.Z] [--push] [--yes]
+#   scripts/release.sh [--version X.Y.Z] [--next X.Y.Z] [--push] [--yes]
 #
-#   --next X.Y.Z  Version main resumes on after the release (a `-dev` suffix is
-#                 added). Default: bump the minor of the release version.
-#   --push        Push the release commit, tag, and follow-up bump when done.
-#   --yes         Skip the confirmation prompt.
+#   --version X.Y.Z  Version to release. Default: the current -dev version with
+#                    its suffix stripped. Use this to release a version other
+#                    than the one main currently plans (e.g. cut a minor from a
+#                    -dev that was only a patch).
+#   --next X.Y.Z     Version main resumes on after the release (a `-dev` suffix
+#                    is added). Default: bump the minor of the release version.
+#   --push           Push the release commit, tag, and follow-up bump when done.
+#   --yes            Skip the confirmation prompt.
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 
+release_override=""
 next_release_dev=""
 do_push=0
 assume_yes=0
 while [ $# -gt 0 ]; do
   case "$1" in
+    --version) release_override="${2:?--version needs a version}"; shift 2 ;;
     --next) next_release_dev="${2:?--next needs a version}"; shift 2 ;;
     --push) do_push=1; shift ;;
     --yes|-y) assume_yes=1; shift ;;
@@ -31,6 +37,10 @@ while [ $# -gt 0 ]; do
 done
 
 die() { echo "release: $*" >&2; exit 1; }
+
+# Accept only a plain X.Y.Z (no pre-release/build suffix): the release commit
+# carries a final version, and the script appends `-dev` itself for the resume.
+valid_version() { [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
 
 # Read the authoritative workspace version (the only top-level `version = "…"`
 # in Cargo.toml; members inherit via `version.workspace = true`).
@@ -62,7 +72,14 @@ case "$current" in
   *) die "Cargo version is '$current' (no -dev suffix); main should carry an in-development version." ;;
 esac
 
-release="${current%-dev}"
+# The release version is the explicit --version when given, else the current
+# in-development version with its -dev suffix stripped.
+if [ -n "$release_override" ]; then
+  valid_version "$release_override" || die "--version '$release_override' is not a plain X.Y.Z."
+  release="$release_override"
+else
+  release="${current%-dev}"
+fi
 git rev-parse -q --verify "refs/tags/v$release" >/dev/null 2>&1 \
   && die "tag v$release already exists."
 
@@ -70,6 +87,8 @@ if [ -z "$next_release_dev" ]; then
   # Default: bump the minor, reset patch (0.1.0 -> 0.2.0).
   IFS=. read -r maj min _pat <<<"$release"
   next_release_dev="$maj.$((min + 1)).0"
+else
+  valid_version "$next_release_dev" || die "--next '$next_release_dev' is not a plain X.Y.Z."
 fi
 next_dev="$next_release_dev-dev"
 
