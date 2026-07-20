@@ -140,7 +140,10 @@ A typical path:
    explain a decision or a status change; `asset add` to attach proof. Read an
    asset back with `asset show <ref> <name>` (bytes to stdout, verbatim) and
    change it with `asset update <ref> <name>` (new data via stdin/`--file`
-   and/or a new `--description`). Organise with `label add`.
+   and/or a new `--description`). Organise with `label add`. When you change
+   something that already exists — a body, a comment, an asset — read its
+   current version back first and edit from that, so a concurrent change by
+   another agent or the human is not overwritten (see Gotchas).
 6. **Read and report.** `loti ticket show <ref>` for one node,
    `loti ticket list <epic-id>` for a scope, and `loti epic list` for the
    roster. A list defaults to the full tree rooted at the scope; add `--shallow`
@@ -183,6 +186,16 @@ comments over silent work.
   Create with `add`, change with `update` — neither silently clobbers. "I was
   only reading it" is not an exception to the hard rule: reads go through the
   CLI too.
+- **Edit any resource from a freshly read copy — never a stale one.** Two
+  audiences share one store (agents and the human), and every free-form edit
+  **replaces the whole field**: `edit --file` overwrites a body, `comment edit`
+  overwrites the text, `asset update` overwrites the payload. Basing an edit on
+  an old copy — a temp file kept from an earlier `asset add`, a body you cached,
+  your own memory of the text — silently discards whatever changed in between.
+  Always **read the current version first** (`show` for a body, `comment list`
+  for comment text, `asset show` for asset bytes), apply your change to *that*,
+  then write it back. Treat every edit as **read-fresh → modify → write**, and
+  discard scratch files afterward rather than reusing them next time.
 - **Bodies, comment text, and asset data never take an inline flag.** Pipe them
   on stdin or pass `--file`. An interactive terminal with no input is treated as
   empty (it never hangs waiting).
