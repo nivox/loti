@@ -115,8 +115,10 @@ of work). Epics also have their **id**.
 
 **Content input rule.** Free-form or binary payloads — an epic or ticket
 **body**, **comment** text, **asset** data — are read from **stdin** or
-**`--file <path>`**, never from an inline flag. One-liners (`--name`,
-`--summary`, `--reason`, and so on) stay inline flags.
+**`--file <path>`**, never from an inline flag. Piping on stdin is the common
+case; `--file -` names stdin explicitly (the usual Unix `-` convention) and is
+equivalent to piping with no `--file`. One-liners (`--name`, `--summary`,
+`--reason`, and so on) stay inline flags.
 
 ## Lifecycle & workflow
 
@@ -197,8 +199,9 @@ comments over silent work.
   then write it back. Treat every edit as **read-fresh → modify → write**, and
   discard scratch files afterward rather than reusing them next time.
 - **Bodies, comment text, and asset data never take an inline flag.** Pipe them
-  on stdin or pass `--file`. An interactive terminal with no input is treated as
-  empty (it never hangs waiting).
+  on stdin, pass `--file <path>`, or pass `--file -` (an explicit name for
+  stdin). An interactive terminal with no input is treated as empty (it never
+  hangs waiting).
 - **Attribution lives in comments.** A status change or asset carries no author
   by itself; add a comment to say who and why.
 - **`ticket list` always needs a scope** (an epic id, or a node reference to

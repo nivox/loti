@@ -4,6 +4,8 @@
 //!   * Free-form / binary payloads — epic & ticket `body`, comment text, asset
 //!     data — are **never** passed inline; they come from `--file <path>` or,
 //!     when that is absent, from piped **stdin**.
+//!   * `--file -` names stdin explicitly (the usual Unix `-` convention), so it
+//!     behaves exactly like passing no `--file` and piping stdin.
 //!   * The reader **must never block on a TTY**: an interactive stdin is
 //!     treated as "no source".
 //!   * An absent source is empty for an optional payload and an error for a
@@ -17,10 +19,12 @@ use anyhow::{anyhow, Context, Result};
 
 /// Resolve a free-form/binary payload following the content-input rules above.
 ///
-/// Precedence: `--file` wins over stdin. When no file is given, stdin is read
-/// only if it is *not* a TTY (piped/redirected), so the call never blocks on an
-/// interactive terminal. `stdin_is_tty` is injected to keep this pure/testable;
-/// [`read_content`] wires it to the real process stdin.
+/// Precedence: a real `--file` path wins over stdin. The sentinel `--file -`
+/// names stdin explicitly and is treated identically to no `--file`. When the
+/// source is stdin, it is read only if it is *not* a TTY (piped/redirected), so
+/// the call never blocks on an interactive terminal. `stdin_is_tty` is injected
+/// to keep this pure/testable; [`read_content`] wires it to the real process
+/// stdin.
 ///
 /// - `Some(bytes)` — a source was present (may be empty if a file/pipe was empty).
 /// - `None` — no source; caller treats as empty (optional) after the
@@ -33,7 +37,10 @@ pub fn resolve_content<R: Read>(
     stdin_is_tty: bool,
     required: bool,
 ) -> Result<Option<Vec<u8>>> {
-    if let Some(path) = file {
+    // `--file -` is the conventional Unix name for stdin, so it falls through to
+    // the stdin branch instead of trying to open a file literally named "-".
+    let path = file.filter(|p| p.as_os_str() != "-");
+    if let Some(path) = path {
         let bytes = fs::read(path)
             .with_context(|| format!("reading content from --file {}", path.display()))?;
         return Ok(Some(bytes));
@@ -50,8 +57,8 @@ pub fn resolve_content<R: Read>(
     // No --file and stdin is an interactive TTY: never block on it.
     if required {
         return Err(anyhow!(
-            "content is required: provide it via stdin (pipe/redirect) or --file <path> \
-             (content is never passed inline)"
+            "content is required: provide it via stdin (pipe/redirect, or --file -) \
+             or --file <path> (content is never passed inline)"
         ));
     }
     Ok(None)
@@ -78,6 +85,25 @@ mod tests {
         let mut stdin = Cursor::new(b"piped body".to_vec());
         let out = resolve_content(None, &mut stdin, false, false).unwrap();
         assert_eq!(out, Some(b"piped body".to_vec()));
+    }
+
+    #[test]
+    fn file_dash_is_the_stdin_sentinel() {
+        // `--file -` names stdin explicitly and must read the pipe, not a file
+        // literally named "-".
+        let dash = Path::new("-");
+        let mut stdin = Cursor::new(b"piped via dash".to_vec());
+        let out = resolve_content(Some(dash), &mut stdin, false, true).unwrap();
+        assert_eq!(out, Some(b"piped via dash".to_vec()));
+    }
+
+    #[test]
+    fn file_dash_on_a_tty_is_absent_for_optional() {
+        // The sentinel still respects the never-block-on-TTY rule.
+        let dash = Path::new("-");
+        let mut stdin = Cursor::new(Vec::new());
+        let out = resolve_content(Some(dash), &mut stdin, true, false).unwrap();
+        assert_eq!(out, None);
     }
 
     #[test]

@@ -545,11 +545,13 @@ pub struct RefArg {
 }
 
 /// The shared content-input source. The payload is **never** inline:
-/// it comes from `--file <PATH>` or, absent that, piped stdin; an interactive
-/// TTY is treated as "no source" (never blocks). See [`crate::content_input`].
+/// it comes from `--file <PATH>` or, absent that, piped stdin; `--file -` names
+/// stdin explicitly. An interactive TTY is treated as "no source" (never
+/// blocks). See [`crate::content_input`].
 #[derive(Debug, Args)]
 pub struct ContentInput {
-    /// Read the payload from PATH instead of stdin (never passed inline).
+    /// Read the payload from PATH instead of stdin (never passed inline). Use
+    /// PATH `-` to name stdin explicitly (same as piping with no --file).
     #[arg(long, value_name = "PATH")]
     pub file: Option<PathBuf>,
 }
