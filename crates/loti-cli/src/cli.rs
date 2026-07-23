@@ -289,7 +289,7 @@ pub struct TicketStateSel {
     /// Allowed only when all descendants are terminal.
     #[arg(long)]
     pub done: bool,
-    /// Requires `--reason`; refuses non-terminal descendants without --cascade.
+    /// Requires `--reason`; closes only this node unless `--cascade` is given.
     #[arg(long)]
     pub closed: bool,
 }

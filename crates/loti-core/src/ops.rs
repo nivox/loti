@@ -425,9 +425,11 @@ pub struct StatusOutcome {
 }
 
 /// Apply a node state transition, enforcing the state machine. Returns the
-/// updated node and any descendants a cascade close resolved with it. For a
-/// cascade close, the descendants are closed too (ascending order, per-file,
-/// idempotent); a partial failure is reported.
+/// updated node and any descendants a cascade close resolved with it. A default
+/// close resolves only the node itself and leaves its descendants untouched, so
+/// it can be reopened without having rewritten the subtree; a cascade close
+/// also closes the descendants (ascending order, per-file, idempotent), and a
+/// partial failure is reported.
 pub fn set_node_status(
     store: &Store,
     node_ref: &NodeRef,
@@ -1321,7 +1323,7 @@ mod tests {
     }
 
     #[test]
-    fn close_refused_without_cascade_then_cascades() {
+    fn close_without_cascade_leaves_child_open_then_cascades() {
         let (_d, s) = seeded();
         create_epic(&s, new_epic("e")).unwrap();
         let parent = create_node(&s, new_node("e", None)).unwrap();
@@ -1329,20 +1331,21 @@ mod tests {
         let child = create_node(&s, new_node("e", Some(pr.clone()))).unwrap();
         let cr = NodeRef::new("e", child.frontmatter.number);
 
-        // With an open child, a non-cascade close is refused.
-        assert!(matches!(
-            set_node_status(
-                &s,
-                &pr,
-                NodeStatusChange::Closed {
-                    reason: Some("obsolete".into()),
-                    cascade: false
-                }
-            ),
-            Err(OpError::Transition(
-                domain::TransitionError::CloseWithOpenDescendants { .. }
-            ))
-        ));
+        // A default close resolves only the parent; the open child is left as
+        // it was and is never reported as a cascade target.
+        let parent_only = set_node_status(
+            &s,
+            &pr,
+            NodeStatusChange::Closed {
+                reason: Some("obsolete".into()),
+                cascade: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(parent_only.node.frontmatter.status, NodeState::Closed);
+        assert!(parent_only.cascaded_closed.is_empty());
+        let child_untouched = s.read_node("e", cr.number).unwrap();
+        assert_eq!(child_untouched.frontmatter.status, NodeState::ToDo);
 
         // Cascade closes both.
         let closed = set_node_status(

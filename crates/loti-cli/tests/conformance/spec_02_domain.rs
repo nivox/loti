@@ -3,8 +3,8 @@
 //! The normative rules exercised here:
 //!   * a node becomes `done` only when every descendant is terminal, and a
 //!     `closed` descendant counts as resolved;
-//!   * closing a node with non-terminal descendants is refused unless a cascade
-//!     is requested, which then closes the descendants too;
+//!   * closing a node resolves only that node by default, leaving any
+//!     non-terminal descendants untouched; a cascade closes the descendants too;
 //!   * `blocked` is only ever set explicitly and carries its structured
 //!     blocked-by; it is never set or cleared automatically;
 //!   * an epic's state is the stored closed flag when set, else computed:
@@ -68,18 +68,29 @@ fn closing_requires_a_reason() {
 }
 
 #[test]
-fn closing_with_open_descendants_is_refused_without_cascade() {
+fn closing_without_cascade_leaves_open_descendants_untouched() {
     let s = Store::new();
     s.epic("e");
     let parent = s.ticket("e", "parent");
-    let _child = s.subticket("e", &parent, "child");
-    let err = s.fail(&[
+    let child = s.subticket("e", &parent, "child");
+    // A default close resolves only the parent; the open child keeps its state,
+    // so the parent can be reopened without having rewritten the subtree.
+    s.ok(&[
         "ticket", "status", &parent, "--closed", "--reason", "obsolete",
     ]);
+    let pj = s.ok(&["ticket", "show", &parent, "--json"]);
+    let cj = s.ok(&["ticket", "show", &child, "--json"]);
+    assert!(pj.contains("\"status\": \"closed\""), "parent: {pj}");
     assert!(
-        err.to_lowercase().contains("cascade"),
-        "close with open descendants should point at cascade, got: {err}"
+        cj.contains("\"status\": \"to-do\""),
+        "child untouched: {cj}"
     );
+    // Reopening the parent restores an active node with the subtree intact.
+    s.ok(&["ticket", "status", &parent, "--in-progress"]);
+    let pj2 = s.ok(&["ticket", "show", &parent, "--json"]);
+    let cj2 = s.ok(&["ticket", "show", &child, "--json"]);
+    assert!(pj2.contains("\"status\": \"in-progress\""), "parent: {pj2}");
+    assert!(cj2.contains("\"status\": \"to-do\""), "child: {cj2}");
 }
 
 #[test]

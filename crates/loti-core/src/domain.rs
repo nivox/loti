@@ -152,18 +152,6 @@ pub enum TransitionError {
     /// completing.
     #[error("closing a node requires a reason")]
     CloseNeedsReason,
-    /// Closing a node with non-terminal descendants is refused unless the
-    /// caller explicitly asks to cascade the close to them.
-    #[error(
-        "cannot close this node while {count} descendant(s) are still open \
-         (first: {first}); re-run with cascade to close them too"
-    )]
-    CloseWithOpenDescendants {
-        /// How many descendants are still non-terminal.
-        count: usize,
-        /// The lowest-numbered offending descendant.
-        first: u64,
-    },
     /// Entering `blocked` is only ever an explicit request; it is never set (or
     /// cleared) as a side effect of another operation.
     #[error("the blocked state is only ever set explicitly, never automatically")]
@@ -214,7 +202,7 @@ pub fn validate_done(descendants: &[NodeStatus]) -> Result<(), TransitionError> 
 /// Whether cascade was requested when closing a node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cascade {
-    /// Close only this node; refuse if it has non-terminal descendants.
+    /// Close only this node; leave any non-terminal descendants as they are.
     No,
     /// Close this node and every non-terminal descendant too.
     Yes,
@@ -232,10 +220,12 @@ pub struct ClosePlan {
 
 /// Validate closing a node and compute what closing it entails.
 ///
-/// Closing always requires a reason. A node with non-terminal descendants is
-/// refused unless cascade is requested; when it is, the plan lists those
-/// descendants (ascending order) so the caller can close them too. Already-
-/// terminal descendants are never re-closed and never appear in the plan.
+/// Closing always requires a reason. By default a close resolves only the node
+/// itself and leaves any non-terminal descendants untouched, so the node can be
+/// reopened later without having rewritten its subtree. When cascade is
+/// requested the plan lists those descendants (ascending order) so the caller
+/// can close them too. Already-terminal descendants are never re-closed and
+/// never appear in the plan.
 pub fn plan_close(
     descendants: &[NodeStatus],
     reason: Option<&str>,
@@ -247,22 +237,14 @@ pub fn plan_close(
         _ => return Err(TransitionError::CloseNeedsReason),
     }
 
-    let open = open_descendants(descendants);
-    if open.is_empty() {
-        return Ok(ClosePlan {
-            cascade_targets: Vec::new(),
-        });
-    }
-
-    match cascade {
-        Cascade::No => Err(TransitionError::CloseWithOpenDescendants {
-            count: open.len(),
-            first: open[0].number,
-        }),
-        Cascade::Yes => Ok(ClosePlan {
-            cascade_targets: open.into_iter().map(|d| d.number).collect(),
-        }),
-    }
+    let cascade_targets = match cascade {
+        Cascade::No => Vec::new(),
+        Cascade::Yes => open_descendants(descendants)
+            .into_iter()
+            .map(|d| d.number)
+            .collect(),
+    };
+    Ok(ClosePlan { cascade_targets })
 }
 
 /// Validate a request to enter the `blocked` state.
@@ -517,16 +499,15 @@ mod tests {
     }
 
     #[test]
-    fn close_refused_without_cascade_when_descendants_open() {
-        let err =
-            plan_close(&[open(4), open(2), done(9)], Some("won't do"), Cascade::No).unwrap_err();
-        match err {
-            TransitionError::CloseWithOpenDescendants { count, first } => {
-                assert_eq!(count, 2);
-                assert_eq!(first, 2);
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+    fn close_without_cascade_leaves_open_descendants_untouched() {
+        // A default close resolves only the node itself: open descendants are
+        // never listed as targets, so the subtree is preserved for a reopen.
+        assert_eq!(
+            plan_close(&[open(4), open(2), done(9)], Some("won't do"), Cascade::No)
+                .unwrap()
+                .cascade_targets,
+            Vec::<u64>::new()
+        );
     }
 
     #[test]

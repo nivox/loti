@@ -78,9 +78,9 @@ follow:
 
 - A node may become **done** only when **all** its descendants are terminal (a
   `closed` descendant counts as resolved).
-- **Closing** a node that still has non-terminal descendants is **refused**
-  unless you explicitly cascade the close, which then closes those descendants
-  too.
+- **Closing** a node resolves only that node by default and leaves any
+  non-terminal descendants untouched, so it can be reopened without having
+  rewritten its subtree. Add `--cascade` to close those descendants too.
 
 ### Epic states
 
@@ -136,8 +136,8 @@ A typical path:
 4. **Drive status as work moves.** `loti ticket status <ref> --in-progress`,
    then `--blocked` (with `--blocked-by` and/or `--reason`) if stuck, and finally
    `--done` when every descendant is resolved. Use `--closed --reason "..."`
-   (add `--cascade` to close open descendants too) when work is dropped rather
-   than finished. Status is set-only — read it back with `show`.
+   (closes only this node; add `--cascade` to close open descendants too) when
+   work is dropped rather than finished. Status is set-only — read it back with `show`.
 5. **Attribute and evidence.** Add a `comment` (with `-u` or `-a <name>`) to
    explain a decision or a status change; `asset add` to attach proof. Read an
    asset back with `asset show <ref> <name>` (bytes to stdout, verbatim) and
@@ -167,8 +167,9 @@ comments over silent work.
 - **`status` is set-only.** There is no status *reader* — use `show`.
 - **`done` is gated by descendants.** It is refused while any descendant is
   non-terminal; resolve or close them first.
-- **`close` needs a reason, and refuses open descendants** unless you pass
-  cascade, which closes them too.
+- **`close` needs a reason, and by default closes only that node** — open
+  descendants are left untouched (add cascade to close them too), so a closed
+  node can be reopened with its subtree intact.
 - **Terminal is a resolution class, not a lock.** `done`/`closed` only gate the
   two rules above; a node is never frozen. You can reclassify `done`→`closed`
   (or the reverse), or move a terminal node back to an active state — the state

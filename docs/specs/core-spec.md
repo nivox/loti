@@ -42,9 +42,10 @@ skill/help system — is specified in [`cli-spec.md`](cli-spec.md).
   `closed`. `done` and `closed` are **terminal** ("resolved").
   - A node MAY become `done` only when **all** descendants are terminal (a
     `closed` descendant counts as resolved).
-  - `closed` carries a **reason**. Closing a node with non-terminal descendants
-    MUST be refused unless cascade is explicitly requested (which closes the
-    descendants too).
+  - `closed` carries a **reason**. Closing a node resolves only that node by
+    default and leaves any non-terminal descendants untouched (so it can be
+    reopened without having rewritten its subtree); cascade MAY be requested to
+    close the descendants too.
   - `blocked` carries a non-empty structured **blocked-by**: at least one node
     reference and/or a free-form reason (an empty blocker is refused). `loti`
     never sets/clears `blocked` automatically. Leaving `blocked` clears the
