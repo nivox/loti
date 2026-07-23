@@ -156,10 +156,11 @@ pub enum TransitionError {
     /// cleared) as a side effect of another operation.
     #[error("the blocked state is only ever set explicitly, never automatically")]
     BlockedMustBeExplicit,
-    /// `blocked` must carry a non-empty structured blocker: at least one node
-    /// reference or a free-form reason, so a blocked node always says why.
-    #[error("blocking a node requires a blocker: pass --blocked-by and/or --reason")]
-    BlockedNeedsBlocker,
+    /// `blocked` must carry a non-empty reason, so a blocked node always says
+    /// why (the `blocked-by` dependency list is separate and does not satisfy
+    /// this).
+    #[error("blocking a node requires a reason: pass --reason")]
+    BlockedNeedsReason,
 }
 
 /// Whether a set of descendant statuses are all resolved (terminal). An empty
@@ -251,18 +252,20 @@ pub fn plan_close(
 ///
 /// Two rules hold. First, `loti` never sets or clears `blocked` as a side
 /// effect: `explicitly_requested` must be true — false means some path tried to
-/// reach `blocked` implicitly, which is refused. Second, the blocker must not be
-/// empty: `has_blocker` records whether at least one node reference or a
-/// free-form reason was supplied, so a blocked node always states why.
+/// reach `blocked` implicitly, which is refused. Second, the state must carry a
+/// reason: `has_reason` records whether a non-blank reason was supplied, so a
+/// blocked node always states why. (The `blocked-by` dependency list is a
+/// separate, status-independent annotation and never substitutes for the
+/// reason.)
 pub fn validate_blocked(
     explicitly_requested: bool,
-    has_blocker: bool,
+    has_reason: bool,
 ) -> Result<(), TransitionError> {
     if !explicitly_requested {
         return Err(TransitionError::BlockedMustBeExplicit);
     }
-    if !has_blocker {
-        return Err(TransitionError::BlockedNeedsBlocker);
+    if !has_reason {
+        return Err(TransitionError::BlockedNeedsReason);
     }
     Ok(())
 }
@@ -535,11 +538,12 @@ mod tests {
     }
 
     #[test]
-    fn blocked_requires_a_non_empty_blocker() {
-        // An explicit request with neither a ref nor a reason is refused.
+    fn blocked_requires_a_reason() {
+        // An explicit request with no reason is refused; the blocked-by list is
+        // separate and does not satisfy the reason requirement.
         assert_eq!(
             validate_blocked(true, false),
-            Err(TransitionError::BlockedNeedsBlocker)
+            Err(TransitionError::BlockedNeedsReason)
         );
     }
 

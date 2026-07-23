@@ -64,14 +64,26 @@ A node is in exactly one state:
 
 - **to-do** — created, not started.
 - **in-progress** — actively being worked.
-- **blocked** — cannot proceed. Carries a structured **blocked-by** that must
-  not be empty: at least one node reference and/or a free-form reason (for a
-  non-ticket blocker, such as waiting on an external key), so a blocked node
-  always says why. `loti` never sets or clears `blocked` for you — it is always
-  an explicit choice.
+- **blocked** — cannot proceed. Carries a free-form **reason** that must not be
+  empty (exactly like `closed`), so a blocked node always says why. `loti` never
+  sets or clears `blocked` for you — it is always an explicit choice. (The
+  separate **blocked-by** dependency list, below, is not the same thing and does
+  not put a node into this state.)
 - **done** — delivered successfully. Terminal.
 - **closed** — resolved *without* completing (won't-do, cancelled, obsolete,
   duplicate, superseded). Carries a **reason**. Terminal.
+
+### Blocked-by (dependency list)
+
+A node may carry a **blocked-by** list: the tickets it depends on. It is an
+advisory annotation, **independent of status** — recording or clearing it never
+changes the node's state, and a state change never touches it (a `done` node can
+still carry its historical dependencies). Manage it with `ticket blocked-by
+(add|remove|set|clear|list)`. Each blocker is written as `<n>` (a ticket in the
+same epic) or `<epic-id>/<n>` (any epic); `loti` stores the canonical
+`<epic-id>/<n>` form. A blocker **must exist** (its own state is irrelevant — a
+done ticket may block), and a ticket cannot block itself. It exists on tickets
+only, not epics.
 
 **Terminal** means `done` or `closed` — both count as "resolved". Two rules
 follow:
@@ -134,8 +146,10 @@ A typical path:
 3. **Add tickets.** `loti ticket create <epic-id> --name "..." --summary "..."`.
    For a subticket, add `--parent <epic-id>/<n>`.
 4. **Drive status as work moves.** `loti ticket status <ref> --in-progress`,
-   then `--blocked` (with `--blocked-by` and/or `--reason`) if stuck, and finally
-   `--done` when every descendant is resolved. Use `--closed --reason "..."`
+   then `--blocked --reason "..."` if stuck, and finally
+   `--done` when every descendant is resolved. Record dependencies with
+   `loti ticket blocked-by add <ref> <blocker>` (independent of status). Use
+   `--closed --reason "..."`
    (closes only this node; add `--cascade` to close open descendants too) when
    work is dropped rather than finished. Status is set-only — read it back with `show`.
 5. **Attribute and evidence.** Add a `comment` (with `-u` or `-a <name>`) to
@@ -175,10 +189,13 @@ comments over silent work.
   (or the reverse), or move a terminal node back to an active state — the state
   machine allows it.
 - **`blocked` is never automatic, and never empty.** You set it and you clear
-  it; moving to another state clears the blocked-by. `--blocked` requires at
-  least one of `--blocked-by`/`--reason` (an empty blocker is refused). The
-  `--blocked-by` refs are a free annotation: `loti` records them but does not
-  check the blockers exist or are still unresolved.
+  it; moving to another state clears the block-reason. `--blocked` requires a
+  `--reason` (an empty reason is refused).
+- **`blocked-by` is a separate dependency list, not the blocked state.** It is
+  status-independent: setting it does not block the ticket, and changing status
+  does not touch it. Each blocker **must exist** (state irrelevant) and cannot
+  be the ticket itself; blockers are given as `<n>` or `<epic-id>/<n>` and
+  stored canonically.
 - **An asset's name defaults to the file's basename with `--file`.** From stdin
   there is nothing to infer, so `--name` is required there.
 - **Never read an asset off disk — use `asset show`.** Its bytes come back on
@@ -236,8 +253,9 @@ loti ticket create <epic-id> --name "..." --summary "..." [--parent <ref>]
 loti ticket list <epic-id> [--shallow] [--json]
 loti ticket show <ref> [--json]
 loti ticket status <ref> --in-progress                   # or --done
-loti ticket status <ref> --blocked --blocked-by <ref> --reason "..."
+loti ticket status <ref> --blocked --reason "..."
 loti ticket status <ref> --closed --reason "..." [--cascade]
+loti ticket blocked-by add <ref> <blocker>               # dependency; <n> or <epic-id>/<n>
 loti ticket edit <ref> --name "..."                      # body ← stdin/--file
 
 # Attribution & evidence (comments carry the author)

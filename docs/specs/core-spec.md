@@ -46,11 +46,18 @@ skill/help system — is specified in [`cli-spec.md`](cli-spec.md).
     default and leaves any non-terminal descendants untouched (so it can be
     reopened without having rewritten its subtree); cascade MAY be requested to
     close the descendants too.
-  - `blocked` carries a non-empty structured **blocked-by**: at least one node
-    reference and/or a free-form reason (an empty blocker is refused). `loti`
-    never sets/clears `blocked` automatically. Leaving `blocked` clears the
-    blocked-by; likewise leaving `closed` clears the close-reason (no non-closed
-    node carries one).
+  - `blocked` carries a non-empty free-form **block-reason** (an empty reason is
+    refused), exactly as `closed` carries a close-reason. `loti` never
+    sets/clears `blocked` automatically. Leaving `blocked` clears the
+    block-reason; likewise leaving `closed` clears the close-reason (no
+    non-blocked/non-closed node carries the respective reason).
+- **Blocked-by (dependency list).** A node MAY carry **blocked-by**: an ordered,
+  deduplicated list of canonical `<epic-id>/<n>` references to the tickets that
+  block it. It is an advisory dependency annotation **independent of status** —
+  it never gates or is changed by a state transition, and a node in any state
+  may carry it. Each blocker MUST reference an existing node (its own state is
+  irrelevant; cross-epic blockers are allowed) and MUST NOT be the node itself;
+  no cycle check is performed. It exists on nodes only, never on epics.
 - **Epic states.** `closed` is an explicit stored flag (optional reason,
   reversible) and takes precedence. `completed` (computed) = ≥1 node and all nodes
   terminal. `open` (computed) = any other case.
@@ -74,11 +81,12 @@ skill/help system — is specified in [`cli-spec.md`](cli-spec.md).
   edit. The tree is encoded by a `parent:` frontmatter field (absent = top-level).
 - **File structure.** **All** structured data lives in **YAML frontmatter**:
   scalars (`number`, `name`, `summary`, `status`, `labels`, `parent`,
-  `created`/`updated` timestamps), `blocked-by` (`{refs, reason}`), the assets
-  index, and the comments list (comment text as `|` literal block scalars). The
-  entire region **below** the frontmatter is the free-form **body**, with **no
-  managed sections**. Timestamps are ISO-8601 UTC. Terminally-closed nodes/epics
-  carry a `close-reason`.
+  `created`/`updated` timestamps), `blocked-by` (a list of canonical
+  `<epic-id>/<n>` refs), the assets index, and the comments list (comment text
+  as `|` literal block scalars). The entire region **below** the frontmatter is
+  the free-form **body**, with **no managed sections**. Timestamps are ISO-8601
+  UTC. A `blocked` node carries a `block-reason`; a terminally-closed node/epic
+  carries a `close-reason`.
 - **Numbering.** A monotonic **`next-number`** counter in `epic.md`. Allocation
   MUST use **probe-forward atomic exclusive-create** (`O_CREAT|O_EXCL`) of the
   complete node file, followed by a **best-effort** counter bump. Correctness

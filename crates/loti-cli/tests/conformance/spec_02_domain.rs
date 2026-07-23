@@ -5,8 +5,10 @@
 //!     `closed` descendant counts as resolved;
 //!   * closing a node resolves only that node by default, leaving any
 //!     non-terminal descendants untouched; a cascade closes the descendants too;
-//!   * `blocked` is only ever set explicitly and carries its structured
-//!     blocked-by; it is never set or cleared automatically;
+//!   * `blocked` is only ever set explicitly and carries a reason; it is never
+//!     set or cleared automatically. The `blocked-by` dependency list is a
+//!     separate, status-independent annotation — a blocker must exist, its own
+//!     state is irrelevant, and a state change never touches the list;
 //!   * an epic's state is the stored closed flag when set, else computed:
 //!     `completed` when it has at least one node and all are terminal, otherwise
 //!     `open` (including an epic with no nodes at all).
@@ -123,41 +125,61 @@ fn cascade_close_resolves_the_descendants_too() {
 }
 
 #[test]
-fn blocked_carries_its_structured_blocked_by() {
+fn blocked_carries_its_reason() {
+    // `--blocked` carries a free-form reason (like `--closed`); it no longer
+    // takes blocked-by refs (those are a separate list).
     let s = Store::new();
     s.epic("e");
     let a = s.ticket("e", "a");
-    let b = s.ticket("e", "b");
     s.ok(&[
         "ticket",
         "status",
         &a,
         "--blocked",
-        "--blocked-by",
-        &b,
         "--reason",
         "waiting on b",
     ]);
     let json = s.ok(&["ticket", "show", &a, "--json"]);
     assert!(json.contains("\"status\": \"blocked\""), "got: {json}");
-    assert!(
-        json.contains(&b),
-        "blocked-by ref should be recorded: {json}"
-    );
     assert!(json.contains("waiting on b"), "reason recorded: {json}");
 }
 
 #[test]
-fn blocked_refuses_an_empty_blocker() {
-    // `--blocked` with neither a ref nor a reason is refused: a blocked node
-    // must always state why it is blocked.
+fn blocked_by_is_a_status_independent_dependency_list() {
+    // blocked-by is managed via its own subcommand, accepts `<n>` or
+    // `<epic-id>/<n>`, requires the blocker to exist (its state is irrelevant),
+    // and does not change this node's status.
+    let s = Store::new();
+    s.epic("e");
+    let _a = s.ticket("e", "a"); // e/1
+    s.ticket("e", "b"); // e/2
+
+    // A missing blocker is refused.
+    let err = s.fail(&["ticket", "blocked-by", "add", "e/1", "999"]);
+    assert!(err.contains("does not exist"), "missing blocker: {err}");
+
+    // Add by bare number (same epic) resolves to canonical form; status stays.
+    s.ok(&["ticket", "blocked-by", "add", "e/1", "2"]);
+    let json = s.ok(&["ticket", "show", "e/1", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["blocked-by"], serde_json::json!(["e/2"]));
+    assert_eq!(v["status"], "to-do", "blocked-by never changes status");
+
+    // A self-reference is refused.
+    let err = s.fail(&["ticket", "blocked-by", "add", "e/1", "1"]);
+    assert!(err.contains("itself"), "self-reference refused: {err}");
+}
+
+#[test]
+fn blocked_refuses_an_empty_reason() {
+    // `--blocked` with no reason is refused: a blocked node must state why.
     let s = Store::new();
     s.epic("e");
     let a = s.ticket("e", "a");
     let err = s.fail(&["ticket", "status", &a, "--blocked"]);
     assert!(
-        err.contains("requires a blocker"),
-        "empty blocker must be refused: {err}"
+        err.contains("requires a reason"),
+        "empty reason must be refused: {err}"
     );
     // The node stays in its prior state, not moved to blocked.
     let json = s.ok(&["ticket", "show", &a, "--json"]);
@@ -167,7 +189,7 @@ fn blocked_refuses_an_empty_blocker() {
 #[test]
 fn reactivating_a_closed_node_drops_its_close_reason() {
     // A non-closed node must not carry a close-reason; leaving `closed` clears
-    // it, mirroring how leaving `blocked` clears blocked-by.
+    // it, mirroring how leaving `blocked` clears block-reason.
     let s = Store::new();
     s.epic("e");
     let a = s.ticket("e", "a");
@@ -193,17 +215,10 @@ fn blocked_is_never_set_automatically_by_other_operations() {
     s.epic("e");
     let a = s.ticket("e", "a");
     let b = s.ticket("e", "b");
-    // Block a on b, then resolve b. loti must not clear a's blocked state.
-    s.ok(&[
-        "ticket",
-        "status",
-        &a,
-        "--blocked",
-        "--blocked-by",
-        &b,
-        "--reason",
-        "waiting",
-    ]);
+    // Block a with a reason and a dependency on b, then resolve b. loti must
+    // not clear a's blocked state, nor its blocked-by list.
+    s.ok(&["ticket", "status", &a, "--blocked", "--reason", "waiting"]);
+    s.ok(&["ticket", "blocked-by", "add", &a, &b]);
     s.ok(&["ticket", "status", &b, "--done"]);
     let json = s.ok(&["ticket", "show", &a, "--json"]);
     assert!(

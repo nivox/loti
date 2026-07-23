@@ -194,11 +194,11 @@ fn run_migrate_store<O: Write, E: Write>(
     }
     let root = discovered.root;
 
-    // No concrete cross-major transforms exist yet, so the registry is empty;
-    // the machinery (sentinel/drain/snapshot/swap/commit) and the minor-bump
-    // and no-op paths are all live. A future breaking change registers its
-    // per-major transform here.
-    let registry = loti_core::migrate::TransformRegistry::new();
+    // The registry carries every known cross-major transform (e.g. the 0->1
+    // split of the coupled blocked-by map into an independent dependency list
+    // plus block-reason). The machinery (sentinel/drain/snapshot/swap/commit)
+    // and the minor-bump and no-op paths are all live around it.
+    let registry = loti_core::migrate::default_registry();
     let config = loti_core::migrate::MigrateConfig {
         force: if args.force {
             loti_core::migrate::Force::Force
@@ -438,6 +438,7 @@ fn run_ticket<R: Read, O: Write, E: Write>(
                 )?;
             }
         }
+        TicketCommand::BlockedBy(a) => run_blocked_by(cli, &a.command, out, err)?,
         TicketCommand::Label(a) => run_label(cli, &a.command, Kind::Ticket, out, err)?,
         TicketCommand::Comment(a) => {
             run_comment(cli, &a.command, Kind::Ticket, stdin, stdin_is_tty, out, err)?
@@ -458,8 +459,9 @@ fn run_ticket<R: Read, O: Write, E: Write>(
 }
 
 /// Translate the ticket status flags into the typed core change. The clap group
-/// guarantees exactly one state flag is set; `--blocked-by`/`--reason`/
-/// `--cascade` are constrained by clap to their owning state.
+/// guarantees exactly one state flag is set; `--reason`/`--cascade` are
+/// constrained to their owning state. The `blocked-by` dependency list is
+/// managed separately (see `ticket blocked-by`) and never set here.
 fn status_change_from_args(a: &crate::cli::TicketStatusArgs) -> Result<NodeStatusChange> {
     let s = &a.state;
     if s.to_do {
@@ -467,18 +469,7 @@ fn status_change_from_args(a: &crate::cli::TicketStatusArgs) -> Result<NodeStatu
     } else if s.in_progress {
         Ok(NodeStatusChange::InProgress)
     } else if s.blocked {
-        let refs = match &a.blocked_by {
-            Some(list) => list
-                .split(',')
-                .map(|t| t.trim())
-                .filter(|t| !t.is_empty())
-                .map(NodeRef::parse)
-                .collect::<Result<Vec<_>, _>>()
-                .context("parsing --blocked-by")?,
-            None => Vec::new(),
-        };
         Ok(NodeStatusChange::Blocked {
-            refs,
             reason: a.reason.clone(),
         })
     } else if s.done {
@@ -513,6 +504,77 @@ fn target_of(kind: Kind, reference: &str) -> Result<Target> {
         Kind::Epic => Target::Epic(reference.to_string()),
         Kind::Ticket => Target::Node(NodeRef::parse(reference)?),
     })
+}
+
+/// Resolve a `blocked-by` blocker token entered on the CLI to a canonical
+/// [`NodeRef`]. A bare number (`<n>`) resolves against the target node's own
+/// epic; a full `<epic-id>/<n>` is parsed as-is. This human-friendly shorthand
+/// exists only at the CLI edge — storage always keeps the canonical form.
+fn resolve_blocker(epic_id: &str, token: &str) -> Result<NodeRef> {
+    let token = token.trim();
+    if let Ok(number) = token.parse::<u64>() {
+        return Ok(NodeRef::new(epic_id, number));
+    }
+    NodeRef::parse(token).context("parsing blocker (use <n> or <epic-id>/<n>)")
+}
+
+fn run_blocked_by<O: Write, E: Write>(
+    cli: &Cli,
+    cmd: &crate::cli::BlockedByCommand,
+    out: &mut O,
+    err: &mut E,
+) -> Result<()> {
+    use crate::cli::BlockedByCommand;
+    match cmd {
+        BlockedByCommand::Add(a) => {
+            let store = open_store(cli, err)?;
+            let node_ref = NodeRef::parse(&a.reference)?;
+            let blockers = a
+                .blockers
+                .iter()
+                .map(|t| resolve_blocker(&node_ref.epic_id, t))
+                .collect::<Result<Vec<_>>>()?;
+            let list = ops::add_blocked_by(&store, &node_ref, &blockers)?;
+            writeln!(out, "loti: blocked-by: {}", render_list(&list))?;
+        }
+        BlockedByCommand::Remove(a) => {
+            let store = open_store(cli, err)?;
+            let node_ref = NodeRef::parse(&a.reference)?;
+            let blockers = a
+                .blockers
+                .iter()
+                .map(|t| resolve_blocker(&node_ref.epic_id, t))
+                .collect::<Result<Vec<_>>>()?;
+            let list = ops::remove_blocked_by(&store, &node_ref, &blockers)?;
+            writeln!(out, "loti: blocked-by: {}", render_list(&list))?;
+        }
+        BlockedByCommand::Set(a) => {
+            let store = open_store(cli, err)?;
+            let node_ref = NodeRef::parse(&a.reference)?;
+            let blockers = a
+                .blockers
+                .iter()
+                .map(|t| resolve_blocker(&node_ref.epic_id, t))
+                .collect::<Result<Vec<_>>>()?;
+            let list = ops::set_blocked_by(&store, &node_ref, &blockers)?;
+            writeln!(out, "loti: blocked-by: {}", render_list(&list))?;
+        }
+        BlockedByCommand::Clear(a) => {
+            let store = open_store(cli, err)?;
+            let node_ref = NodeRef::parse(&a.reference)?;
+            let list = ops::clear_blocked_by(&store, &node_ref)?;
+            writeln!(out, "loti: blocked-by: {}", render_list(&list))?;
+        }
+        BlockedByCommand::List(a) => {
+            let store = open_store(cli, err)?;
+            let node_ref = NodeRef::parse(&a.reference)?;
+            let list = ops::list_blocked_by(&store, &node_ref)?;
+            for b in list {
+                writeln!(out, "{b}")?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run_label<O: Write, E: Write>(
@@ -1297,15 +1359,9 @@ mod tests {
         let ar = NodeRef::new("e", a.frontmatter.number);
         let b = ops::create_node(&store, test_node("e", Some(ar.clone()))).unwrap();
         let br = NodeRef::new("e", b.frontmatter.number);
-        ops::set_node_status(
-            &store,
-            &br,
-            NodeStatusChange::Blocked {
-                refs: vec![],
-                reason: Some("waiting".into()),
-            },
-        )
-        .unwrap();
+        // The trailing tag reflects the blocked-by dependency list; record a
+        // dependency of the child on its parent.
+        ops::add_blocked_by(&store, &br, std::slice::from_ref(&ar)).unwrap();
         let cli = cli_with_root(&root, &["ticket", "list", "e"]);
         let (out, _e, r) = invoke(&cli, b"");
         assert!(r.is_ok());
@@ -1318,8 +1374,8 @@ mod tests {
             lines
         );
         assert!(
-            lines[1].contains("[blocked: waiting]"),
-            "blocked tag missing: {:?}",
+            lines[1].contains("[blocked-by: e/1]"),
+            "blocked-by tag missing: {:?}",
             lines
         );
     }

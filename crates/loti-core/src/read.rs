@@ -16,7 +16,7 @@ use crate::domain::{epic_status, NodeRef, NodeStatus};
 use crate::filter::{RegexMatcher, StructuredFilters};
 use crate::matcher::{self, MatchWarning, MatcherError, MatcherRegistry, ResolvedMatcher};
 use crate::ops::{descendants_of, list_comments, load_epic_nodes, CommentView, OpError, Target};
-use crate::render::{BlockedTag, ChildRow, CommentLine, ListEpic, ListNode};
+use crate::render::{ChildRow, CommentLine, ListEpic, ListNode};
 use crate::store::{Store, EPIC_FILE};
 use crate::{model::NodeFile, render};
 
@@ -326,21 +326,9 @@ fn list_node(epic_id: &str, n: &NodeFile) -> ListNode {
         status: fm.status.wire_name().to_string(),
         parent: fm.parent.map(|p| format!("{}/{}", epic_id, p)),
         labels: fm.labels.clone(),
-        blocked: if fm.status == crate::NodeState::Blocked || !fm.blocked_by.is_empty() {
-            // A blocked node carries the tag; a node with a stored blocker but a
-            // non-blocked state does not (the state is authoritative), so only
-            // tag when actually blocked.
-            if fm.status == crate::NodeState::Blocked {
-                Some(BlockedTag {
-                    refs: fm.blocked_by.refs.clone(),
-                    reason: fm.blocked_by.reason.clone(),
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        },
+        // blocked-by is a dependency annotation independent of status: it is
+        // carried through verbatim and shown whenever non-empty, in any state.
+        blocked_by: fm.blocked_by.clone(),
     }
 }
 
@@ -541,20 +529,16 @@ mod tests {
     }
 
     #[test]
-    fn blocked_node_carries_a_tag() {
+    fn node_carries_its_blocked_by_dependencies() {
+        // The blocked-by tag lists dependency refs and is independent of the
+        // node's status — an in-progress node with dependencies still shows it.
         let (_d, s) = seeded();
         create_epic(&s, new_epic("e")).unwrap();
+        create_node(&s, new_node("e", None, "blocker")).unwrap();
         let a = create_node(&s, new_node("e", None, "a")).unwrap();
         let ar = NodeRef::new("e", a.frontmatter.number);
-        set_node_status(
-            &s,
-            &ar,
-            NodeStatusChange::Blocked {
-                refs: vec![NodeRef::new("e", 99)],
-                reason: Some("waiting".into()),
-            },
-        )
-        .unwrap();
+        crate::ops::add_blocked_by(&s, &ar, &[NodeRef::new("e", 1)]).unwrap();
+        set_node_status(&s, &ar, NodeStatusChange::InProgress).unwrap();
         let rows = list_nodes(
             &s,
             &ListScope::Epic {
@@ -563,9 +547,8 @@ mod tests {
             },
         )
         .unwrap();
-        let tag = rows[0].blocked.as_ref().expect("blocked tag");
-        assert_eq!(tag.refs, vec!["e/99"]);
-        assert_eq!(tag.reason.as_deref(), Some("waiting"));
+        let row = rows.iter().find(|r| r.name == "a").expect("node a");
+        assert_eq!(row.blocked_by, vec!["e/1"]);
     }
 
     #[test]

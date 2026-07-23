@@ -75,7 +75,11 @@ pub fn node_to_json(epic_id: &str, node: &NodeFile) -> Value {
             None => Value::Null,
         },
     );
-    map.insert("blocked-by".into(), blocked_by_json(&fm.blocked_by));
+    map.insert("blocked-by".into(), json!(fm.blocked_by));
+    map.insert(
+        "block-reason".into(),
+        opt_string_json(fm.block_reason.as_deref()),
+    );
     map.insert(
         "close-reason".into(),
         opt_string_json(fm.close_reason.as_deref()),
@@ -119,16 +123,6 @@ pub fn epic_to_json(epic: &EpicFile, node_statuses: &[NodeStatus]) -> Value {
     map.insert("body".into(), json!(epic.body));
     merge_extra(&mut map, &fm.extra);
     Value::Object(map)
-}
-
-fn blocked_by_json(b: &crate::model::BlockedBy) -> Value {
-    if b.is_empty() {
-        return Value::Null;
-    }
-    json!({
-        "refs": b.refs,
-        "reason": opt_string_json(b.reason.as_deref()),
-    })
 }
 
 fn assets_json(atts: &[Asset]) -> Value {
@@ -502,11 +496,17 @@ pub fn show_markdown(
             let _ = writeln!(s, "| {} | {} |", key, meta_cell(v));
         }
     }
-    // blocked-by is worth surfacing for a node when present.
+    // blocked-by (dependency list) and block-reason are worth surfacing for a
+    // node when present; they are independent of each other.
     if node {
         if let Some(b) = value.get("blocked-by") {
-            if !b.is_null() {
-                let _ = writeln!(s, "| blocked-by | {} |", blocked_cell(b));
+            if !b.is_null() && !b.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+                let _ = writeln!(s, "| blocked-by | {} |", blocked_by_cell(b));
+            }
+        }
+        if let Some(br) = value.get("block-reason") {
+            if !br.is_null() {
+                let _ = writeln!(s, "| block-reason | {} |", meta_cell(br));
             }
         }
     }
@@ -594,11 +594,10 @@ fn meta_cell(v: &Value) -> String {
     }
 }
 
-/// Render a blocked-by cell: its refs joined and any reason appended.
-fn blocked_cell(b: &Value) -> String {
+/// Render a blocked-by cell: the dependency refs joined by commas.
+fn blocked_by_cell(b: &Value) -> String {
     let refs = b
-        .get("refs")
-        .and_then(Value::as_array)
+        .as_array()
         .map(|a| {
             a.iter()
                 .filter_map(|i| i.as_str().map(str::to_string))
@@ -606,12 +605,10 @@ fn blocked_cell(b: &Value) -> String {
                 .join(", ")
         })
         .unwrap_or_default();
-    let reason = b.get("reason").and_then(Value::as_str).unwrap_or("");
-    match (refs.is_empty(), reason.is_empty()) {
-        (false, false) => format!("{refs}; {reason}"),
-        (false, true) => refs,
-        (true, false) => reason.to_string(),
-        (true, true) => "—".to_string(),
+    if refs.is_empty() {
+        "—".to_string()
+    } else {
+        refs
     }
 }
 
@@ -691,30 +688,9 @@ pub struct ListNode {
     pub parent: Option<String>,
     /// Its labels.
     pub labels: Vec<String>,
-    /// Whether it is blocked, and by what (refs + reason), for the trailing tag.
-    pub blocked: Option<BlockedTag>,
-}
-
-/// The blocked-by summary rendered as a trailing `[blocked: …]` tag.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlockedTag {
-    /// Referenced blocker nodes.
-    pub refs: Vec<String>,
-    /// A free-form reason, if any.
-    pub reason: Option<String>,
-}
-
-impl BlockedTag {
-    /// The inside of the `[blocked: …]` tag.
-    fn summary(&self) -> String {
-        let refs = self.refs.join(", ");
-        match (refs.is_empty(), &self.reason) {
-            (false, Some(r)) => format!("{refs}; {r}"),
-            (false, None) => refs,
-            (true, Some(r)) => r.clone(),
-            (true, None) => "blocked".to_string(),
-        }
-    }
+    /// The node's `blocked-by` dependency refs (canonical `<epic-id>/<n>`).
+    /// Rendered as a trailing `[blocked-by: …]` tag; independent of `status`.
+    pub blocked_by: Vec<String>,
 }
 
 /// A list roster entry for an epic (the `epic list` roster).
@@ -744,7 +720,8 @@ pub enum Color {
 }
 
 /// Render the default plain-text `list` for nodes: a git-log-like, indented,
-/// depth-first tree, each blocked node carrying a trailing `[blocked: …]` tag.
+/// depth-first tree, each node with dependencies carrying a trailing
+/// `[blocked-by: …]` tag.
 ///
 /// The tree is reconstructed from each node's parent pointer; a node whose
 /// parent is not in the set (e.g. because the scope started below it) is treated
@@ -790,8 +767,8 @@ pub fn list_nodes_plain(nodes: &[ListNode], color: Color) -> String {
 }
 
 /// One indented node line: `<indent><ref> <name> <status>` plus a trailing
-/// blocked tag when blocked. Colour, when enabled, dims the reference and paints
-/// the status; a blocked tag is emphasised.
+/// `[blocked-by: …]` tag when the node has dependencies. Colour, when enabled,
+/// dims the reference and paints the status; the dependency tag is emphasised.
 fn render_node_line(node: &ListNode, depth: usize, color: Color) -> String {
     let indent = "  ".repeat(depth);
     let reference = paint(&node.reference, dim(), color);
@@ -801,8 +778,8 @@ fn render_node_line(node: &ListNode, depth: usize, color: Color) -> String {
         color,
     );
     let mut line = format!("{indent}{reference} {} {status}", node.name);
-    if let Some(tag) = &node.blocked {
-        let tag_text = format!("[blocked: {}]", tag.summary());
+    if !node.blocked_by.is_empty() {
+        let tag_text = format!("[blocked-by: {}]", node.blocked_by.join(", "));
         let _ = write!(line, " {}", paint(&tag_text, blocked_style(), color));
     }
     line
@@ -924,21 +901,18 @@ pub fn list_nodes_ndjson(nodes: &[ListNode]) -> String {
 }
 
 /// Render `list --raw` for nodes: flat, tab-separated rows
-/// (`ref  number  name  status  parent  labels  blocked`).
+/// (`ref  number  name  status  parent  labels  blocked-by`). The blocked-by
+/// column joins the dependency refs with commas.
 pub fn list_nodes_raw(nodes: &[ListNode]) -> String {
     let mut out = String::new();
     for n in nodes {
         let parent = n.parent.clone().unwrap_or_default();
         let labels = n.labels.join(",");
-        let blocked = n
-            .blocked
-            .as_ref()
-            .map(BlockedTag::summary)
-            .unwrap_or_default();
+        let blocked_by = n.blocked_by.join(",");
         let _ = writeln!(
             out,
             "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            n.reference, n.number, n.name, n.status, parent, labels, blocked
+            n.reference, n.number, n.name, n.status, parent, labels, blocked_by
         );
     }
     out
@@ -952,10 +926,7 @@ fn list_node_value(n: &ListNode) -> Value {
         "status": n.status,
         "parent": n.parent.clone().map(Value::from).unwrap_or(Value::Null),
         "labels": n.labels,
-        "blocked": n.blocked.as_ref().map(|t| json!({
-            "refs": t.refs,
-            "reason": opt_string_json(t.reason.as_deref()),
-        })).unwrap_or(Value::Null),
+        "blocked-by": n.blocked_by,
     })
 }
 
@@ -1004,7 +975,13 @@ fn list_epic_value(e: &ListEpic) -> Value {
 /// The node fields `list` may serve via `--fields`. Requesting anything else is
 /// a hard error — heavy/structured fields are `show`-only.
 pub const LISTABLE_NODE_FIELDS: &[&str] = &[
-    "ref", "number", "name", "status", "parent", "labels", "blocked",
+    "ref",
+    "number",
+    "name",
+    "status",
+    "parent",
+    "labels",
+    "blocked-by",
 ];
 
 /// The epic roster fields `list` may serve via `--fields`.
@@ -1019,7 +996,7 @@ pub const HEAVY_FIELDS: &[&str] = &["body", "comments", "assets", "subtickets"];
 pub fn validate_list_fields(fields: &[String], listable: &[&str]) -> Result<(), RenderError> {
     for f in fields {
         // Only the head segment is checked against the listable set; a dotted
-        // path into a listable field (e.g. `blocked.refs`) is still summary.
+        // path into a listable field is still summary.
         let head = f.split('.').next().unwrap_or(f);
         if listable.contains(&head) {
             continue;
@@ -1247,7 +1224,7 @@ mod tests {
                 status: "in-progress".into(),
                 parent: None,
                 labels: vec!["x".into()],
-                blocked: None,
+                blocked_by: vec![],
             },
             ListNode {
                 reference: "e/2".into(),
@@ -1256,21 +1233,19 @@ mod tests {
                 status: "blocked".into(),
                 parent: Some("e/1".into()),
                 labels: vec![],
-                blocked: Some(BlockedTag {
-                    refs: vec!["e/9".into()],
-                    reason: Some("waiting".into()),
-                }),
+                blocked_by: vec!["e/9".into(), "e/12".into()],
             },
         ]
     }
 
     #[test]
-    fn plain_list_is_depth_first_indented_with_blocked_tag() {
+    fn plain_list_is_depth_first_indented_with_blocked_by_tag() {
         let out = list_nodes_plain(&nodes(), Color::None);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "e/1 root (in-progress)");
         assert!(lines[1].starts_with("  e/2 "));
-        assert!(lines[1].contains("[blocked: e/9; waiting]"));
+        // The tag lists the dependency refs, independent of status.
+        assert!(lines[1].contains("[blocked-by: e/9, e/12]"));
     }
 
     fn node(reference: &str, number: u64, status: &str) -> ListNode {
@@ -1281,7 +1256,7 @@ mod tests {
             status: status.into(),
             parent: None,
             labels: vec![],
-            blocked: None,
+            blocked_by: vec![],
         }
     }
 
@@ -1355,7 +1330,7 @@ mod tests {
         let out = list_nodes_raw(&nodes());
         let first = out.lines().next().unwrap();
         let cols: Vec<&str> = first.split('\t').collect();
-        // ref, number, name, status, parent, labels, blocked
+        // ref, number, name, status, parent, labels, blocked-by
         assert_eq!(cols.len(), 7);
         assert_eq!(cols[0], "e/1");
     }
@@ -1365,7 +1340,7 @@ mod tests {
     #[test]
     fn listable_fields_pass_heavy_fields_fail() {
         assert!(validate_list_fields(
-            &["ref".into(), "status".into(), "blocked.refs".into()],
+            &["ref".into(), "status".into(), "blocked-by".into()],
             LISTABLE_NODE_FIELDS
         )
         .is_ok());

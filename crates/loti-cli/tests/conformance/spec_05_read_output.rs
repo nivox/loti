@@ -130,21 +130,15 @@ fn plain_list_closes_with_a_per_status_progress_footer_absent_from_machine_forms
 }
 
 #[test]
-fn list_default_is_an_indented_depth_first_tree_with_blocked_tag() {
+fn list_default_is_an_indented_depth_first_tree_with_blocked_by_tag() {
     let s = Store::new();
     s.epic("e");
     let parent = s.ticket("e", "parent");
     let child = s.subticket("e", &parent, "child");
     let other = s.ticket("e", "other");
-    s.ok(&[
-        "ticket",
-        "status",
-        &child,
-        "--blocked",
-        "--reason",
-        "waiting",
-    ]);
-    let _ = other;
+    // The trailing tag reflects the blocked-by dependency list, independent of
+    // status: record a dependency on `other`.
+    s.ok(&["ticket", "blocked-by", "add", &child, &other]);
 
     let out = s.ok(&["ticket", "list", "e"]);
     let lines: Vec<&str> = out.lines().collect();
@@ -158,8 +152,8 @@ fn list_default_is_an_indented_depth_first_tree_with_blocked_tag() {
         "child is indented under the parent: {out}"
     );
     assert!(
-        lines[c].contains("[blocked:") && lines[c].contains("waiting"),
-        "a blocked node carries a trailing tag: {out}"
+        lines[c].contains("[blocked-by:") && lines[c].contains(&other),
+        "a node with dependencies carries a trailing blocked-by tag: {out}"
     );
 }
 

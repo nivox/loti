@@ -34,26 +34,6 @@ pub enum ModelError {
     Yaml(#[from] serde_yaml::Error),
 }
 
-/// A structured blocker on a node. Both parts are optional: a `blocked` node
-/// may cite other nodes, a free-form reason, or both. `loti` never sets or
-/// clears this automatically.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BlockedBy {
-    /// References to other nodes that block this one, as `<epic-id>/<n>`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub refs: Vec<String>,
-    /// A free-form blocker for non-node causes (e.g. an external dependency).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-}
-
-impl BlockedBy {
-    /// A blocker carrying neither references nor a reason is vacuous.
-    pub fn is_empty(&self) -> bool {
-        self.refs.is_empty() && self.reason.is_none()
-    }
-}
-
 /// One entry in a file's assets index. The bytes live in the companion
 /// directory beside the file; this records the name and an optional caption.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,13 +91,19 @@ pub struct NodeFrontmatter {
     /// tree is encoded solely by this field, never by file location.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<u64>,
-    /// Structured blocker; present only while relevant.
+    /// Dependency annotation: canonical `<epic-id>/<n>` references to other
+    /// nodes that block this one. Independent of `status` — it never gates or
+    /// is cleared by a state change, and a node in any state may carry it.
+    #[serde(rename = "blocked-by", default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_by: Vec<String>,
+    /// Reason a node is in the `blocked` state; present only while `blocked`
+    /// (mirrors `close-reason` for `closed`). Leaving `blocked` clears it.
     #[serde(
-        rename = "blocked-by",
+        rename = "block-reason",
         default,
-        skip_serializing_if = "BlockedBy::is_empty"
+        skip_serializing_if = "Option::is_none"
     )]
-    pub blocked_by: BlockedBy,
+    pub block_reason: Option<String>,
     /// Reason a terminally-closed node was closed; absent otherwise.
     #[serde(
         rename = "close-reason",
@@ -392,25 +378,29 @@ mod tests {
     }
 
     #[test]
-    fn blocked_by_round_trips() {
+    fn blocked_by_and_block_reason_round_trip() {
+        // blocked-by is a plain list of canonical refs, independent of status;
+        // block-reason is the free-form reason for the blocked state.
         let text = "---\n\
              number: 2\n\
              name: n\n\
              summary: s\n\
              status: blocked\n\
-             blocked-by:\n  refs:\n  - my-epic/1\n  reason: waiting on a key\n\
+             blocked-by:\n- my-epic/1\n- other/3\n\
+             block-reason: waiting on a key\n\
              created: 2024-01-01T00:00:00Z\n\
              updated: 2024-01-01T00:00:00Z\n\
              ---\n";
         let node = NodeFile::parse(text).unwrap();
-        assert_eq!(node.frontmatter.blocked_by.refs, vec!["my-epic/1"]);
+        assert_eq!(node.frontmatter.blocked_by, vec!["my-epic/1", "other/3"]);
         assert_eq!(
-            node.frontmatter.blocked_by.reason.as_deref(),
+            node.frontmatter.block_reason.as_deref(),
             Some("waiting on a key")
         );
         let out = node.to_text().unwrap();
         assert!(out.contains("blocked-by:"));
         assert!(out.contains("my-epic/1"));
+        assert!(out.contains("block-reason: waiting on a key"));
     }
 
     #[test]
@@ -551,7 +541,8 @@ mod tests {
             status: NodeState::ToDo,
             labels: Vec::new(),
             parent: None,
-            blocked_by: BlockedBy::default(),
+            blocked_by: Vec::new(),
+            block_reason: None,
             close_reason: None,
             assets: Vec::new(),
             comments: Vec::new(),

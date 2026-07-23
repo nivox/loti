@@ -26,7 +26,7 @@ use tempfile::TempDir;
 /// The metadata a fresh store carries, matching what `loti init` writes for the
 /// version this binary understands. Kept as a literal so the harness does not
 /// depend on the core crate.
-const CURRENT_META: &str = "format-version = \"0.1\"\n";
+const CURRENT_META: &str = "format-version = \"1.1\"\n";
 
 /// A throwaway store rooted in a tempdir, plus a builder for binary invocations
 /// against it.

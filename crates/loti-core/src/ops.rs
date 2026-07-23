@@ -65,6 +65,9 @@ pub enum OpError {
         /// The epic the node being created/edited belongs to.
         epic_id: String,
     },
+    /// A node cannot list itself as a `blocked-by` dependency.
+    #[error("a node cannot be blocked by itself ({0})")]
+    BlockedBySelf(NodeRef),
     /// Reparenting would make a node its own ancestor (a cycle).
     #[error("reparenting {node} under {parent} would form a cycle")]
     ReparentCycle {
@@ -225,7 +228,8 @@ pub fn create_node(store: &Store, new: NewNode) -> Result<NodeFile, OpError> {
             status: NodeState::ToDo,
             labels: dedup_preserving_order(new.labels),
             parent: parent_number,
-            blocked_by: Default::default(),
+            blocked_by: Vec::new(),
+            block_reason: None,
             close_reason: None,
             assets: Vec::new(),
             comments: Vec::new(),
@@ -393,11 +397,10 @@ pub enum NodeStatusChange {
     ToDo,
     /// Move to `in-progress`.
     InProgress,
-    /// Move to `blocked`, carrying the structured blocker.
+    /// Move to `blocked`, carrying the required reason. The `blocked-by`
+    /// dependency list is managed separately and untouched by this change.
     Blocked {
-        /// Node references that block this one.
-        refs: Vec<NodeRef>,
-        /// Free-form reason for a non-node blocker.
+        /// Free-form reason the node is blocked (required, non-blank).
         reason: Option<String>,
     },
     /// Move to `done` (allowed only when all descendants are terminal).
@@ -441,34 +444,30 @@ pub fn set_node_status(
     match change {
         NodeStatusChange::ToDo => {
             node.frontmatter.status = NodeState::ToDo;
-            node.frontmatter.blocked_by = Default::default();
-            // A non-closed node carries no close-reason; clear any left from a
-            // prior close so reactivating a node never keeps a stale reason.
+            // Leaving `blocked`/`closed` clears their reasons; the blocked-by
+            // dependency list is independent of status and left untouched.
+            node.frontmatter.block_reason = None;
             node.frontmatter.close_reason = None;
         }
         NodeStatusChange::InProgress => {
             node.frontmatter.status = NodeState::InProgress;
-            node.frontmatter.blocked_by = Default::default();
+            node.frontmatter.block_reason = None;
             node.frontmatter.close_reason = None;
         }
-        NodeStatusChange::Blocked { refs, reason } => {
+        NodeStatusChange::Blocked { reason } => {
             // `blocked` is set only explicitly (this arm) and must carry a
-            // non-empty blocker — at least one ref or a non-blank reason.
-            let has_blocker =
-                !refs.is_empty() || reason.as_deref().map(|r| !r.trim().is_empty()) == Some(true);
-            validate_blocked(true, has_blocker)?;
+            // non-blank reason. blocked-by is managed separately, never here.
+            let has_reason = reason.as_deref().map(|r| !r.trim().is_empty()) == Some(true);
+            validate_blocked(true, has_reason)?;
             node.frontmatter.status = NodeState::Blocked;
-            node.frontmatter.blocked_by = crate::model::BlockedBy {
-                refs: refs.iter().map(|r| r.to_string()).collect(),
-                reason,
-            };
+            node.frontmatter.block_reason = reason;
             node.frontmatter.close_reason = None;
         }
         NodeStatusChange::Done => {
             let descendants = descendants_of(store, node_ref)?;
             validate_done(&descendants)?;
             node.frontmatter.status = NodeState::Done;
-            node.frontmatter.blocked_by = Default::default();
+            node.frontmatter.block_reason = None;
             // `done` is terminal but not `closed`; it never carries a reason.
             node.frontmatter.close_reason = None;
         }
@@ -490,7 +489,7 @@ pub fn set_node_status(
             }
             node.frontmatter.status = NodeState::Closed;
             node.frontmatter.close_reason = reason;
-            node.frontmatter.blocked_by = Default::default();
+            node.frontmatter.block_reason = None;
         }
     }
 
@@ -531,7 +530,7 @@ fn close_descendants(
         }
         child.frontmatter.status = NodeState::Closed;
         child.frontmatter.close_reason = reason.clone();
-        child.frontmatter.blocked_by = Default::default();
+        child.frontmatter.block_reason = None;
         child.frontmatter.updated = now();
         store
             .write_node(epic_id, number, &child)
@@ -640,6 +639,113 @@ fn with_labels(
             Ok(new)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// blocked-by (node-only dependency list)
+// ---------------------------------------------------------------------------
+
+/// Validate one proposed `blocked-by` blocker and return its canonical
+/// `<epic-id>/<n>` string. A blocker must address an existing node and may not
+/// be the node itself; its *state* is irrelevant (a terminal node may block).
+/// Cross-epic blockers are allowed. The list is a dependency annotation, so no
+/// cycle check is performed.
+fn validate_blocker(
+    store: &Store,
+    node_ref: &NodeRef,
+    blocker: &NodeRef,
+) -> Result<String, OpError> {
+    if blocker == node_ref {
+        return Err(OpError::BlockedBySelf(blocker.clone()));
+    }
+    if !store.node_path(&blocker.epic_id, blocker.number).is_file() {
+        return Err(OpError::NoSuchNode(blocker.clone()));
+    }
+    Ok(blocker.to_string())
+}
+
+/// Add blockers to a node's `blocked-by` list (deduplicated, first-seen order).
+/// Each blocker must exist and not be the node itself. Bumps `updated`.
+pub fn add_blocked_by(
+    store: &Store,
+    node_ref: &NodeRef,
+    blockers: &[NodeRef],
+) -> Result<Vec<String>, OpError> {
+    let mut canonical = Vec::with_capacity(blockers.len());
+    for b in blockers {
+        canonical.push(validate_blocker(store, node_ref, b)?);
+    }
+    with_blocked_by(store, node_ref, |existing| {
+        let mut merged = existing.clone();
+        for c in canonical {
+            if !merged.contains(&c) {
+                merged.push(c);
+            }
+        }
+        merged
+    })
+}
+
+/// Remove blockers from a node's `blocked-by` list. Removing an absent blocker
+/// is a no-op. Blockers are matched by canonical form, so `<n>` and
+/// `<epic-id>/<n>` are resolved by the caller before reaching here. Bumps
+/// `updated`.
+pub fn remove_blocked_by(
+    store: &Store,
+    node_ref: &NodeRef,
+    blockers: &[NodeRef],
+) -> Result<Vec<String>, OpError> {
+    let drop: Vec<String> = blockers.iter().map(NodeRef::to_string).collect();
+    with_blocked_by(store, node_ref, |existing| {
+        existing
+            .iter()
+            .filter(|c| !drop.contains(c))
+            .cloned()
+            .collect()
+    })
+}
+
+/// Replace a node's `blocked-by` list wholesale. Every blocker must exist and
+/// not be the node itself. Bumps `updated`.
+pub fn set_blocked_by(
+    store: &Store,
+    node_ref: &NodeRef,
+    blockers: &[NodeRef],
+) -> Result<Vec<String>, OpError> {
+    let mut canonical = Vec::with_capacity(blockers.len());
+    for b in blockers {
+        let c = validate_blocker(store, node_ref, b)?;
+        if !canonical.contains(&c) {
+            canonical.push(c);
+        }
+    }
+    with_blocked_by(store, node_ref, |_existing| canonical.clone())
+}
+
+/// Empty a node's `blocked-by` list. Bumps `updated`.
+pub fn clear_blocked_by(store: &Store, node_ref: &NodeRef) -> Result<Vec<String>, OpError> {
+    with_blocked_by(store, node_ref, |_existing| Vec::new())
+}
+
+/// List a node's `blocked-by` dependencies (canonical refs).
+pub fn list_blocked_by(store: &Store, node_ref: &NodeRef) -> Result<Vec<String>, OpError> {
+    Ok(read_node(store, node_ref)?.frontmatter.blocked_by)
+}
+
+/// Read a node's `blocked-by` list, transform it, write back (bumping
+/// `updated`), and return the new list. Shared by add/remove/set/clear so each
+/// takes the guarded path.
+fn with_blocked_by(
+    store: &Store,
+    node_ref: &NodeRef,
+    transform: impl FnOnce(&Vec<String>) -> Vec<String>,
+) -> Result<Vec<String>, OpError> {
+    let mut node = read_node(store, node_ref)?;
+    let new = transform(&node.frontmatter.blocked_by);
+    node.frontmatter.blocked_by = new.clone();
+    node.frontmatter.updated = now();
+    store.write_node(&node_ref.epic_id, node_ref.number, &node)?;
+    Ok(new)
 }
 
 // ---------------------------------------------------------------------------
@@ -1258,7 +1364,7 @@ mod tests {
     }
 
     #[test]
-    fn status_blocked_sets_structured_blocked_by() {
+    fn status_blocked_sets_block_reason_and_leaves_blocked_by() {
         let (_d, s) = seeded();
         create_epic(&s, new_epic("e")).unwrap();
         let n = create_node(&s, new_node("e", None)).unwrap();
@@ -1267,17 +1373,78 @@ mod tests {
             &s,
             &r,
             NodeStatusChange::Blocked {
-                refs: vec![NodeRef::new("e", 99)],
                 reason: Some("waiting on a key".into()),
             },
         )
         .unwrap();
         assert_eq!(blocked.node.frontmatter.status, NodeState::Blocked);
-        assert_eq!(blocked.node.frontmatter.blocked_by.refs, vec!["e/99"]);
         assert_eq!(
-            blocked.node.frontmatter.blocked_by.reason.as_deref(),
+            blocked.node.frontmatter.block_reason.as_deref(),
             Some("waiting on a key")
         );
+        // blocked-by is a separate dependency list, untouched by the state.
+        assert!(blocked.node.frontmatter.blocked_by.is_empty());
+    }
+
+    // -- blocked-by (dependency list, status-independent) ------------------
+
+    #[test]
+    fn blocked_by_add_remove_set_clear_and_existence_checks() {
+        let (_d, s) = seeded();
+        create_epic(&s, new_epic("e")).unwrap();
+        let a = create_node(&s, new_node("e", None)).unwrap();
+        let b = create_node(&s, new_node("e", None)).unwrap();
+        let c = create_node(&s, new_node("e", None)).unwrap();
+        let ar = NodeRef::new("e", a.frontmatter.number);
+        let br = NodeRef::new("e", b.frontmatter.number);
+        let cr = NodeRef::new("e", c.frontmatter.number);
+
+        // Add two existing blockers, deduped.
+        let after = add_blocked_by(&s, &ar, &[br.clone(), cr.clone(), br.clone()]).unwrap();
+        assert_eq!(after, vec![br.to_string(), cr.to_string()]);
+
+        // A missing blocker is refused; a self-reference is refused.
+        assert!(matches!(
+            add_blocked_by(&s, &ar, &[NodeRef::new("e", 999)]),
+            Err(OpError::NoSuchNode(_))
+        ));
+        assert!(matches!(
+            add_blocked_by(&s, &ar, std::slice::from_ref(&ar)),
+            Err(OpError::BlockedBySelf(_))
+        ));
+
+        // Remove one; the other survives.
+        let after_rm = remove_blocked_by(&s, &ar, std::slice::from_ref(&br)).unwrap();
+        assert_eq!(after_rm, vec![cr.to_string()]);
+
+        // Set replaces wholesale; clear empties.
+        let after_set = set_blocked_by(&s, &ar, std::slice::from_ref(&br)).unwrap();
+        assert_eq!(after_set, vec![br.to_string()]);
+        assert!(clear_blocked_by(&s, &ar).unwrap().is_empty());
+        assert!(list_blocked_by(&s, &ar).unwrap().is_empty());
+    }
+
+    #[test]
+    fn blocked_by_survives_state_changes() {
+        // The dependency list is orthogonal to status: resolving a node never
+        // clears it.
+        let (_d, s) = seeded();
+        create_epic(&s, new_epic("e")).unwrap();
+        let a = create_node(&s, new_node("e", None)).unwrap();
+        let b = create_node(&s, new_node("e", None)).unwrap();
+        let ar = NodeRef::new("e", a.frontmatter.number);
+        let br = NodeRef::new("e", b.frontmatter.number);
+        add_blocked_by(&s, &ar, std::slice::from_ref(&br)).unwrap();
+        set_node_status(
+            &s,
+            &ar,
+            NodeStatusChange::Closed {
+                reason: Some("obsolete".into()),
+                cascade: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(list_blocked_by(&s, &ar).unwrap(), vec![br.to_string()]);
     }
 
     #[test]
@@ -1404,22 +1571,15 @@ mod tests {
     }
 
     #[test]
-    fn blocked_requires_a_blocker() {
+    fn blocked_requires_a_reason() {
         let (_d, s) = seeded();
         create_epic(&s, new_epic("e")).unwrap();
         let n = create_node(&s, new_node("e", None)).unwrap();
         let r = NodeRef::new("e", n.frontmatter.number);
         assert!(matches!(
-            set_node_status(
-                &s,
-                &r,
-                NodeStatusChange::Blocked {
-                    refs: vec![],
-                    reason: None,
-                },
-            ),
+            set_node_status(&s, &r, NodeStatusChange::Blocked { reason: None }),
             Err(OpError::Transition(
-                domain::TransitionError::BlockedNeedsBlocker
+                domain::TransitionError::BlockedNeedsReason
             ))
         ));
     }

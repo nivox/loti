@@ -206,6 +206,8 @@ pub enum TicketCommand {
     Edit(TicketEditArgs),
     /// Set node status (set-only; read via `show`).
     Status(TicketStatusArgs),
+    /// Manage the blocked-by dependency list (add/remove/set/clear/list).
+    BlockedBy(BlockedByArgs),
     /// Manage labels (add/remove/list).
     Label(LabelArgs),
     /// Manage comments (add/edit/delete/list). Actor required on mutations.
@@ -214,6 +216,42 @@ pub enum TicketCommand {
     Asset(AssetArgs),
     /// List nodes under a required scope.
     List(TicketListArgs),
+}
+
+/// The `blocked-by` dependency list is node-only: it records which tickets
+/// block this one. It is an advisory annotation independent of the node's
+/// status — setting or clearing it never changes the state, and a state change
+/// never touches it. A blocker must exist; its own state is irrelevant.
+#[derive(Debug, Args)]
+#[command(disable_help_subcommand = true)]
+pub struct BlockedByArgs {
+    #[command(subcommand)]
+    pub command: BlockedByCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BlockedByCommand {
+    /// Add blockers (deduplicated). Each blocker is `<n>` (same epic) or
+    /// `<epic-id>/<n>`.
+    Add(BlockedByMutateArgs),
+    /// Remove blockers. Removing an absent blocker is a no-op.
+    Remove(BlockedByMutateArgs),
+    /// Replace the whole list with these blockers.
+    Set(BlockedByMutateArgs),
+    /// Clear the whole list.
+    Clear(RefArg),
+    /// List the current blockers (canonical refs).
+    List(RefArg),
+}
+
+#[derive(Debug, Args)]
+pub struct BlockedByMutateArgs {
+    /// Node reference `<epic-id>/<n>`.
+    #[arg(value_name = "REF")]
+    pub reference: String,
+    /// Blockers: each `<n>` (same epic as REF) or `<epic-id>/<n>` (inline).
+    #[arg(value_name = "BLOCKER", required = true)]
+    pub blockers: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -264,10 +302,7 @@ pub struct TicketStatusArgs {
     pub reference: String,
     #[command(flatten)]
     pub state: TicketStateSel,
-    /// blocked-by node refs, comma-separated (only with --blocked).
-    #[arg(long, value_name = "REF[,REF]", requires = "blocked")]
-    pub blocked_by: Option<String>,
-    /// Free-form reason (inline; with --blocked or --closed).
+    /// Free-form reason (inline). Required with --blocked and with --closed.
     #[arg(long, value_name = "S")]
     pub reason: Option<String>,
     /// Cascade a close to non-terminal descendants (only with --closed).
@@ -283,7 +318,8 @@ pub struct TicketStateSel {
     pub to_do: bool,
     #[arg(long)]
     pub in_progress: bool,
-    /// Requires a structured blocked-by (`--blocked-by` and/or `--reason`).
+    /// Requires `--reason`. The blocked-by dependency list is managed
+    /// separately via `ticket blocked-by` and is not set here.
     #[arg(long)]
     pub blocked: bool,
     /// Allowed only when all descendants are terminal.

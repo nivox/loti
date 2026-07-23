@@ -123,7 +123,7 @@ fn config_pointer_wins_and_root_override_beats_discovery() {
     std::fs::create_dir_all(data.path().join(".loti")).unwrap();
     std::fs::write(
         data.path().join(".loti").join("meta"),
-        "format-version = \"0.1\"\n",
+        "format-version = \"1.1\"\n",
     )
     .unwrap();
     // `outer` carries only a pointer to it.
@@ -275,7 +275,7 @@ fn init_rejects_naming_the_target_twice() {
 fn write_meta_here(dir: &std::path::Path) {
     let marker = dir.join(".loti");
     std::fs::create_dir_all(&marker).unwrap();
-    std::fs::write(marker.join("meta"), "format-version = \"0.1\"\n").unwrap();
+    std::fs::write(marker.join("meta"), "format-version = \"1.1\"\n").unwrap();
 }
 
 /// Run `loti init` with the current dir set to `dir` and no `--root`.

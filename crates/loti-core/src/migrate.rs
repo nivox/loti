@@ -616,6 +616,137 @@ fn remove_dir_if_exists(path: &Path) -> Result<(), MigrateError> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// registered transforms
+// ---------------------------------------------------------------------------
+
+/// The registry of every known major transform, used by callers that migrate
+/// to this binary's version. Registered in `from`-major order.
+pub fn default_registry() -> TransformRegistry {
+    let mut registry = TransformRegistry::new();
+    registry.register(Box::new(BlockedByV0ToV1));
+    registry
+}
+
+/// Transform node files from format major 0 to 1: split the coupled major-0
+/// `blocked-by: {refs, reason}` map into an independent `blocked-by` ref list
+/// plus a `block-reason` scalar.
+///
+/// The rule this enforces: in major 0 a node's blocker was one map tied to the
+/// `blocked` state; in major 1 the dependency list (`blocked-by`) and the
+/// state's reason (`block-reason`) are separate, status-independent fields. A
+/// node that carried the old map keeps its `refs` as the new list and moves its
+/// `reason` to `block-reason`; a node without the old map shape is left
+/// untouched.
+pub struct BlockedByV0ToV1;
+
+impl MajorTransform for BlockedByV0ToV1 {
+    fn source_major(&self) -> u32 {
+        0
+    }
+
+    fn apply(&self, staged_store: &Path) -> Result<(), MigrateError> {
+        let epics = match std::fs::read_dir(staged_store) {
+            Ok(e) => e,
+            Err(source) => {
+                return Err(MigrateError::Io {
+                    path: staged_store.to_path_buf(),
+                    source,
+                })
+            }
+        };
+        for epic in epics {
+            let epic = epic.map_err(|source| MigrateError::Io {
+                path: staged_store.to_path_buf(),
+                source,
+            })?;
+            let epic_dir = epic.path();
+            if !epic_dir.is_dir() {
+                continue;
+            }
+            // The store's own marker/working directories are not epics.
+            if epic_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with('.'))
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            let files = std::fs::read_dir(&epic_dir).map_err(|source| MigrateError::Io {
+                path: epic_dir.clone(),
+                source,
+            })?;
+            for file in files {
+                let file = file.map_err(|source| MigrateError::Io {
+                    path: epic_dir.clone(),
+                    source,
+                })?;
+                let path = file.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                    transform_blocked_by_file(&path)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Rewrite one file's frontmatter if it carries the old `blocked-by` map. A
+/// file that is not a frontmatter document, or whose `blocked-by` is absent or
+/// already a list, is left byte-for-byte unchanged.
+fn transform_blocked_by_file(path: &Path) -> Result<(), MigrateError> {
+    use serde_yaml::{Mapping, Value};
+
+    let invalid = |source: std::io::Error| MigrateError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let yaml_err =
+        |e: serde_yaml::Error| invalid(std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+
+    let text = std::fs::read_to_string(path).map_err(invalid)?;
+    let split = match crate::frontmatter::split(&text) {
+        Ok(s) => s,
+        // Not a frontmatter document: nothing to transform.
+        Err(_) => return Ok(()),
+    };
+    let mut map: Mapping = serde_yaml::from_str(&split.frontmatter).map_err(yaml_err)?;
+
+    let key = Value::from("blocked-by");
+    let old = match map.get(&key) {
+        Some(Value::Mapping(m)) => m.clone(),
+        // Absent, or already the new list form: leave it alone.
+        _ => return Ok(()),
+    };
+
+    let refs: Vec<Value> = old
+        .get(Value::from("refs"))
+        .and_then(Value::as_sequence)
+        .cloned()
+        .unwrap_or_default();
+    let reason = old
+        .get(Value::from("reason"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    // blocked-by becomes the plain ref list (dropped when empty).
+    if refs.is_empty() {
+        map.remove(&key);
+    } else {
+        map.insert(key, Value::Sequence(refs));
+    }
+    // The old reason moves to block-reason (the blocked state's reason).
+    if let Some(reason) = reason {
+        map.insert(Value::from("block-reason"), Value::from(reason));
+    }
+
+    let yaml = serde_yaml::to_string(&map).map_err(yaml_err)?;
+    let out = crate::frontmatter::join(&yaml, &split.body);
+    std::fs::write(path, out).map_err(invalid)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -940,6 +1071,54 @@ mod tests {
             meta::read(&root).unwrap().store_version(),
             Some(StoreVersion::Clean { major: 1, minor: 0 })
         );
+    }
+
+    #[test]
+    fn blocked_by_v0_to_v1_splits_map_into_list_and_reason() {
+        // A staged major-0 node carrying the coupled blocked-by map is rewritten
+        // to the decoupled major-1 shape: a plain ref list plus block-reason.
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("store");
+        std::fs::create_dir_all(stage.join("e")).unwrap();
+        std::fs::write(stage.join("e").join("epic.md"), "---\nid: e\n---\n").unwrap();
+        let old = "---\n\
+             number: 1\n\
+             name: t\n\
+             summary: s\n\
+             status: blocked\n\
+             blocked-by:\n  refs:\n  - e/2\n  - other/3\n  reason: waiting on a key\n\
+             created: 2024-01-01T00:00:00Z\n\
+             updated: 2024-01-01T00:00:00Z\n\
+             ---\nbody\n";
+        std::fs::write(stage.join("e").join("1.md"), old).unwrap();
+
+        BlockedByV0ToV1.apply(&stage).unwrap();
+
+        let out = std::fs::read_to_string(stage.join("e").join("1.md")).unwrap();
+        let node = crate::model::NodeFile::parse(&out).unwrap();
+        assert_eq!(node.frontmatter.blocked_by, vec!["e/2", "other/3"]);
+        assert_eq!(
+            node.frontmatter.block_reason.as_deref(),
+            Some("waiting on a key")
+        );
+        // The body is preserved verbatim.
+        assert_eq!(node.body, "body\n");
+    }
+
+    #[test]
+    fn blocked_by_v0_to_v1_leaves_files_without_the_old_map_untouched() {
+        // A node with no blocked-by (the common case) is byte-for-byte unchanged.
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("store");
+        std::fs::create_dir_all(stage.join("e")).unwrap();
+        std::fs::write(stage.join("e").join("epic.md"), "---\nid: e\n---\n").unwrap();
+        let node_text = "---\nnumber: 1\nname: t\nstatus: to-do\n---\nbody\n";
+        std::fs::write(stage.join("e").join("1.md"), node_text).unwrap();
+
+        BlockedByV0ToV1.apply(&stage).unwrap();
+
+        let out = std::fs::read_to_string(stage.join("e").join("1.md")).unwrap();
+        assert_eq!(out, node_text);
     }
 
     #[test]

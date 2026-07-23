@@ -65,8 +65,9 @@ loti ticket create <epic-id> [--parent <ref>] --name <s> --summary <s> [--label 
 loti ticket show   <ref> [--field <f> | --fields <f,…>] [--markdown|--json|--raw]
 loti ticket edit   <ref> [--name <s>] [--summary <s>] [--parent <ref>] [--file <path>]
 loti ticket status <ref> (--to-do | --in-progress |
-                          --blocked [--blocked-by <ref>[,<ref>]] [--reason <s>] |
+                          --blocked --reason <s> |
                           --done | --closed --reason <s> [--cascade])   # set-only
+loti ticket blocked-by (add|remove|set|clear|list) <ref> [<blocker>…]  # node-only dependency list
 loti ticket label   (add|remove|list) <ref> [<label>…]
 loti ticket comment (add|edit|delete|list) <ref> …
 loti ticket asset   (add|update|show|delete|list) <ref> …
@@ -107,7 +108,8 @@ loti skill              # prints the static SKILL.md (see The `skill` subcommand
     any ambiguous multi-field selection is a **hard error** pointing at `--json`
     (no `--sep`).
 - **`list`** has three modes: **default plain text** (git-log-like, management-
-  oriented — indented depth-first tree with a trailing `[blocked: …]` tag, closed
+  oriented — indented depth-first tree with a trailing `[blocked-by: …]` tag
+  listing a node's dependency refs (shown in any state), closed
   by a **per-status progress footer**: the total plus one entry per non-empty
   status in lifecycle order, over the nodes actually listed, tagged when a filter
   narrowed them and marked done when all are terminal — plain text only),
@@ -116,7 +118,7 @@ loti skill              # prints the static SKILL.md (see The `skill` subcommand
   `--markdown`** — `list` never *presents*.
 - **`--fields`** takes **dotted leaf paths** (e.g. `comments.author`), in all
   three modes. `list` is restricted to **summary/listable fields**
-  (`ref|number|name|status|parent|labels|blocked`; epics
+  (`ref|number|name|status|parent|labels|blocked-by`; epics
   `id|name|status|labels|nodes`+counts); requesting heavy/structured fields
   (`body`/`comments`/`assets`/`subtickets`) on `list` is a **hard error** — those
   are `show`-only.

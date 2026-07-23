@@ -613,7 +613,7 @@ fn read_bytes(path: &Path) -> Result<Vec<u8>, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Asset, BlockedBy, EpicFrontmatter, NodeFrontmatter};
+    use crate::model::{Asset, EpicFrontmatter, NodeFrontmatter};
     use crate::NodeState;
     use jiff::Timestamp;
     use serde_yaml::Mapping;
@@ -631,7 +631,8 @@ mod tests {
                 status: NodeState::ToDo,
                 labels: Vec::new(),
                 parent: None,
-                blocked_by: BlockedBy::default(),
+                blocked_by: Vec::new(),
+                block_reason: None,
                 close_reason: None,
                 assets: Vec::new(),
                 comments: Vec::new(),

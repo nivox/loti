@@ -30,7 +30,7 @@ pub mod store;
 /// `<root>/.loti/meta`, and carried at store granularity. A store major newer
 /// than the binary is refused; an older major is read-only until migrated;
 /// minor differences within a major stay compatible in both directions.
-pub const FORMAT_VERSION: (u32, u32) = (0, 1);
+pub const FORMAT_VERSION: (u32, u32) = (1, 1);
 
 /// The five node states. `Done`/`Closed` are terminal ("resolved").
 ///
