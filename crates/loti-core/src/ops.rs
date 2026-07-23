@@ -1608,7 +1608,10 @@ mod tests {
         create_epic(&s, new_epic("e")).unwrap();
         let target = Target::Epic("e".into());
         add_asset(&s, &target, "a.bin", None, &[0u8, 1, 2, 3]).unwrap();
-        assert_eq!(read_asset(&s, &target, "a.bin").unwrap(), vec![0u8, 1, 2, 3]);
+        assert_eq!(
+            read_asset(&s, &target, "a.bin").unwrap(),
+            vec![0u8, 1, 2, 3]
+        );
     }
 
     #[test]

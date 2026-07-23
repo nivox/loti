@@ -617,13 +617,18 @@ fn run_asset<R: Read, O: Write, E: Write>(
             // Data is optional here: absent source ⇒ keep current bytes. An
             // update with neither new data nor a --description has nothing to
             // persist and is rejected rather than silently touching `updated`.
-            let bytes =
-                content_input::resolve_content(a.content.file.as_deref(), stdin, stdin_is_tty, false)?;
-            let description = a.description.clone().map(|d| if d.is_empty() { None } else { Some(d) });
+            let bytes = content_input::resolve_content(
+                a.content.file.as_deref(),
+                stdin,
+                stdin_is_tty,
+                false,
+            )?;
+            let description = a
+                .description
+                .clone()
+                .map(|d| if d.is_empty() { None } else { Some(d) });
             if bytes.is_none() && description.is_none() {
-                bail!(
-                    "nothing to update: pass --description, or new data via stdin/--file"
-                );
+                bail!("nothing to update: pass --description, or new data via stdin/--file");
             }
             let entry = ops::update_asset(&store, &target, &a.name, description, bytes.as_deref())?;
             writeln!(out, "loti: updated asset {}", entry.name)?;

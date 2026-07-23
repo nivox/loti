@@ -79,12 +79,23 @@ fn file_dash_names_stdin_explicitly() {
     let s = Store::new();
     s.ok_stdin(
         &[
-            "epic", "create", "e", "--name", "n", "--summary", "s", "--file", "-",
+            "epic",
+            "create",
+            "e",
+            "--name",
+            "n",
+            "--summary",
+            "s",
+            "--file",
+            "-",
         ],
         "body via dash\n",
     );
     let raw = std::fs::read_to_string(s.path("e/epic.md")).unwrap();
-    assert!(raw.ends_with("body via dash\n"), "--file - reads stdin: {raw}");
+    assert!(
+        raw.ends_with("body via dash\n"),
+        "--file - reads stdin: {raw}"
+    );
 }
 
 #[test]
