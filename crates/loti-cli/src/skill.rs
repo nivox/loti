@@ -16,10 +16,10 @@ mod tests {
     use super::SKILL;
 
     #[test]
-    fn has_the_seven_sections_in_order() {
+    fn has_the_expected_sections_in_order() {
         // The document must carry exactly this section shape, in this order:
         // frontmatter -> what/when -> hard rule -> concepts -> workflow ->
-        // gotchas -> help-full handoff.
+        // gotchas -> cheat-sheet -> help handoff.
         let anchors = [
             "---",                                // frontmatter opens
             "name: loti",                         // frontmatter body
@@ -28,7 +28,8 @@ mod tests {
             "## Core concepts",                   // distilled concepts
             "## Lifecycle & workflow",            // lifecycle / workflow
             "## Gotchas",                         // gotchas
-            "## The whole command surface",       // --help-full handoff
+            "## Common commands",                 // routine-command cheat-sheet
+            "## The whole command surface",       // help hierarchy + --help-full
         ];
         let mut cursor = 0usize;
         for anchor in anchors {

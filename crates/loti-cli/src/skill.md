@@ -215,15 +215,54 @@ comments over silent work.
   add `ref` yourself, or use `--json`/`--ndjson`/`--raw`, which always carry
   `ref`/`number`/`parent`. Any single unknown leaf aborts the whole projection.
 
+## Common commands (cheat-sheet)
+
+These cover routine work; you should not need to consult help for them. `<ref>`
+is `<epic-id>/<number>`; bodies/text/data come from stdin or `--file` (see the
+content-input rule above).
+
+```
+loti init                                             # store in the current dir
+
+# Epics
+loti epic create <epic-id> --name "..." --summary "..."   # body ← stdin/--file
+loti epic list
+loti epic show <epic-id> [--json]
+loti epic status <epic-id> --closed --reason "..."        # or --open
+
+# Tickets & subtickets
+loti ticket create <epic-id> --name "..." --summary "..." [--parent <ref>]
+loti ticket list <epic-id> [--shallow] [--json]
+loti ticket show <ref> [--json]
+loti ticket status <ref> --in-progress                   # or --done
+loti ticket status <ref> --blocked --blocked-by <ref> --reason "..."
+loti ticket status <ref> --closed --reason "..." [--cascade]
+loti ticket edit <ref> --name "..."                      # body ← stdin/--file
+
+# Attribution & evidence (comments carry the author)
+loti ticket comment add <ref> -a <agent-name>            # text ← stdin/--file
+loti ticket comment add <ref> -u                         # the human
+loti ticket comment list <ref>
+loti ticket label add <ref> <label>
+loti ticket asset add <ref> --name <name>                # data ← stdin/--file
+loti ticket asset show <ref> <name>                      # bytes → stdout
+```
+
+Epic and ticket share the same collection verbs (`comment`, `label`, `asset`)
+with identical flags — swap the noun and the reference.
+
 ## The whole command surface
 
-For the complete, annotated command tree in one pass — every noun, verb, and
-collection, with each flag's input rule and the actor requirement on comment
-operations — run:
+When you need a command not on the cheat-sheet, or its full flag list, use the
+built-in help **hierarchy** — it is scoped and cheap:
 
-```
-loti --help-full
-```
+- `loti <noun> --help` — the verbs under a noun (e.g. `loti ticket --help`).
+- `loti <noun> <verb> --help` — the exact flags for one command, with each
+  flag's input rule (e.g. `loti ticket status --help`). **Reach for this** to
+  check a single command; it is small and targeted.
 
-That one page is the authoritative reference for exact flags and forms. Start
-here for concepts and workflow, then go there for the surface.
+For a one-time tour of the entire surface — every noun, verb, and collection in
+one annotated pass — run `loti --help-full`. It is the authoritative reference,
+but it is **large**: read it once to orient, then use the scoped
+`loti <noun> <verb> --help` for day-to-day lookups rather than re-fetching the
+whole page.
