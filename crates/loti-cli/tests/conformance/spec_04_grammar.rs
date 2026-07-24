@@ -193,6 +193,55 @@ fn non_comment_operations_are_actor_agnostic() {
 }
 
 #[test]
+fn claim_take_requires_the_as_flag() {
+    // The claimer identifier is a one-liner supplied inline via --as; omitting
+    // it is a grammar error (never read from stdin).
+    let s = Store::new();
+    s.epic("e");
+    let t = s.ticket("e", "t");
+    let err = s.fail(&["ticket", "claim", "take", &t]);
+    assert!(
+        err.contains("--as"),
+        "take without --as is a grammar error naming the flag, got: {err}"
+    );
+}
+
+#[test]
+fn claim_confirmations_echo_the_target_name_and_reassignment() {
+    // A mutation confirmation names the target (ref + name); a reassignment also
+    // names the prior holder so overwriting a claim is never silent.
+    let s = Store::new();
+    s.epic("checkout");
+    let t = s.ticket("checkout", "Add step-up prompt");
+
+    let claimed = s.ok(&["ticket", "claim", "take", &t, "--as", "alice"]);
+    assert!(
+        claimed.contains("(Add step-up prompt)") && claimed.contains("alice"),
+        "claim take echoes the name and holder: {claimed}"
+    );
+
+    let reclaimed = s.ok(&["ticket", "claim", "take", &t, "--as", "bob"]);
+    assert!(
+        reclaimed.contains("bob") && reclaimed.contains("alice"),
+        "reassignment names both the new and prior holder: {reclaimed}"
+    );
+
+    // Re-taking with the same holder refreshes the timestamp rather than
+    // reporting a reassignment.
+    let refreshed = s.ok(&["ticket", "claim", "take", &t, "--as", "bob"]);
+    assert!(
+        refreshed.to_lowercase().contains("refresh") && refreshed.contains("bob"),
+        "re-taking by the same holder is a refresh: {refreshed}"
+    );
+
+    let released = s.ok(&["ticket", "claim", "release", &t]);
+    assert!(
+        released.contains("(Add step-up prompt)") && released.contains("bob"),
+        "release echoes the name and the prior holder: {released}"
+    );
+}
+
+#[test]
 fn status_and_edit_confirmations_echo_the_target_name() {
     // Refs are numeric, so a wrong-but-valid number would apply silently to the
     // wrong node. Mutation confirmations therefore echo the resolved name, so a

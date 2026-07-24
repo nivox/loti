@@ -208,6 +208,8 @@ pub enum TicketCommand {
     Status(TicketStatusArgs),
     /// Manage the blocked-by dependency list (add/remove/set/clear/list).
     BlockedBy(BlockedByArgs),
+    /// Manage the single-holder claim (take/release).
+    Claim(ClaimArgs),
     /// Manage labels (add/remove/list).
     Label(LabelArgs),
     /// Manage comments (add/edit/delete/list). Actor required on mutations.
@@ -252,6 +254,37 @@ pub struct BlockedByMutateArgs {
     /// Blockers: each `<n>` (same epic as REF) or `<epic-id>/<n>` (inline).
     #[arg(value_name = "BLOCKER", required = true)]
     pub blockers: Vec<String>,
+}
+
+/// A node's claim is a single freeform holder identifier plus a
+/// `loti`-maintained timestamp. It is node-only and actor-agnostic — the
+/// identifier is not the `-u`/`-a` attribution actor — and independent of
+/// status; a node has at most one holder, so re-taking reassigns. Read it back
+/// via `ticket show`.
+#[derive(Debug, Args)]
+#[command(disable_help_subcommand = true)]
+pub struct ClaimArgs {
+    #[command(subcommand)]
+    pub command: ClaimCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ClaimCommand {
+    /// Take or reassign the claim; overwrites any current holder and refreshes
+    /// the timestamp.
+    Take(ClaimTakeArgs),
+    /// Release the claim, dropping the holder and timestamp together.
+    Release(RefArg),
+}
+
+#[derive(Debug, Args)]
+pub struct ClaimTakeArgs {
+    /// Node reference `<epic-id>/<n>`.
+    #[arg(value_name = "REF")]
+    pub reference: String,
+    /// Claimer identifier — a freeform email or name (inline; never empty).
+    #[arg(long = "as", value_name = "IDENTIFIER")]
+    pub claimer: String,
 }
 
 #[derive(Debug, Args)]

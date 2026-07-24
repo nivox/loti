@@ -45,6 +45,23 @@ pub struct Asset {
     pub description: Option<String>,
 }
 
+/// A single-holder claim on a node: who holds it and when it was taken.
+///
+/// The identifier is **freeform** (an email or a name) and is deliberately
+/// decoupled from the attribution actor — a claim is not `-u`/`-a`. A node has
+/// **at most one** claim, so reassigning is overwriting. `at` is maintained by
+/// `loti` and is never supplied by a caller, and the two fields always travel
+/// together: an unclaimed node carries no `claim` key at all, never a holder
+/// without a timestamp or the reverse.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Claim {
+    /// Freeform claimer identifier; never empty.
+    pub by: String,
+    /// When the claim was taken or last reassigned, ISO-8601 UTC. Maintained by
+    /// `loti`, never supplied by the caller.
+    pub at: Timestamp,
+}
+
 /// A comment appended to a node or epic. Comments are the sole attribution
 /// channel and are never hard-deleted: deletion is a flag, which keeps ids
 /// stable and monotonic.
@@ -111,6 +128,10 @@ pub struct NodeFrontmatter {
         skip_serializing_if = "Option::is_none"
     )]
     pub close_reason: Option<String>,
+    /// Single-holder claim, if any. Absent means unclaimed. Actor-agnostic and
+    /// independent of `status`; managed via `ticket claim take/release`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<Claim>,
     /// Assets index; the bytes live in the companion directory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assets: Vec<Asset>,
@@ -404,6 +425,37 @@ mod tests {
     }
 
     #[test]
+    fn claim_round_trips_and_is_absent_when_unclaimed() {
+        // A claim is a `by`/`at` pair that survives parse/emit; an unclaimed
+        // node emits no `claim` key at all (the two fields never split).
+        let text = "---\n\
+             number: 3\n\
+             name: n\n\
+             summary: s\n\
+             status: to-do\n\
+             claim:\n  by: alice@example.com\n  at: 2024-01-02T03:04:05Z\n\
+             created: 2024-01-01T00:00:00Z\n\
+             updated: 2024-01-01T00:00:00Z\n\
+             ---\n";
+        let node = NodeFile::parse(text).unwrap();
+        let claim = node.frontmatter.claim.clone().unwrap();
+        assert_eq!(claim.by, "alice@example.com");
+        assert_eq!(claim.at, ts("2024-01-02T03:04:05Z"));
+        let out = node.to_text().unwrap();
+        assert!(out.contains("claim:"));
+        assert!(out.contains("by: alice@example.com"));
+
+        let unclaimed = minimal_node_frontmatter();
+        let out = NodeFile {
+            frontmatter: unclaimed,
+            body: String::new(),
+        }
+        .to_text()
+        .unwrap();
+        assert!(!out.contains("claim:"));
+    }
+
+    #[test]
     fn comment_text_serialises_as_a_literal_block() {
         let mut fm = minimal_node_frontmatter();
         fm.comments.push(Comment {
@@ -544,6 +596,7 @@ mod tests {
             blocked_by: Vec::new(),
             block_reason: None,
             close_reason: None,
+            claim: None,
             assets: Vec::new(),
             comments: Vec::new(),
             created: ts("2024-01-01T00:00:00Z"),

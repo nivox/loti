@@ -22,7 +22,7 @@ use crate::domain::{
 };
 use crate::lock::{self, Force};
 use crate::model::{
-    insert_asset, next_comment_id, remove_asset, Asset, Comment, EpicFile, EpicFrontmatter,
+    insert_asset, next_comment_id, remove_asset, Asset, Claim, Comment, EpicFile, EpicFrontmatter,
     NodeFile, NodeFrontmatter,
 };
 use crate::store::{Store, StoreError};
@@ -68,6 +68,9 @@ pub enum OpError {
     /// A node cannot list itself as a `blocked-by` dependency.
     #[error("a node cannot be blocked by itself ({0})")]
     BlockedBySelf(NodeRef),
+    /// Taking a claim needs a non-empty identifier to record who holds it.
+    #[error("a claim needs a non-empty identifier: pass --as <identifier>")]
+    EmptyClaimIdentifier,
     /// Reparenting would make a node its own ancestor (a cycle).
     #[error("reparenting {node} under {parent} would form a cycle")]
     ReparentCycle {
@@ -231,6 +234,7 @@ pub fn create_node(store: &Store, new: NewNode) -> Result<NodeFile, OpError> {
             blocked_by: Vec::new(),
             block_reason: None,
             close_reason: None,
+            claim: None,
             assets: Vec::new(),
             comments: Vec::new(),
             created: ts,
@@ -746,6 +750,58 @@ fn with_blocked_by(
     node.frontmatter.updated = now();
     store.write_node(&node_ref.epic_id, node_ref.number, &node)?;
     Ok(new)
+}
+
+// ---------------------------------------------------------------------------
+// claim (node-only single-holder)
+// ---------------------------------------------------------------------------
+
+/// Take (or reassign) a node's single-holder claim.
+///
+/// The identifier is freeform and must be non-blank (a blank one is refused);
+/// `at` is stamped now. A node has at most one claim, so this overwrites any
+/// existing holder — reassigning is just re-taking. Returns the updated node
+/// and the prior holder (if the node was already claimed) so the caller can
+/// report a reassignment. Bumps `updated`.
+pub fn take_claim(
+    store: &Store,
+    node_ref: &NodeRef,
+    identifier: &str,
+) -> Result<(NodeFile, Option<String>), OpError> {
+    let identifier = identifier.trim();
+    if identifier.is_empty() {
+        return Err(OpError::EmptyClaimIdentifier);
+    }
+    let mut node = read_node(store, node_ref)?;
+    let prior = node.frontmatter.claim.as_ref().map(|c| c.by.clone());
+    // The claim timestamp and the node's `updated` stamp share one instant, so
+    // "when it was claimed" never drifts from "when the file last changed".
+    let ts = now();
+    // by and at are always set together, so a claim never carries a holder
+    // without a timestamp.
+    node.frontmatter.claim = Some(Claim {
+        by: identifier.to_string(),
+        at: ts,
+    });
+    node.frontmatter.updated = ts;
+    store.write_node(&node_ref.epic_id, node_ref.number, &node)?;
+    Ok((node, prior))
+}
+
+/// Release a node's claim, dropping the identifier and timestamp together.
+///
+/// Releasing an unclaimed node is a no-op on the claim (there is nothing to
+/// drop). Returns the updated node and the prior holder (if any). Bumps
+/// `updated`.
+pub fn release_claim(
+    store: &Store,
+    node_ref: &NodeRef,
+) -> Result<(NodeFile, Option<String>), OpError> {
+    let mut node = read_node(store, node_ref)?;
+    let prior = node.frontmatter.claim.take().map(|c| c.by);
+    node.frontmatter.updated = now();
+    store.write_node(&node_ref.epic_id, node_ref.number, &node)?;
+    Ok((node, prior))
 }
 
 // ---------------------------------------------------------------------------
@@ -1422,6 +1478,70 @@ mod tests {
         assert_eq!(after_set, vec![br.to_string()]);
         assert!(clear_blocked_by(&s, &ar).unwrap().is_empty());
         assert!(list_blocked_by(&s, &ar).unwrap().is_empty());
+    }
+
+    // -- claim (single-holder, node-only) ----------------------------------
+
+    #[test]
+    fn claim_take_reassign_and_release() {
+        let (_d, s) = seeded();
+        create_epic(&s, new_epic("e")).unwrap();
+        let n = create_node(&s, new_node("e", None)).unwrap();
+        let r = NodeRef::new("e", n.frontmatter.number);
+
+        // First take: no prior holder; by/at both set.
+        let (node, prior) = take_claim(&s, &r, "alice@example.com").unwrap();
+        assert_eq!(prior, None);
+        let claim = node.frontmatter.claim.clone().unwrap();
+        assert_eq!(claim.by, "alice@example.com");
+        let first_at = claim.at;
+
+        // Reassign: single-holder, so it overwrites and reports the prior.
+        let (node, prior) = take_claim(&s, &r, "bob@example.com").unwrap();
+        assert_eq!(prior.as_deref(), Some("alice@example.com"));
+        let claim = node.frontmatter.claim.clone().unwrap();
+        assert_eq!(claim.by, "bob@example.com");
+        // The timestamp is refreshed on reassignment (never behind the first).
+        assert!(claim.at >= first_at);
+
+        // Release drops holder and timestamp together and reports the prior.
+        let (node, prior) = release_claim(&s, &r).unwrap();
+        assert_eq!(prior.as_deref(), Some("bob@example.com"));
+        assert!(node.frontmatter.claim.is_none());
+
+        // Releasing an already-unclaimed node is a no-op with no prior holder.
+        let (node, prior) = release_claim(&s, &r).unwrap();
+        assert_eq!(prior, None);
+        assert!(node.frontmatter.claim.is_none());
+    }
+
+    #[test]
+    fn claim_take_refuses_a_blank_identifier() {
+        let (_d, s) = seeded();
+        create_epic(&s, new_epic("e")).unwrap();
+        let n = create_node(&s, new_node("e", None)).unwrap();
+        let r = NodeRef::new("e", n.frontmatter.number);
+        assert!(matches!(
+            take_claim(&s, &r, "   "),
+            Err(OpError::EmptyClaimIdentifier)
+        ));
+        // A surrounding-whitespace identifier is trimmed before storage.
+        let (node, _) = take_claim(&s, &r, "  carol  ").unwrap();
+        assert_eq!(node.frontmatter.claim.unwrap().by, "carol");
+    }
+
+    #[test]
+    fn claim_is_independent_of_status() {
+        // Claiming never changes state, and a state change never touches the
+        // claim — it is a status-independent annotation.
+        let (_d, s) = seeded();
+        create_epic(&s, new_epic("e")).unwrap();
+        let n = create_node(&s, new_node("e", None)).unwrap();
+        let r = NodeRef::new("e", n.frontmatter.number);
+        take_claim(&s, &r, "alice").unwrap();
+        let done = set_node_status(&s, &r, NodeStatusChange::Done).unwrap();
+        assert_eq!(done.node.frontmatter.status, NodeState::Done);
+        assert_eq!(done.node.frontmatter.claim.unwrap().by, "alice");
     }
 
     #[test]

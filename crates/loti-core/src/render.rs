@@ -19,7 +19,7 @@ use std::fmt::Write as _;
 use serde_json::{json, Map, Value};
 
 use crate::domain::{epic_status, NodeStatus};
-use crate::model::{Asset, Comment, EpicFile, NodeFile};
+use crate::model::{Asset, Claim, Comment, EpicFile, NodeFile};
 
 /// Why a read/projection could not be rendered as asked.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -84,6 +84,7 @@ pub fn node_to_json(epic_id: &str, node: &NodeFile) -> Value {
         "close-reason".into(),
         opt_string_json(fm.close_reason.as_deref()),
     );
+    map.insert("claim".into(), claim_json(fm.claim.as_ref()));
     map.insert("assets".into(), assets_json(&fm.assets));
     map.insert("comments".into(), comments_json(&fm.comments));
     map.insert("created".into(), json!(fm.created.to_string()));
@@ -123,6 +124,16 @@ pub fn epic_to_json(epic: &EpicFile, node_statuses: &[NodeStatus]) -> Value {
     map.insert("body".into(), json!(epic.body));
     merge_extra(&mut map, &fm.extra);
     Value::Object(map)
+}
+
+/// A claim as JSON: `{ by, at }` when held, or null when unclaimed. `by` and
+/// `at` always appear together — the machine form never shows a holder without
+/// a timestamp.
+fn claim_json(claim: Option<&Claim>) -> Value {
+    match claim {
+        Some(c) => json!({ "by": c.by, "at": c.at.to_string() }),
+        None => Value::Null,
+    }
 }
 
 fn assets_json(atts: &[Asset]) -> Value {
@@ -509,6 +520,12 @@ pub fn show_markdown(
                 let _ = writeln!(s, "| block-reason | {} |", meta_cell(br));
             }
         }
+        // The single-holder claim is surfaced only when the node is claimed.
+        if let Some(cl) = value.get("claim") {
+            if !cl.is_null() {
+                let _ = writeln!(s, "| claim | {} |", claim_cell(cl));
+            }
+        }
     }
     if let Some(cr) = value.get("close-reason") {
         if !cr.is_null() {
@@ -592,6 +609,13 @@ fn meta_cell(v: &Value) -> String {
             .join(", "),
         Value::Object(_) => "…".to_string(),
     }
+}
+
+/// Render a claim cell: the holder identifier and when the claim was taken.
+fn claim_cell(c: &Value) -> String {
+    let by = c.get("by").and_then(Value::as_str).unwrap_or("");
+    let at = c.get("at").and_then(Value::as_str).unwrap_or("");
+    format!("{by} (since {at})")
 }
 
 /// Render a blocked-by cell: the dependency refs joined by commas.
@@ -988,7 +1012,7 @@ pub const LISTABLE_NODE_FIELDS: &[&str] = &[
 pub const LISTABLE_EPIC_FIELDS: &[&str] = &["id", "name", "status", "labels", "nodes"];
 
 /// The heavy/structured fields that are `show`-only and rejected on `list`.
-pub const HEAVY_FIELDS: &[&str] = &["body", "comments", "assets", "subtickets"];
+pub const HEAVY_FIELDS: &[&str] = &["body", "comments", "assets", "subtickets", "claim"];
 
 /// Validate that every requested `list` field is a listable summary field. A
 /// heavy/structured field, or any unknown field, is rejected so `list` never

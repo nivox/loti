@@ -265,6 +265,68 @@ fn epic_open_when_any_node_is_non_terminal() {
     );
 }
 
+// -- claim (single-holder, node-only) --------------------------------------
+
+#[test]
+fn claim_take_reassign_and_release_are_single_holder() {
+    let s = Store::new();
+    s.epic("e");
+    let t = s.ticket("e", "t");
+
+    // Taking a claim records the freeform holder and a loti-maintained
+    // timestamp; both appear together.
+    s.ok(&["ticket", "claim", "take", &t, "--as", "alice@example.com"]);
+    let json = s.ok(&["ticket", "show", &t, "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["claim"]["by"], "alice@example.com");
+    assert!(
+        v["claim"]["at"].as_str().is_some(),
+        "claim carries a timestamp: {json}"
+    );
+
+    // Re-taking reassigns (a node has at most one holder): the holder is
+    // overwritten wholesale.
+    s.ok(&["ticket", "claim", "take", &t, "--as", "bob@example.com"]);
+    let v: serde_json::Value =
+        serde_json::from_str(&s.ok(&["ticket", "show", &t, "--json"])).unwrap();
+    assert_eq!(v["claim"]["by"], "bob@example.com");
+
+    // Releasing drops the holder and timestamp together (claim becomes null).
+    s.ok(&["ticket", "claim", "release", &t]);
+    let v: serde_json::Value =
+        serde_json::from_str(&s.ok(&["ticket", "show", &t, "--json"])).unwrap();
+    assert!(v["claim"].is_null(), "released claim is null: {v}");
+}
+
+#[test]
+fn claim_take_refuses_a_blank_identifier() {
+    let s = Store::new();
+    s.epic("e");
+    let t = s.ticket("e", "t");
+    let err = s.fail(&["ticket", "claim", "take", &t, "--as", "   "]);
+    assert!(
+        err.to_lowercase().contains("identifier"),
+        "a blank claim identifier is refused, got: {err}"
+    );
+}
+
+#[test]
+fn claim_is_independent_of_status() {
+    // Claiming never changes state, and a state change never touches the claim.
+    let s = Store::new();
+    s.epic("e");
+    let t = s.ticket("e", "t");
+    s.ok(&["ticket", "claim", "take", &t, "--as", "alice"]);
+    s.ok(&["ticket", "status", &t, "--done"]);
+    let v: serde_json::Value =
+        serde_json::from_str(&s.ok(&["ticket", "show", &t, "--json"])).unwrap();
+    assert_eq!(v["status"], "done", "claiming did not change status");
+    assert_eq!(
+        v["claim"]["by"], "alice",
+        "resolving the node left the claim intact: {v}"
+    );
+}
+
 #[test]
 fn epic_closed_flag_takes_precedence_over_computed_state() {
     let s = Store::new();

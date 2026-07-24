@@ -199,6 +199,35 @@ fn list_raw_is_tab_separated_and_uncoloured() {
 }
 
 #[test]
+fn show_surfaces_a_claim_in_markdown_and_raw_leaves() {
+    let s = Store::new();
+    s.epic("e");
+    let t = s.ticket("e", "t");
+    s.ok(&["ticket", "claim", "take", &t, "--as", "alice@example.com"]);
+
+    // The default markdown view carries a claim row naming the holder.
+    let md = s.ok(&["ticket", "show", &t]);
+    assert!(
+        md.contains("| claim |") && md.contains("alice@example.com"),
+        "markdown show surfaces the claim: {md}"
+    );
+
+    // The claim's leaves are projectable via dotted paths.
+    let by = s.ok(&["ticket", "show", &t, "--raw", "--field", "claim.by"]);
+    assert_eq!(by.trim(), "alice@example.com", "claim.by leaf: {by}");
+    let at = s.ok(&["ticket", "show", &t, "--raw", "--field", "claim.at"]);
+    assert!(!at.trim().is_empty(), "claim.at leaf is present: {at}");
+
+    // An unclaimed node shows no claim row.
+    s.ok(&["ticket", "claim", "release", &t]);
+    let md = s.ok(&["ticket", "show", &t]);
+    assert!(
+        !md.contains("| claim |"),
+        "an unclaimed node has no claim row: {md}"
+    );
+}
+
+#[test]
 fn list_rejects_heavy_fields() {
     let s = Store::new();
     s.epic("e");
@@ -208,6 +237,12 @@ fn list_rejects_heavy_fields() {
     assert!(
         err.to_lowercase().contains("body") && err.contains("show"),
         "heavy field on list must error pointing at show, got: {err}"
+    );
+    // `claim` is structured/show-only too: rejected on list pointing at show.
+    let err = s.fail(&["ticket", "list", "e", "--field", "claim"]);
+    assert!(
+        err.to_lowercase().contains("claim") && err.contains("show"),
+        "claim on list must error pointing at show, got: {err}"
     );
 }
 

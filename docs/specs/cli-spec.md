@@ -17,9 +17,10 @@ document assumes that model.
   `migrate-store`. Collections nest a third level (`ticket comment add`).
 - **Operations grouped by nature:** `edit` = plain scalar fields
   (`name`/`summary`/`body`/`parent`); `status` = the state machine (**set-only**;
-  read via `show`); `label`/`comment`/`asset` = collections
-  (`add`/`remove`|`delete`/`list`, plus asset `update`/`show`); `show` = the
-  **sole projectable reader** of nodes/epics.
+  read via `show`); `claim` = the node-only single-holder claim
+  (`take`/`release`; **set-only**, read via `show`); `label`/`comment`/`asset` =
+  collections (`add`/`remove`|`delete`/`list`, plus asset `update`/`show`);
+  `show` = the **sole projectable reader** of nodes/epics.
 - **Create never overwrites; modify targets what exists.** Every creator refuses
   a duplicate (`epic create` an existing id; `ticket create`/`comment add` cannot
   collide — their keys are machine-allocated, never-reused numbers/ids); every
@@ -68,6 +69,7 @@ loti ticket status <ref> (--to-do | --in-progress |
                           --blocked --reason <s> |
                           --done | --closed --reason <s> [--cascade])   # set-only
 loti ticket blocked-by (add|remove|set|clear|list) <ref> [<blocker>…]  # node-only dependency list
+loti ticket claim (take <ref> --as <s> | release <ref>)               # node-only single-holder claim
 loti ticket label   (add|remove|list) <ref> [<label>…]
 loti ticket comment (add|edit|delete|list) <ref> …
 loti ticket asset   (add|update|show|delete|list) <ref> …

@@ -308,6 +308,7 @@ mod tests {
                 blocked_by: Vec::new(),
                 block_reason: None,
                 close_reason: None,
+                claim: None,
                 assets: Vec::new(),
                 comments: Vec::new(),
                 created: ts(),

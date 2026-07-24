@@ -439,6 +439,7 @@ fn run_ticket<R: Read, O: Write, E: Write>(
             }
         }
         TicketCommand::BlockedBy(a) => run_blocked_by(cli, &a.command, out, err)?,
+        TicketCommand::Claim(a) => run_claim(cli, &a.command, out, err)?,
         TicketCommand::Label(a) => run_label(cli, &a.command, Kind::Ticket, out, err)?,
         TicketCommand::Comment(a) => {
             run_comment(cli, &a.command, Kind::Ticket, stdin, stdin_is_tty, out, err)?
@@ -571,6 +572,55 @@ fn run_blocked_by<O: Write, E: Write>(
             let list = ops::list_blocked_by(&store, &node_ref)?;
             for b in list {
                 writeln!(out, "{b}")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Drive `ticket claim take/release`. The claim is single-holder and
+/// node-only; `take` overwrites any current holder (reassignment) and the
+/// confirmation names the prior holder so a reassignment is never silent, per
+/// the rule that a mutation confirmation names its target.
+fn run_claim<O: Write, E: Write>(
+    cli: &Cli,
+    cmd: &crate::cli::ClaimCommand,
+    out: &mut O,
+    err: &mut E,
+) -> Result<()> {
+    use crate::cli::ClaimCommand;
+    match cmd {
+        ClaimCommand::Take(a) => {
+            let store = open_store(cli, err)?;
+            let node_ref = NodeRef::parse(&a.reference)?;
+            let (node, prior) = ops::take_claim(&store, &node_ref, &a.claimer)?;
+            let name = &node.frontmatter.name;
+            let by = node
+                .frontmatter
+                .claim
+                .as_ref()
+                .map(|c| c.by.as_str())
+                .unwrap_or_default();
+            match prior {
+                None => writeln!(out, "loti: claimed ticket {node_ref} ({name}) as {by}")?,
+                Some(p) if p == by => writeln!(
+                    out,
+                    "loti: refreshed claim on ticket {node_ref} ({name}) for {by}"
+                )?,
+                Some(p) => writeln!(
+                    out,
+                    "loti: reclaimed ticket {node_ref} ({name}) as {by} (was {p})"
+                )?,
+            }
+        }
+        ClaimCommand::Release(a) => {
+            let store = open_store(cli, err)?;
+            let node_ref = NodeRef::parse(&a.reference)?;
+            let (node, prior) = ops::release_claim(&store, &node_ref)?;
+            let name = &node.frontmatter.name;
+            match prior {
+                Some(p) => writeln!(out, "loti: released ticket {node_ref} ({name}) (was {p})")?,
+                None => writeln!(out, "loti: ticket {node_ref} ({name}) was not claimed")?,
             }
         }
     }

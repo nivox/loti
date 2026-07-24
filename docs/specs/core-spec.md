@@ -51,6 +51,17 @@ skill/help system — is specified in [`cli-spec.md`](cli-spec.md).
     sets/clears `blocked` automatically. Leaving `blocked` clears the
     block-reason; likewise leaving `closed` clears the close-reason (no
     non-blocked/non-closed node carries the respective reason).
+- **Claim (single-holder).** A node MAY carry a **claim**: a single **freeform
+  identifier** (an email or a name) recording who holds it, plus a timestamp
+  `loti` maintains autonomously. It is **node-only** and **actor-agnostic** —
+  the identifier is deliberately decoupled from the attribution actor (it is not
+  `-u`/`-a`) — and **independent of status** (claiming never changes state and a
+  state change never touches the claim). A node has **at most one** holder, so
+  re-claiming **overwrites** the identifier and **refreshes** the timestamp
+  (reassignment is just re-claiming). Releasing a claim removes the identifier
+  and timestamp **together**: the two never split, and an unclaimed node carries
+  neither. Taking a claim requires a **non-empty** identifier (a blank one is
+  refused).
 - **Blocked-by (dependency list).** A node MAY carry **blocked-by**: an ordered,
   deduplicated list of canonical `<epic-id>/<n>` references to the tickets that
   block it. It is an advisory dependency annotation **independent of status** —
@@ -62,7 +73,8 @@ skill/help system — is specified in [`cli-spec.md`](cli-spec.md).
   reversible) and takes precedence. `completed` (computed) = ≥1 node and all nodes
   terminal. `open` (computed) = any other case.
 - **Standard fields.** name, summary, body, assets, labels, status,
-  comments; epics also have an id. Labels carry no intrinsic semantics.
+  comments; nodes also carry an optional single-holder claim; epics also have an
+  id. Labels carry no intrinsic semantics.
 - **Attribution.** The **actor** is either *the human* (exactly one, unnamed) or a
   *named agent*. Attribution is required **only for comment operations**; every
   other operation is actor-agnostic. **Comments are the sole attribution
@@ -86,7 +98,10 @@ skill/help system — is specified in [`cli-spec.md`](cli-spec.md).
   as `|` literal block scalars). The entire region **below** the frontmatter is
   the free-form **body**, with **no managed sections**. Timestamps are ISO-8601
   UTC. A `blocked` node carries a `block-reason`; a terminally-closed node/epic
-  carries a `close-reason`.
+  carries a `close-reason`. A claimed node carries a `claim` mapping (`by` for
+  the freeform holder, `at` for the `loti`-maintained ISO-8601 UTC timestamp);
+  the two keys always appear together, and an unclaimed node carries no `claim`
+  key at all.
 - **Numbering.** A monotonic **`next-number`** counter in `epic.md`. Allocation
   MUST use **probe-forward atomic exclusive-create** (`O_CREAT|O_EXCL`) of the
   complete node file, followed by a **best-effort** counter bump. Correctness

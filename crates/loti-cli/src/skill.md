@@ -85,6 +85,18 @@ same epic) or `<epic-id>/<n>` (any epic); `loti` stores the canonical
 done ticket may block), and a ticket cannot block itself. It exists on tickets
 only, not epics.
 
+### Claim (single-holder)
+
+A ticket may carry a **claim**: who is working it. Manage it with `ticket claim
+take <ref> --as <identifier>` and `ticket claim release <ref>`; read it back with
+`ticket show`. The **identifier is freeform** (an email or a name) and is **not**
+the attribution actor — it has nothing to do with `-u`/`-a`. A ticket has **at
+most one** holder, so `take` on an already-claimed ticket **reassigns** it,
+overwriting the holder. `loti` maintains the claim **timestamp** for you (set
+and refreshed on every `take`); you never pass it. `release` drops the holder
+and timestamp **together**. It is **independent of status** (claiming never
+changes state) and exists on tickets only, not epics.
+
 **Terminal** means `done` or `closed` — both count as "resolved". Two rules
 follow:
 
@@ -122,7 +134,8 @@ default and never truly removed, so its id is stable and never reused.
 
 Epics and nodes both carry: **name** (one-liner), **summary** (scope), **body**
 (free-form markdown), **labels** (free-form, no built-in meaning — use them to
-orchestrate), **status**, **comments**, and **assets** (attached files as proof
+orchestrate), **status**, **comments** (nodes also carry an optional
+single-holder **claim**), and **assets** (attached files as proof
 of work). Epics also have their **id**.
 
 **Content input rule.** Free-form or binary payloads — an epic or ticket
@@ -196,6 +209,13 @@ comments over silent work.
   does not touch it. Each blocker **must exist** (state irrelevant) and cannot
   be the ticket itself; blockers are given as `<n>` or `<epic-id>/<n>` and
   stored canonically.
+- **A claim is one freeform holder, not an actor.** `ticket claim take <ref>
+  --as <id>` records who is working a ticket; the identifier is arbitrary text
+  (an email or a name), unrelated to `-u`/`-a`. A ticket has at most one holder,
+  so `take` on a claimed ticket reassigns it (overwriting the holder); the
+  timestamp is maintained for you and refreshed on every `take`. `release`
+  clears holder and timestamp together. Read it with `ticket show`; it is
+  status-independent and tickets-only.
 - **An asset's name defaults to the file's basename with `--file`.** From stdin
   there is nothing to infer, so `--name` is required there.
 - **Never read an asset off disk — use `asset show`.** Its bytes come back on
@@ -256,6 +276,8 @@ loti ticket status <ref> --in-progress                   # or --done
 loti ticket status <ref> --blocked --reason "..."
 loti ticket status <ref> --closed --reason "..." [--cascade]
 loti ticket blocked-by add <ref> <blocker>               # dependency; <n> or <epic-id>/<n>
+loti ticket claim take <ref> --as <identifier>           # claim/reassign; timestamp is automatic
+loti ticket claim release <ref>                          # drop holder + timestamp
 loti ticket edit <ref> --name "..."                      # body ← stdin/--file
 
 # Attribution & evidence (comments carry the author)

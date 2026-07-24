@@ -16,7 +16,7 @@
 //! migration — the 0->1 split of the coupled `blocked-by` map into an
 //! independent dependency list plus `block-reason`. The minor-behind path
 //! (compatible reads+writes, and a meta-only migrate) is exercised against a
-//! `1.0` store, one minor below this binary's `1.1`.
+//! `1.0` store, one minor below this binary's `1.2`.
 
 use super::harness::Store;
 
@@ -49,7 +49,7 @@ fn a_store_newer_major_refuses_mutations() {
         "a too-new store must refuse mutations, got: {err}"
     );
     // And it truly did not write: restoring a current meta shows no comment.
-    s.set_meta(&meta("1.1"));
+    s.set_meta(&meta("1.2"));
     let listed = s.ok(&["epic", "comment", "list", "e"]);
     assert!(
         listed.trim().is_empty(),
@@ -61,7 +61,7 @@ fn a_store_newer_major_refuses_mutations() {
 fn a_minor_difference_within_a_major_is_compatible() {
     let s = Store::new();
     s.epic("e");
-    // A store one minor behind (1.0 vs binary 1.1) reads and writes normally.
+    // A store one minor behind (1.0 vs binary 1.2) reads and writes normally.
     s.set_meta(&meta("1.0"));
     let read = s.ok(&["epic", "show", "e", "--raw", "--field", "id"]);
     assert_eq!(read.trim(), "e", "minor-behind reads are fine");
@@ -109,7 +109,7 @@ fn migrate_store_minor_behind_is_a_meta_only_bump() {
     // The recorded version is now the binary's, and the store bytes are intact.
     let recorded = std::fs::read_to_string(s.path(".loti/meta")).unwrap();
     assert!(
-        recorded.contains("1.1"),
+        recorded.contains("1.2"),
         "version bumped to current: {recorded}"
     );
     let after = std::fs::read(s.path("e/1.md")).unwrap();
