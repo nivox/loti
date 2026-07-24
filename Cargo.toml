@@ -10,7 +10,7 @@ members = [
 # flake/`--version` builds off main sort before (and are visibly distinct from)
 # the final release. A release commit strips the suffix; the release workflow
 # refuses to build a tag whose version still carries `-dev`.
-version = "0.3.1"
+version = "0.3.2-dev"
 edition = "2021"
 rust-version = "1.96"
 license = "MIT"
