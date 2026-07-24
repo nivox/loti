@@ -297,7 +297,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "loti-cli"
-version = "0.3.1-dev"
+version = "0.3.1"
 dependencies = [
  "anstream 0.6.21",
  "anstyle",
@@ -311,7 +311,7 @@ dependencies = [
 
 [[package]]
 name = "loti-core"
-version = "0.3.1-dev"
+version = "0.3.1"
 dependencies = [
  "anstyle",
  "jiff",
