@@ -107,7 +107,7 @@ fn migrate_store_minor_behind_is_a_meta_only_bump() {
     );
 
     // The recorded version is now the binary's, and the store bytes are intact.
-    let recorded = std::fs::read_to_string(s.path(".loti/meta")).unwrap();
+    let recorded = std::fs::read_to_string(s.store_path("meta")).unwrap();
     assert!(
         recorded.contains("1.2"),
         "version bumped to current: {recorded}"

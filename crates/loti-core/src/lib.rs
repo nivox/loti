@@ -27,9 +27,11 @@ pub mod render;
 pub mod store;
 
 /// Store `format-version` as `(major, minor)`. Written by `loti init` into
-/// `<root>/.loti/meta`, and carried at store granularity. A store major newer
-/// than the binary is refused; an older major is read-only until migrated;
-/// minor differences within a major stay compatible in both directions.
+/// `<container>/meta`, and carried at store granularity. The container is the
+/// only directory loti owns — it holds `meta` and every epic dir — and is
+/// `.loti` by default. A store major newer than the binary is refused; an older
+/// major is read-only until migrated; minor differences within a major stay
+/// compatible in both directions.
 pub const FORMAT_VERSION: (u32, u32) = (1, 2);
 
 /// The five node states. `Done`/`Closed` are terminal ("resolved").

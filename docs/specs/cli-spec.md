@@ -43,11 +43,13 @@ document assumes that model.
 ```
 loti [--root <path>] <init|epic|ticket|skill|migrate-store> ...
 
-loti init [<dir>]        # default: .loti/ here; a data root elsewhere via
-                         # --root or the positional <dir> (equivalent, mutually
-                         # exclusive) + a .loti.conf pointer here. Refuses if the
-                         # scope is already inside a store (upward walk). Warns
-                         # if in a git repo but not at its root.
+loti init [<dir>]        # default container: .loti/ here (no pointer). --root or
+                         # the positional <dir> (equivalent, mutually exclusive)
+                         # names the container literally (no .loti appended);
+                         # meta lands at <container>/meta and a .loti.conf
+                         # pointer is written here. Refuses if the scope is
+                         # already inside a store (upward walk). Warns if in a
+                         # git repo but not at its root.
 loti --help-full         # entire command tree in one pass (global; see
                          #   The `skill` subcommand & help)
 loti migrate-store       # align an older on-disk format to this binary

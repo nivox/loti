@@ -1,6 +1,10 @@
 //! The physical store: layout, path helpers, file read/write, and init.
 //!
-//! Layout is one flat directory per epic under the data root:
+//! The container is the only directory loti owns: it holds `meta` at its top
+//! level and one flat directory per epic directly under it. Nothing loti writes
+//! ever escapes the container.
+//!
+//! Layout is one flat directory per epic under the container:
 //!   * `<epic-id>/epic.md` holds the epic;
 //!   * `<epic-id>/<n>.md` holds each node.
 //!
@@ -49,7 +53,7 @@ pub const EPIC_FILE: &str = "epic.md";
 /// The epic's companion directory name for assets.
 pub const EPIC_ASSET_DIR: &str = "epic";
 
-/// A handle to a store rooted at a data-root directory. Cheap to clone.
+/// A handle to a store rooted at its container directory. Cheap to clone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Store {
     root: PathBuf,
@@ -75,7 +79,7 @@ pub enum StoreError {
     /// A store already exists where init was asked to create one.
     #[error("a store already exists at {path}")]
     AlreadyInitialised {
-        /// The existing marker directory.
+        /// The existing store metadata that init refused to clobber.
         path: PathBuf,
     },
     /// The temp-file lock could not be taken, or the atomic write failed.
@@ -102,9 +106,9 @@ pub enum StoreError {
 }
 
 impl Store {
-    /// Open a store at an already-resolved data root. The root is taken as-is;
-    /// discovery happens before this. Mutations are gated on the store version
-    /// read from its metadata.
+    /// Open a store at an already-resolved container. The container is taken
+    /// as-is; discovery happens before this. Mutations are gated on the store
+    /// version read from its metadata.
     pub fn at(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
@@ -120,7 +124,7 @@ impl Store {
         self
     }
 
-    /// The data-root directory.
+    /// The container directory (the store root loti owns).
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -478,59 +482,71 @@ impl Store {
     }
 }
 
-/// Where init placed its markers, so a caller can report precisely.
+/// Where init placed the store, so a caller can report precisely.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitOutcome {
-    /// The resolved data root that now holds a marker directory and metadata.
+    /// The container that now holds metadata (and will hold every epic dir).
     pub root: PathBuf,
     /// The config-file pointer written in the invocation directory, when the
-    /// data root is elsewhere; absent for an in-place init.
+    /// container is neither `here` nor `here`'s default `.loti`; absent when
+    /// discovery finds the container without a breadcrumb.
     pub config_pointer: Option<PathBuf>,
 }
 
-/// Initialise a store whose data root is `root`, invoked from `here`.
+/// Initialise a store whose container is `container`, invoked from `here`.
 ///
-/// The marker directory and metadata are created under `root`. When `root` is
-/// not the invocation directory `here`, a `.loti.conf` pointer naming `root` is
-/// written in `here` so commands run from `here` (or below) discover the store;
-/// an in-place init (root == here) writes no pointer. The caller resolves where
-/// `root` should be (default `here`, or a `--root`/positional target).
+/// The container is the only directory loti owns: metadata lands at
+/// `container/meta` and every epic dir will sit directly under it. The caller
+/// resolves where `container` should be (the default `here/.loti`, or a literal
+/// `--root`/positional target with no `.loti` appended).
 ///
-/// Refuses to clobber an existing store: an existing marker directory at `root`
-/// is an error.
-pub fn init(here: &Path, root: &Path) -> Result<InitOutcome, StoreError> {
-    let root = root.to_path_buf();
+/// A `.loti.conf` pointer naming the container is written in `here` only when a
+/// bare upward walk from `here` would not find the container on its own. That
+/// walk finds either a `.loti` directory or a `.loti.conf`, so a pointer is
+/// suppressed for the default in-place container (`here/.loti`, found
+/// directly) and for a container that is literally `here` (nothing to redirect
+/// to). A relative `loti-root` is written when the container is under `here`
+/// (so a moved checkout keeps working), else an absolute one.
+///
+/// Refuses to clobber an existing store: existing metadata at the container is
+/// an error.
+pub fn init(here: &Path, container: &Path) -> Result<InitOutcome, StoreError> {
+    let container = container.to_path_buf();
 
-    let marker = root.join(MARKER_DIR);
-    if marker.exists() {
-        return Err(StoreError::AlreadyInitialised { path: marker });
+    let meta_file = meta::meta_path(&container);
+    if meta_file.exists() {
+        return Err(StoreError::AlreadyInitialised { path: meta_file });
     }
 
-    meta::write(&root, &Meta::current()).map_err(|e| match e {
+    meta::write(&container, &Meta::current()).map_err(|e| match e {
         meta::MetaError::Io { path, source } => StoreError::Io { path, source },
         // Encoding a freshly-built Meta cannot realistically fail; surface it
         // as an I/O-shaped error against the metadata path rather than panic.
         other => StoreError::Io {
-            path: marker.clone(),
+            path: meta_file.clone(),
             source: std::io::Error::other(other.to_string()),
         },
     })?;
 
-    // A pointer is written only when the data root lives somewhere other than
-    // the invocation directory. Both paths exist now (meta::write created the
-    // root), so compare canonical forms to see through `.`/`..`/symlinks.
-    let config_pointer = if !same_dir(here, &root) {
+    // A pointer is written only when a bare upward walk from `here` would not
+    // reach the container by itself. Both the default `.loti` and `here` are
+    // found without one, so suppress the breadcrumb for those two cases; every
+    // other explicit container needs a pointer. Compare canonical forms so the
+    // check sees through `.`/`..`/symlinks.
+    let default_container = here.join(MARKER_DIR);
+    let found_by_walk = same_dir(here, &container) || same_dir(&default_container, &container);
+    let config_pointer = if found_by_walk {
+        None
+    } else {
         let pointer = here.join(CONFIG_FILE);
-        let root_str = data_dir_config_value(here, &root);
+        let root_str = data_dir_config_value(here, &container);
         let body = format!("loti-root = {}\n", toml_string(&root_str));
         write_string(&pointer, &body)?;
         Some(pointer)
-    } else {
-        None
     };
 
     Ok(InitOutcome {
-        root,
+        root: container,
         config_pointer,
     })
 }
@@ -560,7 +576,7 @@ pub fn inside_git_repo_but_not_root(dir: &Path) -> bool {
         .any(|ancestor| ancestor.join(".git").exists())
 }
 
-/// Prefer a relative `loti-root` when the data root is under the config's
+/// Prefer a relative `loti-root` when the container is under the config's
 /// directory, so a moved checkout keeps working; fall back to absolute.
 fn data_dir_config_value(config_dir: &Path, root: &Path) -> String {
     match root.strip_prefix(config_dir) {
@@ -722,18 +738,35 @@ mod tests {
     }
 
     #[test]
-    fn init_in_place_creates_marker_and_meta() {
+    fn init_default_container_creates_meta_and_no_pointer() {
+        // The default in-place container is `here/.loti`; discovery finds it on
+        // a bare walk, so no `.loti.conf` breadcrumb is written.
         let dir = tempfile::tempdir().unwrap();
-        let outcome = init(dir.path(), dir.path()).unwrap();
-        assert_eq!(outcome.root, dir.path());
+        let container = dir.path().join(MARKER_DIR);
+        let outcome = init(dir.path(), &container).unwrap();
+        assert_eq!(outcome.root, container);
         assert!(outcome.config_pointer.is_none());
-        assert!(dir.path().join(MARKER_DIR).join("meta").is_file());
+        assert!(container.join("meta").is_file());
         let store = Store::at(&outcome.root);
         assert_eq!(store.read_meta().unwrap(), Meta::current());
     }
 
     #[test]
-    fn init_with_data_dir_writes_a_config_pointer() {
+    fn init_container_here_writes_meta_and_no_pointer() {
+        // An explicit container that is literally `here` puts meta directly in
+        // the invocation dir and writes no breadcrumb (nothing to redirect to).
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = init(dir.path(), dir.path()).unwrap();
+        assert_eq!(outcome.root, dir.path());
+        assert!(outcome.config_pointer.is_none());
+        assert!(dir.path().join("meta").is_file());
+        assert!(!dir.path().join(CONFIG_FILE).exists());
+    }
+
+    #[test]
+    fn init_with_explicit_container_writes_a_config_pointer() {
+        // An explicit container elsewhere is literal (no `.loti` appended): meta
+        // lands at `<container>/meta` and a relative breadcrumb points at it.
         let dir = tempfile::tempdir().unwrap();
         let outcome = init(dir.path(), &dir.path().join("store")).unwrap();
         assert_eq!(outcome.root, dir.path().join("store"));
@@ -741,12 +774,7 @@ mod tests {
         assert_eq!(pointer, dir.path().join(CONFIG_FILE));
         let body = std::fs::read_to_string(&pointer).unwrap();
         assert!(body.contains("loti-root = \"store\""));
-        assert!(dir
-            .path()
-            .join("store")
-            .join(MARKER_DIR)
-            .join("meta")
-            .is_file());
+        assert!(dir.path().join("store").join("meta").is_file());
     }
 
     #[test]
@@ -767,9 +795,10 @@ mod tests {
     #[test]
     fn init_refuses_to_clobber_an_existing_store() {
         let dir = tempfile::tempdir().unwrap();
-        init(dir.path(), dir.path()).unwrap();
+        let container = dir.path().join(MARKER_DIR);
+        init(dir.path(), &container).unwrap();
         assert!(matches!(
-            init(dir.path(), dir.path()),
+            init(dir.path(), &container),
             Err(StoreError::AlreadyInitialised { .. })
         ));
     }

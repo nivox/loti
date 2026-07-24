@@ -1,5 +1,9 @@
 //! Aligning an older on-disk store to the version this binary writes.
 //!
+//! Migration operates only on the store container — the directory loti owns,
+//! holding `meta` and every epic dir. It copies, transforms and swaps that
+//! container; it never touches the project directory the container lives in.
+//!
 //! Migration moves a store from the version it recorded to the version this
 //! binary understands. Two shapes, chosen by how far apart they are:
 //!
@@ -30,14 +34,16 @@
 //!
 //! Concrete choices this module makes (the rules, stated so they can be checked
 //! against reality):
-//!   * **Snapshot/replace technique: copy-aside then swap.** The live store is
-//!     copied to a sibling backup directory; the transform builds a fresh
-//!     directory; the old store directory is moved to a discard name and the
-//!     fresh one moved into place. A crash between those two moves is recovered
+//!   * **Snapshot/replace technique: copy-aside then swap.** The live container
+//!     is copied to a sibling backup directory; the transform builds a fresh
+//!     directory; the old container is moved to a discard name and the fresh
+//!     one moved into place. A crash between those two moves is recovered
 //!     because the backup, not the possibly-half-swapped live tree, is the
-//!     source of truth on re-run.
-//!   * **Backup retention/naming.** The preserved copy is a sibling of the data
-//!     root named with a fixed suffix; it is kept after a successful migration
+//!     source of truth on re-run. Only the container is ever renamed, so the
+//!     project directory it sits in keeps its identity.
+//!   * **Backup retention/naming.** The preserved copy is a sibling of the
+//!     container named with a fixed suffix; it is kept after a successful
+//!     migration
 //!     so a human can inspect or roll back, and it is the resume source if a
 //!     migration is re-run. Re-running removes a leftover discard directory and
 //!     rebuilds from the backup.
@@ -53,7 +59,7 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
-use crate::meta::{self, Meta, StoreVersion, MARKER_DIR};
+use crate::meta::{self, Meta, StoreVersion};
 use crate::FORMAT_VERSION;
 
 /// The sibling-directory suffix for the preserved pre-migration copy. Kept
@@ -489,8 +495,8 @@ fn drain(root: &Path, config: &MigrateConfig) -> Result<(), MigrateError> {
     }
 }
 
-/// Whether any staging temp file exists anywhere under `root`, excluding the
-/// marker directory (which holds only metadata, never staging temps for nodes).
+/// Whether any staging temp file exists anywhere under the container `root`. A
+/// staging temp is any file whose name starts with a dot and ends with `.tmp`.
 fn any_temp_files(root: &Path) -> Result<bool, MigrateError> {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -510,11 +516,6 @@ fn any_temp_files(root: &Path) -> Result<bool, MigrateError> {
                 source,
             })?;
             if file_type.is_dir() {
-                // The marker directory never holds node staging temps; skip it
-                // so the drain only watches the store's own edit staging.
-                if path.file_name().and_then(|n| n.to_str()) == Some(MARKER_DIR) {
-                    continue;
-                }
                 stack.push(path);
             } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 if name.starts_with(TEMP_PREFIX) && name.ends_with(TEMP_SUFFIX) {
@@ -1119,6 +1120,59 @@ mod tests {
 
         let out = std::fs::read_to_string(stage.join("e").join("1.md")).unwrap();
         assert_eq!(out, node_text);
+    }
+
+    #[test]
+    fn migration_touches_only_the_container_not_the_project_dir() {
+        // The container sits inside a project dir that also holds an unrelated
+        // user file. A (fabricated major) migration must copy/transform/swap
+        // only the container: the sibling user file stays, and the project dir
+        // keeps its identity (inode) across the whole run.
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let container = project.join(".loti");
+        std::fs::create_dir_all(container.join("e")).unwrap();
+        std::fs::write(container.join("e").join("epic.md"), "---\nid: e\n---\n").unwrap();
+        meta::write(&container, &Meta::clean(0, 0)).unwrap();
+
+        // An unrelated user file beside the container inside the project dir.
+        let user_file = project.join("NOTES.md");
+        std::fs::write(&user_file, "keep me").unwrap();
+
+        #[cfg(unix)]
+        let project_inode = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&project).unwrap().ino()
+        };
+
+        let mut registry = TransformRegistry::new();
+        registry.register(Box::new(MarkerTransform { from: 0 }));
+        let out = migrate_store_to(
+            &container,
+            (1, 0),
+            &registry,
+            &fast_config(Force::Deny),
+            &mut SilentProgress,
+        )
+        .unwrap();
+        assert!(matches!(out, Outcome::Migrated { steps: 1, .. }));
+
+        // The container was migrated in place.
+        assert!(container.join("transformed-from-0.marker").is_file());
+        assert_eq!(
+            meta::read(&container).unwrap().store_version(),
+            Some(StoreVersion::Clean { major: 1, minor: 0 })
+        );
+        // The user file is untouched and the project dir kept its identity; the
+        // migration's working dirs are siblings of the container, inside proj.
+        assert_eq!(std::fs::read_to_string(&user_file).unwrap(), "keep me");
+        assert!(project.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(std::fs::metadata(&project).unwrap().ino(), project_inode);
+        }
     }
 
     #[test]

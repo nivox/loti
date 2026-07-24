@@ -1,4 +1,8 @@
-//! Store metadata: the `meta` file inside the data-root marker directory.
+//! Store metadata: the `meta` file inside the store container.
+//!
+//! The container `S` is the only directory loti owns: it holds `meta` at
+//! `S/meta` and every epic directory directly under it. Metadata is at the
+//! container's top level, not inside a nested marker directory.
 //!
 //! The store carries exactly one format version, at store granularity, written
 //! when the store is created. The version is `major.minor`:
@@ -16,10 +20,12 @@ use thiserror::Error;
 
 use crate::FORMAT_VERSION;
 
-/// The marker directory holding store metadata, relative to the data root.
+/// The default container directory name used by discovery and `init` when no
+/// explicit container is chosen. The container itself is the store root; this
+/// name is what an in-place store is called (`<here>/.loti`).
 pub const MARKER_DIR: &str = ".loti";
 
-/// The metadata file name inside the marker directory.
+/// The metadata file name at the container's top level.
 pub const META_FILE: &str = "meta";
 
 /// On-disk store metadata (TOML).
@@ -158,12 +164,13 @@ impl Meta {
     }
 }
 
-/// The metadata file path for a given data root.
+/// The metadata file path for a store container: `meta` at the container's top
+/// level (the container is the store root loti owns).
 pub fn meta_path(root: &Path) -> PathBuf {
-    root.join(MARKER_DIR).join(META_FILE)
+    root.join(META_FILE)
 }
 
-/// Read and parse the store metadata under `root`.
+/// Read and parse the store metadata under the container `root`.
 pub fn read(root: &Path) -> Result<Meta, MetaError> {
     let path = meta_path(root);
     let text = std::fs::read_to_string(&path).map_err(|source| MetaError::Io {
@@ -173,11 +180,11 @@ pub fn read(root: &Path) -> Result<Meta, MetaError> {
     toml::from_str(&text).map_err(|source| MetaError::Parse { path, source })
 }
 
-/// Write store metadata under `root`, creating the marker directory if needed.
+/// Write store metadata under the container `root`, creating the container if
+/// needed.
 pub fn write(root: &Path, meta: &Meta) -> Result<(), MetaError> {
-    let dir = root.join(MARKER_DIR);
-    std::fs::create_dir_all(&dir).map_err(|source| MetaError::Io {
-        path: dir.clone(),
+    std::fs::create_dir_all(root).map_err(|source| MetaError::Io {
+        path: root.to_path_buf(),
         source,
     })?;
     let path = meta_path(root);

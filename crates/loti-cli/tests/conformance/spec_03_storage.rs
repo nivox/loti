@@ -116,24 +116,20 @@ fn discovery_finds_the_store_from_a_subdirectory_via_the_marker() {
 
 #[test]
 fn config_pointer_wins_and_root_override_beats_discovery() {
-    // A `.loti.conf` pointing elsewhere directs discovery to that data root.
+    // A `.loti.conf`'s `loti-root` names the container directly; discovery
+    // resolves through it to that container.
     let outer = tempfile::TempDir::new().unwrap();
     let data = tempfile::TempDir::new().unwrap();
-    // Real data store lives in `data`.
-    std::fs::create_dir_all(data.path().join(".loti")).unwrap();
-    std::fs::write(
-        data.path().join(".loti").join("meta"),
-        "format-version = \"1.1\"\n",
-    )
-    .unwrap();
-    // `outer` carries only a pointer to it.
+    // The container is `data` itself: meta at its top level.
+    std::fs::write(data.path().join("meta"), "format-version = \"1.1\"\n").unwrap();
+    // `outer` carries only a pointer naming the container.
     std::fs::write(
         outer.path().join(".loti.conf"),
         format!("loti-root = \"{}\"\n", data.path().display()),
     )
     .unwrap();
 
-    // Seed an epic in the pointed-at data root (via --root, unambiguously).
+    // Seed an epic in the pointed-at container (via --root, unambiguously).
     let seed = assert_cmd::Command::cargo_bin("loti")
         .unwrap()
         .args(["--root"])
@@ -188,9 +184,10 @@ fn numbers_may_collide_across_epics() {
 
 #[test]
 fn init_root_creates_the_store_elsewhere_with_a_pointer_here() {
-    // `loti init --root <path>` builds the store's files at <path> and leaves a
-    // `.loti.conf` in the invocation directory so this scope discovers it. The
-    // store is still "the store for here".
+    // `loti init --root <path>` names the container literally at <path> (no
+    // `.loti` appended): meta lands at `<path>/meta` and a `.loti.conf` in the
+    // invocation directory points at it so this scope discovers it. The store
+    // is still "the store for here".
     let work = tempfile::TempDir::new().unwrap();
     let data = tempfile::TempDir::new().unwrap();
     let store_root = data.path().join("elsewhere");
@@ -209,8 +206,9 @@ fn init_root_creates_the_store_elsewhere_with_a_pointer_here() {
         "init --root should succeed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // Marker landed at the target, and a pointer was written in the work dir.
-    assert!(store_root.join(".loti").join("meta").is_file());
+    // Meta landed at the container's top level, and a pointer was written in
+    // the work dir.
+    assert!(store_root.join("meta").is_file());
     let pointer = work.path().join(".loti.conf");
     assert!(pointer.is_file(), "a .loti.conf pointer is written here");
     assert!(std::fs::read_to_string(&pointer)
@@ -269,6 +267,64 @@ fn init_rejects_naming_the_target_twice() {
         .unwrap();
     assert!(!out.status.success(), "both --root and DIR must be refused");
     assert!(!work.path().join(".loti.conf").exists(), "nothing created");
+}
+
+#[test]
+fn in_place_init_keeps_the_whole_store_inside_the_container() {
+    // The reported bug: loti must own only its container. A bare `loti init`
+    // creates `<here>/.loti` and everything it writes — meta and every epic
+    // dir — lives inside it. An unrelated user file beside `.loti` is never
+    // touched, and nothing is scattered into the project dir.
+    let work = tempfile::TempDir::new().unwrap();
+    // An unrelated user file in the project dir.
+    let user_file = work.path().join("NOTES.md");
+    std::fs::write(&user_file, "keep me").unwrap();
+
+    let out = init_in(work.path());
+    assert!(
+        out.status.success(),
+        "bare init should succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The default in-place container is `<here>/.loti`; meta lives at its top
+    // level and no breadcrumb is written (discovery finds it directly).
+    let container = work.path().join(".loti");
+    assert!(container.join("meta").is_file(), "meta lives in .loti");
+    assert!(
+        !work.path().join(".loti.conf").exists(),
+        "a bare in-place init writes no pointer"
+    );
+
+    // Create an epic and a ticket from the project dir (discovery resolves the
+    // container).
+    for args in [
+        vec!["epic", "create", "e", "--name", "E", "--summary", "s"],
+        vec!["ticket", "create", "e", "--name", "t", "--summary", "s"],
+    ] {
+        let r = assert_cmd::Command::cargo_bin("loti")
+            .unwrap()
+            .current_dir(work.path())
+            .env("NO_COLOR", "1")
+            .args(&args)
+            .write_stdin("")
+            .output()
+            .unwrap();
+        assert!(
+            r.status.success(),
+            "{args:?} should succeed: {}",
+            String::from_utf8_lossy(&r.stderr)
+        );
+    }
+
+    // The epic dir lives inside the container, not scattered in the project dir.
+    assert!(container.join("e").join("epic.md").is_file());
+    assert!(container.join("e").join("1.md").is_file());
+    assert!(
+        !work.path().join("e").exists(),
+        "nothing is scattered into the project dir"
+    );
+    // The unrelated user file is untouched.
+    assert_eq!(std::fs::read_to_string(&user_file).unwrap(), "keep me");
 }
 
 /// Write store metadata directly at `dir`, creating its `.loti/` marker.

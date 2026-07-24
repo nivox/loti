@@ -45,8 +45,12 @@ any subdirectory afterwards:
 
 ```sh
 loti init
-# → loti: initialised a store at /path/to/project
+# → loti: initialised a store at /path/to/project/.loti
 ```
+
+The whole store lives inside the `.loti/` container; nothing is scattered into
+the project directory. To keep it elsewhere, `loti init --root <path>` uses that
+path as the container directly and leaves a `.loti.conf` pointer behind.
 
 **2. Create an epic** (the top-level unit of work). A longer body is read from
 stdin or `--file`; here we give none:

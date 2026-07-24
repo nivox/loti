@@ -2,13 +2,17 @@
 //! against a throwaway store, so these checks exercise the shipping CLI exactly
 //! as a user (or agent) would, never the crate internals.
 //!
-//! Every test gets its own temporary store. Two isolation strategies are used:
-//!   * `Store::new()` — initialises a store *in place* in a fresh tempdir and
-//!     then drives every later command with `--root <tempdir>`. This is the
-//!     hermetic default; discovery and the current directory are never touched.
-//!   * `Store::new_discovered()` — for the few checks that must observe root
-//!     discovery / `.loti.conf`, which run the binary with its current dir set
-//!     to a tempdir instead of passing `--root`.
+//! Every test gets its own temporary store. The container is the only directory
+//! loti owns — it holds `meta` and every epic dir — and the two isolation
+//! strategies place it differently:
+//!   * `Store::new()` — drives every command with `--root <tempdir>`, so the
+//!     container is the tempdir itself and `meta` lives at `<tempdir>/meta`.
+//!     This is the hermetic default; discovery and the current directory are
+//!     never touched. Epic-relative paths like `path("e/1.md")` stay valid.
+//!   * `Store::new_discovered()` — for the few checks that must observe
+//!     discovery / `.loti.conf`. Commands run with the current dir set to a
+//!     tempdir, so the container is the discovered `<tempdir>/.loti`; `meta`
+//!     lives at `<tempdir>/.loti/meta` and store contents under `.loti/`.
 //!
 //! Setup never invokes `loti init`: every store here is created by writing the
 //! store metadata directly (matching what `loti init` writes), so a test's
@@ -39,11 +43,13 @@ pub struct Store {
 }
 
 impl Store {
-    /// A store initialised in place in a fresh tempdir, driven via `--root`.
+    /// A store driven via `--root <tempdir>`: the container is the tempdir, so
+    /// `meta` is written at `<tempdir>/meta`.
     pub fn new() -> Self {
         let dir = TempDir::new().expect("make tempdir");
         let root = dir.path().to_path_buf();
-        write_meta(&root, CURRENT_META);
+        // --root names the container directly: meta at the container's top level.
+        write_meta_at(&root, CURRENT_META);
         Self {
             dir,
             root,
@@ -51,12 +57,15 @@ impl Store {
         }
     }
 
-    /// A store whose commands are driven by discovery (current dir = root),
-    /// for the checks that must observe `.loti/` vs `.loti.conf` resolution.
+    /// A store whose commands are driven by discovery (current dir = tempdir),
+    /// for the checks that must observe `.loti/` vs `.loti.conf` resolution. The
+    /// container is the discovered `<tempdir>/.loti`.
     pub fn new_discovered() -> Self {
         let dir = TempDir::new().expect("make tempdir");
         let root = dir.path().to_path_buf();
-        write_meta(&root, CURRENT_META);
+        // Discovery finds `<tempdir>/.loti` as the container: meta at
+        // `<tempdir>/.loti/meta`.
+        write_meta_at(&root.join(".loti"), CURRENT_META);
         Self {
             dir,
             root,
@@ -64,20 +73,38 @@ impl Store {
         }
     }
 
-    /// The data-root directory backing this store.
+    /// The directory `--root` points at / discovery starts from. In `--root`
+    /// mode this is the container itself; in discovery mode it is the project
+    /// dir whose `.loti` is the container.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// A path inside the store root.
+    /// A path inside the container. In `--root` mode the container is the root;
+    /// in discovery mode it is the root's `.loti`.
+    pub fn store_path(&self, rel: &str) -> PathBuf {
+        if self.via_discovery {
+            self.root.join(".loti").join(rel)
+        } else {
+            self.root.join(rel)
+        }
+    }
+
+    /// A path inside the directory `--root`/discovery is anchored at. Equal to
+    /// [`Store::store_path`] in `--root` mode; the project dir (not the
+    /// container) in discovery mode.
     pub fn path(&self, rel: &str) -> PathBuf {
         self.root.join(rel)
     }
 
     /// Overwrite the store metadata (for version-gate checks that fabricate a
-    /// mismatched `format-version`).
+    /// mismatched `format-version`). Targets the container per the drive mode.
     pub fn set_meta(&self, contents: &str) {
-        write_meta(&self.root, contents);
+        if self.via_discovery {
+            write_meta_at(&self.root.join(".loti"), contents);
+        } else {
+            write_meta_at(&self.root, contents);
+        }
     }
 
     /// A fresh binary invocation against this store, with the given arguments.
@@ -199,11 +226,11 @@ impl Default for Store {
     }
 }
 
-/// Write `.loti/meta` under `root`, creating the marker directory.
-fn write_meta(root: &Path, contents: &str) {
-    let marker = root.join(".loti");
-    std::fs::create_dir_all(&marker).expect("create .loti");
-    std::fs::write(marker.join("meta"), contents).expect("write meta");
+/// Write `meta` at the top level of the container `dir`, creating it. The
+/// container is the only directory loti owns; `meta` lives at `<container>/meta`.
+fn write_meta_at(dir: &Path, contents: &str) {
+    std::fs::create_dir_all(dir).expect("create container");
+    std::fs::write(dir.join("meta"), contents).expect("write meta");
 }
 
 /// Extract the `<epic>/<n>` reference from a `loti: created ticket <ref>` line.

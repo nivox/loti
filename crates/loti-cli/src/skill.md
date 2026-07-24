@@ -149,10 +149,11 @@ equivalent to piping with no `--file`. One-liners (`--name`, `--summary`,
 
 A typical path:
 
-1. **Set up once.** `loti init` creates the store in the current directory; the
-   whole checkout then shares one store, found from any depth by an upward walk
-   (like git). To keep the data elsewhere, `loti init --root <path>` (or a
-   positional `<dir>`) creates the store there and leaves a `.loti.conf` pointer
+1. **Set up once.** `loti init` creates a `.loti/` container in the current
+   directory holding the whole store; the checkout then shares one store, found
+   from any depth by an upward walk (like git). To keep the store elsewhere,
+   `loti init --root <path>` (or a positional `<dir>`) uses that path as the
+   container literally (no `.loti` appended) and leaves a `.loti.conf` pointer
    here. Init refuses if this scope is already inside a store.
 2. **Create an epic.** `loti epic create <epic-id> --name "..." --summary "..."`
    (pipe or `--file` a longer body if you want one).

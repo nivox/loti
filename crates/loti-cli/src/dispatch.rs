@@ -89,14 +89,15 @@ fn color_for(stdout_is_tty: bool) -> Color {
 // init
 // ---------------------------------------------------------------------------
 
-/// Create a store, reporting where its markers landed.
+/// Create a store, reporting where the container landed.
 ///
-/// A store is always the store *for the current directory*: the marker and
-/// metadata may live elsewhere (a `--root`/positional target), but a
-/// `.loti.conf` pointer is then dropped here so this scope discovers it. Init
-/// refuses when the current scope is already inside a store — the same
-/// git-like upward walk every other command uses — so a nested init cannot
-/// strand or shadow the enclosing store.
+/// A store is always the store *for the current directory*: the container may
+/// live elsewhere (a `--root`/positional target), but a `.loti.conf` pointer is
+/// then dropped here so this scope discovers it. The container is the only
+/// directory loti owns — it holds `meta` and every epic dir. Init refuses when
+/// the current scope is already inside a store — the same git-like upward walk
+/// every other command uses — so a nested init cannot strand or shadow the
+/// enclosing store.
 fn run_init<O: Write, E: Write>(
     cli: &Cli,
     args: &InitArgs,
@@ -120,10 +121,12 @@ fn run_init<O: Write, E: Write>(
         Err(e) => return Err(e.into()),
     }
 
-    // The data root: an explicit --root (global) or the positional DIR names
-    // where the store's files live; both are two spellings of the same target,
-    // so passing both is ambiguous. Absent both, the store is created in place.
-    let root = match (cli.root.as_deref(), args.dir.as_deref()) {
+    // The container: an explicit --root (global) or the positional DIR names it
+    // literally (no `.loti` appended); both are two spellings of the same
+    // target, so passing both is ambiguous. Absent both, the default in-place
+    // container is `here/.loti`, which a bare upward walk finds without a
+    // breadcrumb.
+    let container = match (cli.root.as_deref(), args.dir.as_deref()) {
         (Some(_), Some(_)) => {
             return Err(anyhow!(
                 "name the store's location once — as --root or as the positional DIR, not both"
@@ -136,7 +139,7 @@ fn run_init<O: Write, E: Write>(
                 here.join(target)
             }
         }
-        (None, None) => here.clone(),
+        (None, None) => here.join(loti_core::meta::MARKER_DIR),
     };
 
     if store::inside_git_repo_but_not_root(&here) {
@@ -147,7 +150,7 @@ fn run_init<O: Write, E: Write>(
              so the whole checkout shares one store"
         )?;
     }
-    let outcome = store::init(&here, &root)?;
+    let outcome = store::init(&here, &container)?;
     writeln!(
         out,
         "loti: initialised a store at {}",

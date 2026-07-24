@@ -1,18 +1,20 @@
-//! Locating the data root.
+//! Locating the store container.
 //!
-//! A store is found by walking upward from a starting directory to the nearest
-//! ancestor that carries either a marker directory (whose parent is the data
-//! root) or a config file naming the root. Rules:
+//! The container `S` is the only directory loti owns — it holds `meta` and all
+//! epic dirs. It is found by walking upward from a starting directory to the
+//! nearest ancestor that carries either a `.loti` directory (that directory
+//! *is* the container) or a config file naming the container. Rules:
 //!
 //!   * an explicit override wins outright — no walk, no environment variable;
-//!   * at a single level, the config file wins over the marker directory; if
-//!     the two name different roots, the disagreement is reported so a caller
-//!     can warn;
-//!   * the first level that resolves a root ends the walk.
+//!   * at a single level, the config file wins over the `.loti` directory; if
+//!     the two name different containers, the disagreement is reported so a
+//!     caller can warn;
+//!   * the first level that resolves a container ends the walk.
 //!
-//! The config file is TOML with a `loti-root` key (absolute, or relative to the
-//! config file). It may also carry `[match-impl.<name>]` tables; those are
-//! parsed and preserved but not interpreted here.
+//! The config file is TOML with a `loti-root` key naming the container
+//! directly (absolute, or relative to the config file). It may also carry
+//! `[match-impl.<name>]` tables; those are parsed and preserved but not
+//! interpreted here.
 
 use std::path::{Path, PathBuf};
 
@@ -36,30 +38,31 @@ struct Config {
     match_impl: toml::Table,
 }
 
-/// A resolved data root, plus whether discovery saw the two markers disagree.
+/// A resolved store container, plus whether discovery saw the two markers
+/// disagree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Discovered {
-    /// The resolved data root directory.
+    /// The resolved store container directory.
     pub root: PathBuf,
-    /// Set when a single level held both a config file and a marker directory
-    /// that named different roots; the config file's root was taken. A caller
-    /// should warn the user.
+    /// Set when a single level held both a config file and a `.loti` directory
+    /// that named different containers; the config file's container was taken.
+    /// A caller should warn the user.
     pub disagreement: Option<Disagreement>,
 }
 
-/// The two roots that a single level disagreed on.
+/// The two containers that a single level disagreed on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Disagreement {
-    /// The root taken, from the config file.
+    /// The container taken, from the config file.
     pub config_root: PathBuf,
-    /// The root implied by the sibling marker directory.
+    /// The container implied by the sibling `.loti` directory.
     pub marker_root: PathBuf,
 }
 
 /// Failure to locate a data root.
 #[derive(Debug, Error)]
 pub enum DiscoveryError {
-    /// No marker directory or config file was found walking upward.
+    /// No `.loti` directory or config file was found walking upward.
     #[error(
         "no store found here or in any parent directory; \
          run 'loti init' to create one, or pass --root"
@@ -81,7 +84,7 @@ pub enum DiscoveryError {
     },
 }
 
-/// Resolve the data root, preferring an explicit override over discovery.
+/// Resolve the store container, preferring an explicit override over discovery.
 ///
 /// When `override_root` is given it is taken as-is (no walk, no validation of
 /// its contents here). Otherwise discovery walks upward from `start`.
@@ -95,7 +98,8 @@ pub fn resolve(start: &Path, override_root: Option<&Path>) -> Result<Discovered,
     discover(start)
 }
 
-/// Walk upward from `start`, returning the first level that resolves a root.
+/// Walk upward from `start`, returning the first level that resolves a
+/// container.
 pub fn discover(start: &Path) -> Result<Discovered, DiscoveryError> {
     for dir in start.ancestors() {
         let config = dir.join(CONFIG_FILE);
@@ -104,13 +108,15 @@ pub fn discover(start: &Path) -> Result<Discovered, DiscoveryError> {
         let has_marker = marker.is_dir();
 
         if has_config {
-            // The config file wins at this level; the marker root (if any) is
-            // only consulted to surface a disagreement.
+            // The config file wins at this level; the `.loti` container (if any)
+            // is only consulted to surface a disagreement. Both branches name a
+            // container, so the comparison is container-to-container.
             let config_root = read_config_root(&config)?;
-            let disagreement = if has_marker && config_root != dir {
+            let marker_root = dir.join(MARKER_DIR);
+            let disagreement = if has_marker && config_root != marker_root {
                 Some(Disagreement {
                     config_root: config_root.clone(),
-                    marker_root: dir.to_path_buf(),
+                    marker_root,
                 })
             } else {
                 None
@@ -122,10 +128,10 @@ pub fn discover(start: &Path) -> Result<Discovered, DiscoveryError> {
         }
 
         if has_marker {
-            // The marker directory sits inside the data root; the root is its
-            // parent — here, the level we are standing on.
+            // The `.loti` directory *is* the container: it holds `meta` and all
+            // epic dirs. Return it directly, not its parent.
             return Ok(Discovered {
-                root: dir.to_path_buf(),
+                root: marker,
                 disagreement: None,
             });
         }
@@ -147,8 +153,8 @@ pub fn find_project_config(start: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Read a config file and resolve its `loti-root` (absolute, or relative to the
-/// config file's directory).
+/// Read a config file and resolve its `loti-root` — the container path
+/// (absolute, or relative to the config file's directory).
 fn read_config_root(config_path: &Path) -> Result<PathBuf, DiscoveryError> {
     let text = std::fs::read_to_string(config_path).map_err(|e| DiscoveryError::BadConfig {
         path: config_path.to_path_buf(),
@@ -195,14 +201,15 @@ mod tests {
     }
 
     #[test]
-    fn finds_marker_directory_upward() {
+    fn finds_marker_directory_upward_and_returns_the_container() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        touch_marker(&root);
-        let nested = root.join("a").join("b");
+        let base = dir.path().canonicalize().unwrap();
+        touch_marker(&base);
+        let nested = base.join("a").join("b");
         std::fs::create_dir_all(&nested).unwrap();
         let found = discover(&nested).unwrap();
-        assert_eq!(found.root, root);
+        // The `.loti` directory *is* the container, not its parent.
+        assert_eq!(found.root, base.join(MARKER_DIR));
     }
 
     #[test]
@@ -235,26 +242,28 @@ mod tests {
         touch_marker(&base);
         std::fs::write(base.join(CONFIG_FILE), "loti-root = \"data\"\n").unwrap();
         let found = discover(&base).unwrap();
-        // The config file's root is taken.
+        // The config file's container is taken.
         assert_eq!(found.root, base.join("data"));
-        // And the disagreement with the sibling marker is reported.
+        // And the disagreement with the sibling `.loti` container is reported;
+        // the marker container is the `.loti` directory itself.
         let disagreement = found.disagreement.expect("expected a disagreement");
         assert_eq!(disagreement.config_root, base.join("data"));
-        assert_eq!(disagreement.marker_root, base);
+        assert_eq!(disagreement.marker_root, base.join(MARKER_DIR));
     }
 
     #[test]
-    fn config_pointing_at_its_own_level_does_not_disagree_with_marker() {
+    fn config_pointing_at_the_marker_container_does_not_disagree() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().canonicalize().unwrap();
         touch_marker(&base);
+        // The config names the same `.loti` container the marker branch implies.
         std::fs::write(
             base.join(CONFIG_FILE),
-            format!("loti-root = \"{}\"\n", base.display()),
+            format!("loti-root = \"{}\"\n", base.join(MARKER_DIR).display()),
         )
         .unwrap();
         let found = discover(&base).unwrap();
-        assert_eq!(found.root, base);
+        assert_eq!(found.root, base.join(MARKER_DIR));
         assert!(found.disagreement.is_none());
     }
 

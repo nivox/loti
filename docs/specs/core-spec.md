@@ -87,9 +87,10 @@ skill/help system — is specified in [`cli-spec.md`](cli-spec.md).
 
 ## 3. On-disk storage format
 
-- **Layout.** One flat directory per epic under the data root:
-  `<epic-id>/epic.md` (the epic) and `<epic-id>/<n>.md` (each node). **No nested
-  folders** — identity is decoupled from location; reparenting is a one-field
+- **Layout.** The **container** `S` is the only directory `loti` owns: it holds
+  `meta` at its top level and one flat directory per epic directly under it —
+  `<epic-id>/epic.md` (the epic) and `<epic-id>/<n>.md` (each node). Nothing
+  `loti` writes ever escapes the container. **No nested folders** for the tree — identity is decoupled from location; reparenting is a one-field
   edit. The tree is encoded by a `parent:` frontmatter field (absent = top-level).
 - **File structure.** **All** structured data lives in **YAML frontmatter**:
   scalars (`number`, `name`, `summary`, `status`, `labels`, `parent`,
@@ -113,22 +114,29 @@ skill/help system — is specified in [`cli-spec.md`](cli-spec.md).
 - **Attachments.** Copied in **verbatim** to lazily-created companion dirs
   `<n>/` (nodes) and `epic/` (epic); indexed in frontmatter. URL/soft references
   are expressed as comments, not assets.
-- **Store metadata.** `<root>/.loti/meta` (TOML) carries the store `format-version`
-  (see *Format versioning & migration*). Written by `loti init`.
-- **Root discovery.** Git-like upward walk to the nearest ancestor with a
-  `.loti/` directory (the data root) or a `.loti.conf` file (TOML; `loti-root` key,
-  absolute or relative-to-conf; also carries `[match-impl.<name>]` matcher config,
-  specified in [`cli-spec.md`](cli-spec.md) → *Filtering model for `list`*).
-  `.loti.conf` wins if both are present at one level; warn if they disagree.
-  Override via `--root` only (no env var). Every verb resolves its store this
-  way, from any depth.
-- **Initialisation.** `init` creates the store *for the current directory*. Its
-  files land in place (`.loti/` here) by default, or at a target named by
-  `--root` or the positional `<dir>` (equivalent; naming both is an error), in
-  which case a `.loti.conf` pointer is written here so this scope discovers it.
-  `init` refuses when the current scope already resolves a store by the upward
-  walk (marker or pointer, here or in any ancestor), so a nested `init` can
-  never shadow or strand the enclosing store.
+- **Store metadata.** `<S>/meta` (TOML) — the `meta` file at the container's top
+  level — carries the store `format-version` (see *Format versioning &
+  migration*). Written by `loti init`.
+- **Container discovery.** Git-like upward walk to the nearest ancestor that
+  carries either a `.loti/` directory (that directory **is** the container `S`)
+  or a `.loti.conf` file (TOML; `loti-root` key names the container `S`
+  directly, absolute or relative-to-conf; also carries `[match-impl.<name>]`
+  matcher config, specified in [`cli-spec.md`](cli-spec.md) → *Filtering model
+  for `list`*). `.loti.conf` wins if both are present at one level; warn if the
+  two name different containers. Override via `--root` only (no env var); an
+  explicit `--root` names the container literally and is taken as-is. Every verb
+  resolves its container this way, from any depth.
+- **Initialisation.** `init` creates the store *for the current directory*. The
+  default container is `.loti/` here (found directly by the upward walk, so no
+  pointer is written). A target named by `--root` or the positional `<dir>`
+  (equivalent; naming both is an error) is the container **literally** — no
+  `.loti` is appended — so its `meta` lands at `<target>/meta`. When the
+  container is neither `here`'s default `.loti` nor `here` itself, a `.loti.conf`
+  pointer naming it is written here so this scope discovers it (relative when the
+  container is under `here`, else absolute). `init` refuses when the current
+  scope already resolves a store by the upward walk (container or pointer, here
+  or in any ancestor), so a nested `init` can never shadow or strand the
+  enclosing store.
 
 ---
 
@@ -181,7 +189,8 @@ policy.
 ## 5. Format versioning & migration
 
 - **Version.** The store carries **exactly one** `format-version` at **store
-  granularity**, in `<root>/.loti/meta` (TOML), written by `loti init`.
+  granularity**, in `<S>/meta` (TOML) at the container's top level, written by
+  `loti init`.
 - **Scheme: `major.minor`.** **major** = breaking (rename/remove/restructure
   fields, layout change); **minor** = additive-only (new *optional* fields),
   compatible both directions within a major.
@@ -202,11 +211,13 @@ policy.
 - **`loti migrate-store` — sentinel-barrier protocol** (quiescence via the format,
   **no global lock**):
   - **Minor migration:** meta-only version bump; **no store rewrite**.
-  - **Major migration**, in order: (1) set `.loti/meta` to the intermediate
+  - **Major migration**, in order: (1) set `<S>/meta` to the intermediate
     **`M+1.m-migrate` sentinel**; (2) **drain** — wait until no `*.tmp` (see
     *Concurrency & multi-actor safety*) exists; (3) **snapshot → transform →
-    replace** the store directory (chained ordered steps); (4) write the clean
-    **`M+1.m`** version — the **commit point**.
+    replace** the **container** (chained ordered steps); (4) write the clean
+    **`M+1.m`** version — the **commit point**. Migration operates only on the
+    container `S` — never on the project directory that anchors an in-place
+    store — so it can never strand a shell or editor whose cwd is the project.
   - **Sentinel semantics (MUST):** any binary observing the `-migrate` sentinel —
     including a matching-major one — refuses mutations ("mid-migration, read-only
     for everyone but the migrator").
