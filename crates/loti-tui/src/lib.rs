@@ -19,6 +19,7 @@ pub mod ui;
 use std::io::{self, IsTerminal, Write};
 use std::panic;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{bail, Result};
 use crossterm::event::{
@@ -93,6 +94,14 @@ fn restore() {
     let _ = stdout.flush();
 }
 
+/// How often the loop wakes with no input to read.
+///
+/// A persistent tick is what lets anything timed appear at all: waiting on input
+/// alone, a message that clears itself has no wakeup to clear it on. Coarse
+/// enough to cost nothing, fine enough that a timed change never overstays its
+/// deadline by more than a quarter second.
+const TICK: Duration = Duration::from_millis(250);
+
 fn event_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
     // Mouse capture is what makes the divider draggable, but it also takes
     // click-drag text selection away from the terminal. Zoom is the way out:
@@ -100,7 +109,9 @@ fn event_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
     // selecting text from the preview works again.
     let mut captured = true;
     loop {
-        terminal.draw(|f| ui::draw(f, &mut app))?;
+        if app.take_redraw_request() {
+            terminal.draw(|f| ui::draw(f, &mut app))?;
+        }
 
         let wanted = !app.zoomed();
         if wanted != captured {
@@ -112,6 +123,15 @@ fn event_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
             }
             captured = wanted;
         }
+
+        // A tick with nothing to read is the only wakeup that leaves the frame
+        // to the request. Every real event — key, mouse, resize alike — asks for
+        // one before dispatch, so no handler can leave the screen stale behind
+        // the reader's own input.
+        if !event::poll(TICK)? {
+            continue;
+        }
+        app.request_redraw();
 
         match event::read()? {
             // Key repeats and releases would otherwise apply an action several

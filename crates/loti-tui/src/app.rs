@@ -58,6 +58,11 @@ pub struct App {
     /// tell whether it grabbed the divider. `None` until the first frame.
     divider_column: Option<u16>,
     dragging_divider: bool,
+    /// Whether a frame is owed. The loop wakes on a tick and draws only when
+    /// this is set; every input event sets it before dispatch, so a handler that
+    /// forgets to ask costs a late timed repaint, never a stale reaction to the
+    /// reader's own keypress.
+    redraw: bool,
 }
 
 impl App {
@@ -78,6 +83,8 @@ impl App {
             modal: None,
             divider_column: None,
             dragging_divider: false,
+            // The opening frame is owed: the browser paints before any input.
+            redraw: true,
         })
     }
 
@@ -196,6 +203,17 @@ impl App {
     /// End any drag in progress.
     pub fn release(&mut self) {
         self.dragging_divider = false;
+    }
+
+    /// Ask for a frame. Requests coalesce: many between two wakeups draw once.
+    pub fn request_redraw(&mut self) {
+        self.redraw = true;
+    }
+
+    /// Whether a frame is owed, clearing the request. The loop's draw gate is
+    /// the only caller, so a request is honoured by exactly one frame.
+    pub fn take_redraw_request(&mut self) -> bool {
+        std::mem::take(&mut self.redraw)
     }
 
     /// Bring the preview in line with the highlighted row, rebuilding it when
@@ -375,6 +393,19 @@ mod tests {
         app.release();
         app.drag(20, 100);
         assert_eq!(app.nav_percent(), 60);
+    }
+
+    #[test]
+    fn a_redraw_request_is_owed_to_exactly_one_frame() {
+        let (_dir, mut app) = app();
+        // The opening frame is owed without anyone asking for it.
+        assert!(app.take_redraw_request());
+        assert!(!app.take_redraw_request());
+
+        app.request_redraw();
+        app.request_redraw();
+        assert!(app.take_redraw_request());
+        assert!(!app.take_redraw_request());
     }
 
     #[test]
