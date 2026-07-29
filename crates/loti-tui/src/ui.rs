@@ -3,7 +3,8 @@
 //! Layout invariant: the breadcrumb and the hint strip each take exactly one
 //! line, top and bottom, and the panes divide what is left. Zoom removes the
 //! navigation pane but keeps the breadcrumb, so the reader never loses track of
-//! where the previewed ticket sits.
+//! where the previewed ticket sits. A transient notice draws over the strip
+//! rather than beside or above it, so nothing under it ever moves.
 
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -62,10 +63,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!(" {}", hint_strip(area_text_width(chunks[2].width))),
-            Style::default().fg(theme.muted()),
-        ))),
+        Paragraph::new(Line::from(footer(app, chunks[2].width))),
         chunks[2],
     );
 
@@ -84,6 +82,28 @@ fn preview_wrap_width(pane_width: u16) -> u16 {
 /// The columns a full-width line may use, allowing for the one-column indent.
 fn area_text_width(width: u16) -> usize {
     width.saturating_sub(1) as usize
+}
+
+/// The bottom line: a live notice, or the hint strip.
+///
+/// A notice replaces the whole strip for its lifetime — one line, never wrapped,
+/// truncated if it does not fit — so the essential hints are hidden for those
+/// seconds and a notice's own wording has to carry the way out where that
+/// matters. It is painted in the notice colour, so it reads as a message rather
+/// than as one more binding.
+fn footer(app: &App, width: u16) -> Span<'static> {
+    let theme = app.theme();
+    let columns = area_text_width(width);
+    match app.flash_message() {
+        Some(message) => Span::styled(
+            format!(" {}", truncate(message, columns)),
+            Style::default().fg(theme.notice()),
+        ),
+        None => Span::styled(
+            format!(" {}", hint_strip(columns)),
+            Style::default().fg(theme.muted()),
+        ),
+    }
 }
 
 /// Build the hint strip for a width: as many hints as fit, whole, never a hint

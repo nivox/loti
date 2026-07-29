@@ -109,6 +109,12 @@ fn event_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
     // selecting text from the preview works again.
     let mut captured = true;
     loop {
+        // Every pass, not only the passes where the wait below timed out: that
+        // wait is re-armed by every event, so a timed notice checked there alone
+        // would overstay under a sustained stream of them. The sweep is what asks
+        // for the frame that brings the hint strip back.
+        app.expire_flash();
+
         if app.take_redraw_request() {
             terminal.draw(|f| ui::draw(f, &mut app))?;
         }
@@ -137,6 +143,10 @@ fn event_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
             // Key repeats and releases would otherwise apply an action several
             // times on the terminals that report them.
             Event::Key(key) if key.kind == KeyEventKind::Press => {
+                // Any key retires a live notice, bound or not: the reader has
+                // moved on, and a notice's lifetime is a maximum. Before
+                // dispatch, so a key that raises one of its own keeps it.
+                app.clear_flash();
                 if let Some(action) = keymap::action_for(key) {
                     if app.apply(action)? {
                         return Ok(());

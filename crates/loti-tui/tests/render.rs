@@ -185,6 +185,55 @@ fn an_empty_store_is_browsable_rather_than_an_error() {
     assert_eq!(app.nav().crumbs(), vec!["epics"]);
 }
 
+#[test]
+fn a_flash_replaces_the_hint_strip_and_moves_nothing_else() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store, Theme::with_color(false)).unwrap();
+    let (_t, hinted) = draw(&mut app);
+    app.flash("nothing to open here");
+    let (_t2, flashed) = draw(&mut app);
+
+    assert!(
+        flashed[23].contains("nothing to open here"),
+        "{:?}",
+        flashed[23]
+    );
+    // The whole strip goes, essential hints included: that cost is deliberate.
+    assert!(!flashed[23].contains("q quit"), "{:?}", flashed[23]);
+    // The layout invariant: breadcrumb and strip stay one line each, and nothing
+    // above the strip reflows.
+    assert_eq!(hinted[..23], flashed[..23]);
+}
+
+#[test]
+fn a_flash_too_wide_for_the_line_is_clipped_rather_than_wrapped() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store, Theme::with_color(false)).unwrap();
+    app.flash("a notice ".repeat(40));
+    let (_t, lines) = draw(&mut app);
+
+    assert!(lines[23].chars().count() <= 100, "{:?}", lines[23]);
+    assert!(lines[23].ends_with('…'), "{:?}", lines[23]);
+    // The line above is still the panes' bottom border, not spilled notice text.
+    assert!(!lines[22].contains("a notice"), "{:?}", lines[22]);
+}
+
+#[test]
+fn a_flash_is_not_painted_like_the_hints_it_covers() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store, Theme::with_color(true)).unwrap();
+    let (hinted, _) = draw(&mut app);
+    let hint_fg = hinted.backend().buffer()[(1, 23)].style().fg;
+    app.flash("a notice");
+    let (flashed, _) = draw(&mut app);
+    let flash_fg = flashed.backend().buffer()[(1, 23)].style().fg;
+
+    assert_ne!(
+        flash_fg, hint_fg,
+        "a notice in the hint colour reads as a binding"
+    );
+}
+
 /// A store whose epics cover every epic state: open, completed and closed.
 fn every_epic_state() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();

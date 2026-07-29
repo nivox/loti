@@ -5,6 +5,8 @@
 //! machine testable without a terminal, and means a future write path is an
 //! extra arm in [`App::apply`] rather than a change to the event loop.
 
+use std::time::{Duration, Instant};
+
 use anyhow::Result;
 use loti_core::store::Store;
 use ratatui_markdown::viewer::MarkdownViewer;
@@ -24,6 +26,22 @@ pub const MIN_NAV_PERCENT: u16 = 15;
 pub const MAX_NAV_PERCENT: u16 = 70;
 /// How much one resize keypress moves the divider.
 const RESIZE_STEP: u16 = 5;
+
+/// How long a flash stays up. A maximum rather than a minimum — any key press
+/// retires it early — and fixed rather than configurable, so the browser has one
+/// learnable behaviour instead of two defaults.
+const FLASH_LIFETIME: Duration = Duration::from_secs(5);
+
+/// A transient one-line notice, holding the hint strip's line until its deadline
+/// passes.
+///
+/// The deadline is wall-clock, not a count of wakeups: a notice raised just
+/// before the browser hands the terminal to an external editor is simply expired
+/// by the time the reader comes back.
+struct Flash {
+    message: String,
+    deadline: Instant,
+}
 
 /// An overlay that takes the keyboard while it is open. Only the key-binding
 /// overlay exists today; prompts and pickers a write path would need are the
@@ -63,6 +81,9 @@ pub struct App {
     /// forgets to ask costs a late timed repaint, never a stale reaction to the
     /// reader's own keypress.
     redraw: bool,
+    /// The live notice, if any. One at a time: the strip it draws over holds a
+    /// single line, so there is nothing a queue could show.
+    flash: Option<Flash>,
 }
 
 impl App {
@@ -85,6 +106,7 @@ impl App {
             dragging_divider: false,
             // The opening frame is owed: the browser paints before any input.
             redraw: true,
+            flash: None,
         })
     }
 
@@ -144,8 +166,15 @@ impl App {
             Action::CursorFirst => self.nav.cursor_first(),
             Action::CursorLast => self.nav.cursor_last(),
             Action::Descend => {
-                let store = &self.store;
-                self.nav.descend(|level| data::rows(store, level))?;
+                if self.nav.can_descend() {
+                    let store = &self.store;
+                    self.nav.descend(|level| data::rows(store, level))?;
+                } else {
+                    // Why nothing happened: the row has no level under it. The
+                    // absent child count says so too, but only to a reader who
+                    // was looking at that column.
+                    self.flash("nothing to open here");
+                }
             }
             Action::Ascend => self.nav.ascend(),
 
@@ -214,6 +243,66 @@ impl App {
     /// the only caller, so a request is honoured by exactly one frame.
     pub fn take_redraw_request(&mut self) -> bool {
         std::mem::take(&mut self.redraw)
+    }
+
+    /// Raise a notice on the hint strip's line, replacing any live one and
+    /// restarting its clock.
+    ///
+    /// The channel carries warnings and non-critical notices only — why nothing
+    /// happened, and what a write did. Anything the reader must act on is a
+    /// dialog instead, so the absence of a notice after an accepted surface says
+    /// nothing was written.
+    pub fn flash(&mut self, message: impl Into<String>) {
+        self.raise_flash(message.into(), Instant::now());
+    }
+
+    /// The live notice's message, or `None`. The deadline is honoured here as
+    /// well as swept between frames, so a frame drawn after it passed can never
+    /// show an expired notice whatever else did or did not run.
+    pub fn flash_message(&self) -> Option<&str> {
+        self.flash_at(Instant::now())
+    }
+
+    /// Retire a notice early. Every key press does this — the lifetime is a
+    /// maximum, not a minimum — before the key is dispatched, so a key that
+    /// raises a notice of its own still leaves that one standing.
+    pub fn clear_flash(&mut self) {
+        self.flash = None;
+    }
+
+    /// Drop a notice whose deadline has passed, asking for the frame that takes
+    /// it off the screen.
+    ///
+    /// Must run on every pass of the event loop, never only when the wait for
+    /// input timed out: that wait is re-armed by every event, so a sustained
+    /// stream of them — a divider drag, a held scroll — would otherwise keep a
+    /// notice on screen for as long as the reader keeps them coming.
+    pub fn expire_flash(&mut self) {
+        self.expire_flash_at(Instant::now());
+    }
+
+    fn raise_flash(&mut self, message: String, now: Instant) {
+        self.flash = Some(Flash {
+            message,
+            deadline: now + FLASH_LIFETIME,
+        });
+        // A notice raised outside the input path — by a timer, or by a future
+        // background reload — would otherwise sit unseen until the next event.
+        self.request_redraw();
+    }
+
+    fn flash_at(&self, now: Instant) -> Option<&str> {
+        self.flash
+            .as_ref()
+            .filter(|flash| now < flash.deadline)
+            .map(|flash| flash.message.as_str())
+    }
+
+    fn expire_flash_at(&mut self, now: Instant) {
+        if self.flash.is_some() && self.flash_at(now).is_none() {
+            self.flash = None;
+            self.request_redraw();
+        }
     }
 
     /// Bring the preview in line with the highlighted row, rebuilding it when
@@ -406,6 +495,75 @@ mod tests {
         app.request_redraw();
         assert!(app.take_redraw_request());
         assert!(!app.take_redraw_request());
+    }
+
+    #[test]
+    fn a_flash_lives_its_fixed_lifetime_and_then_goes() {
+        let (_dir, mut app) = app();
+        let raised = Instant::now();
+        app.raise_flash("something to say".into(), raised);
+        assert_eq!(app.flash_at(raised), Some("something to say"));
+        assert_eq!(
+            app.flash_at(raised + FLASH_LIFETIME - Duration::from_millis(1)),
+            Some("something to say")
+        );
+        assert_eq!(app.flash_at(raised + FLASH_LIFETIME), None);
+    }
+
+    #[test]
+    fn a_newer_flash_replaces_the_live_one_and_restarts_its_clock() {
+        let (_dir, mut app) = app();
+        let first = Instant::now();
+        let second = first + Duration::from_secs(4);
+        app.raise_flash("first".into(), first);
+        app.raise_flash("second".into(), second);
+        assert_eq!(app.flash_at(second), Some("second"));
+        // Past the first one's deadline, which the replacement discarded.
+        assert_eq!(app.flash_at(first + FLASH_LIFETIME), Some("second"));
+        assert_eq!(app.flash_at(second + FLASH_LIFETIME), None);
+    }
+
+    #[test]
+    fn clearing_retires_a_flash_before_its_deadline() {
+        let (_dir, mut app) = app();
+        let raised = Instant::now();
+        app.raise_flash("gone on the next key".into(), raised);
+        app.clear_flash();
+        assert_eq!(app.flash_at(raised), None);
+    }
+
+    #[test]
+    fn an_expired_flash_asks_for_the_frame_that_removes_it_exactly_once() {
+        let (_dir, mut app) = app();
+        let raised = Instant::now();
+        app.raise_flash("timed".into(), raised);
+        assert!(app.take_redraw_request(), "a raised flash owes a frame");
+
+        app.expire_flash_at(raised + Duration::from_secs(1));
+        assert!(!app.take_redraw_request(), "a live flash owes nothing");
+
+        app.expire_flash_at(raised + FLASH_LIFETIME);
+        assert!(app.take_redraw_request(), "the strip has to come back");
+
+        // The sweep is not a standing request: an empty strip is drawn once.
+        app.expire_flash_at(raised + FLASH_LIFETIME + Duration::from_secs(1));
+        assert!(!app.take_redraw_request());
+    }
+
+    #[test]
+    fn entering_a_row_with_nothing_under_it_says_why_nothing_happened() {
+        let (_dir, mut app) = app();
+        app.apply(Action::Descend).unwrap(); // into the epic
+        app.apply(Action::Descend).unwrap(); // into the ticket
+        assert_eq!(
+            app.flash_message(),
+            None,
+            "a level opened, so nothing to say"
+        );
+
+        app.apply(Action::Descend).unwrap(); // the subticket is a leaf
+        assert_eq!(app.flash_message(), Some("nothing to open here"));
+        assert_eq!(app.nav().crumbs().len(), 3, "the level must not have moved");
     }
 
     #[test]

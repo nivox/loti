@@ -73,6 +73,13 @@ impl Theme {
         }
     }
 
+    /// The colour of a transient notice on the hint strip's line. Never the
+    /// muted hint colour: a notice has to read as a message rather than as one
+    /// more binding.
+    pub fn notice(self) -> Color {
+        self.hue(Hue::Attention)
+    }
+
     /// The accent used for borders and the breadcrumb.
     pub fn accent(self) -> Color {
         if self.color {
@@ -249,6 +256,12 @@ mod tests {
         assert_eq!(theme.node_status("blocked"), theme.hue(Hue::Attention));
         assert_eq!(theme.node_status("done"), theme.hue(Hue::Resolved));
         assert_eq!(theme.epic_status("completed"), theme.hue(Hue::Resolved));
+    }
+
+    #[test]
+    fn a_notice_is_not_painted_like_a_hint() {
+        let theme = Theme::with_color(true);
+        assert_ne!(theme.notice(), theme.muted());
     }
 
     #[test]
