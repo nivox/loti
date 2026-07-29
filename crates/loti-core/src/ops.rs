@@ -1209,9 +1209,14 @@ pub fn descendants_of(store: &Store, node_ref: &NodeRef) -> Result<Vec<NodeStatu
 // existence-checked reads (mapping "not found" to a clean op error)
 // ---------------------------------------------------------------------------
 
+// These are the readers a caller composing a write goes through: an entity must
+// be read before it can be edited, and "it is gone" is an operation-level answer
+// rather than a path in an I/O message. The rule lives here once so no surface
+// restates it.
+
 /// Read an epic, mapping a missing file to [`OpError::NoSuchEpic`] rather than a
 /// raw I/O error.
-fn read_epic(store: &Store, epic_id: &str) -> Result<EpicFile, OpError> {
+pub fn read_epic(store: &Store, epic_id: &str) -> Result<EpicFile, OpError> {
     if !store.epic_path(epic_id).is_file() {
         return Err(OpError::NoSuchEpic(epic_id.to_string()));
     }
@@ -1219,7 +1224,7 @@ fn read_epic(store: &Store, epic_id: &str) -> Result<EpicFile, OpError> {
 }
 
 /// Read a node, mapping a missing file to [`OpError::NoSuchNode`].
-fn read_node(store: &Store, node_ref: &NodeRef) -> Result<NodeFile, OpError> {
+pub fn read_node(store: &Store, node_ref: &NodeRef) -> Result<NodeFile, OpError> {
     if !store
         .node_path(&node_ref.epic_id, node_ref.number)
         .is_file()

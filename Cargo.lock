@@ -576,6 +576,7 @@ version = "0.3.2-dev"
 dependencies = [
  "anyhow",
  "crossterm",
+ "jiff",
  "loti-core",
  "ratatui",
  "ratatui-markdown",

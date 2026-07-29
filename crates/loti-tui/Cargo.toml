@@ -9,6 +9,9 @@ publish.workspace = true
 [dependencies]
 loti-core.workspace = true
 anyhow.workspace = true
+# Only the core seam names a stamp type; it stays wrapped so no other module has
+# to know what a stamp is.
+jiff.workspace = true
 ratatui.workspace = true
 ratatui-markdown.workspace = true
 crossterm.workspace = true
