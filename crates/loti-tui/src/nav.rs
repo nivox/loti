@@ -216,30 +216,7 @@ fn crumb_for(row: &Row) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use loti_core::domain::NodeRef;
-
-    fn epic_row(id: &str, children: usize) -> Row {
-        Row {
-            selection: Selection::Epic(id.to_string()),
-            label: id.to_string(),
-            name: format!("the {id} epic"),
-            status: "open".to_string(),
-            children,
-        }
-    }
-
-    fn node_row(epic: &str, number: u64, children: usize) -> Row {
-        Row {
-            selection: Selection::Node(NodeRef {
-                epic_id: epic.to_string(),
-                number,
-            }),
-            label: number.to_string(),
-            name: format!("ticket {number}"),
-            status: "to-do".to_string(),
-            children,
-        }
-    }
+    use crate::data::fixture::{epic_row, node_row};
 
     /// Loader for a fixture store: epic `a` has nodes 1 (with child 5) and 2.
     fn load(level: &Level) -> Result<Vec<Row>, ()> {

@@ -360,64 +360,20 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::fixture::Fixture;
     use crate::theme::Theme;
 
-    /// A store with one epic, one ticket and one subticket.
-    pub(crate) fn fixture() -> (tempfile::TempDir, Store) {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join(".loti");
-        loti_core::store::init(dir.path(), &root).unwrap();
-        let store = Store::at(&root);
-        loti_core::ops::create_epic(
-            &store,
-            loti_core::ops::NewEpic {
-                epic_id: "feature".into(),
-                name: "A feature".into(),
-                summary: "Scope".into(),
-                body: String::new(),
-                labels: vec![],
-            },
-        )
-        .unwrap();
-        let parent = loti_core::ops::create_node(
-            &store,
-            loti_core::ops::NewNode {
-                epic_id: "feature".into(),
-                parent: None,
-                name: "Parent".into(),
-                summary: "s".into(),
-                body: String::new(),
-                labels: vec![],
-            },
-        )
-        .unwrap();
-        loti_core::ops::create_node(
-            &store,
-            loti_core::ops::NewNode {
-                epic_id: "feature".into(),
-                parent: Some(loti_core::domain::NodeRef {
-                    epic_id: "feature".into(),
-                    number: parent.frontmatter.number,
-                }),
-                name: "Child".into(),
-                summary: "s".into(),
-                body: String::new(),
-                labels: vec![],
-            },
-        )
-        .unwrap();
-        (dir, store)
-    }
-
-    fn app() -> (tempfile::TempDir, App) {
-        let (dir, store) = fixture();
-        let app = App::new(store, Theme::with_color(false)).unwrap();
-        (dir, app)
+    /// The browser on the shared fixture store. The fixture is returned with it
+    /// because the store is deleted when the fixture is dropped.
+    fn app() -> (Fixture, App) {
+        let fx = Fixture::build();
+        let app = App::new(fx.store.clone(), Theme::with_color(false)).unwrap();
+        (fx, app)
     }
 
     #[test]
     fn resizing_never_collapses_a_pane() {
-        let (_dir, mut app) = app();
+        let (_fx, mut app) = app();
         for _ in 0..20 {
             app.apply(Action::ShrinkNav).unwrap();
         }
@@ -432,7 +388,7 @@ mod tests {
 
     #[test]
     fn an_open_overlay_swallows_navigation_keys() {
-        let (_dir, mut app) = app();
+        let (_fx, mut app) = app();
         app.apply(Action::ToggleHelp).unwrap();
         app.apply(Action::Descend).unwrap();
         assert_eq!(app.nav().crumbs(), vec!["epics"]);
@@ -443,14 +399,14 @@ mod tests {
 
     #[test]
     fn quitting_works_even_with_an_overlay_open() {
-        let (_dir, mut app) = app();
+        let (_fx, mut app) = app();
         app.apply(Action::ToggleHelp).unwrap();
         assert!(app.apply(Action::Quit).unwrap());
     }
 
     #[test]
     fn zoom_keeps_the_motion_keys_off_the_hidden_cursor() {
-        let (_dir, mut app) = app();
+        let (_fx, mut app) = app();
         app.apply(Action::ToggleZoom).unwrap();
         app.apply(Action::CursorDown).unwrap();
         app.apply(Action::Descend).unwrap();
@@ -460,7 +416,7 @@ mod tests {
 
     #[test]
     fn descending_walks_epic_then_ticket_then_subticket() {
-        let (_dir, mut app) = app();
+        let (_fx, mut app) = app();
         app.apply(Action::Descend).unwrap(); // into the epic
         app.apply(Action::Descend).unwrap(); // into the ticket
         assert_eq!(app.nav().crumbs(), vec!["epics", "feature", "1 Parent"]);
@@ -471,7 +427,7 @@ mod tests {
 
     #[test]
     fn a_drag_only_moves_the_divider_when_it_grabbed_it() {
-        let (_dir, mut app) = app();
+        let (_fx, mut app) = app();
         app.set_divider_column(Some(30));
         assert!(!app.press(5));
         app.drag(60, 100);
@@ -486,7 +442,7 @@ mod tests {
 
     #[test]
     fn a_redraw_request_is_owed_to_exactly_one_frame() {
-        let (_dir, mut app) = app();
+        let (_fx, mut app) = app();
         // The opening frame is owed without anyone asking for it.
         assert!(app.take_redraw_request());
         assert!(!app.take_redraw_request());
@@ -499,7 +455,7 @@ mod tests {
 
     #[test]
     fn a_flash_lives_its_fixed_lifetime_and_then_goes() {
-        let (_dir, mut app) = app();
+        let (_fx, mut app) = app();
         let raised = Instant::now();
         app.raise_flash("something to say".into(), raised);
         assert_eq!(app.flash_at(raised), Some("something to say"));
@@ -512,7 +468,7 @@ mod tests {
 
     #[test]
     fn a_newer_flash_replaces_the_live_one_and_restarts_its_clock() {
-        let (_dir, mut app) = app();
+        let (_fx, mut app) = app();
         let first = Instant::now();
         let second = first + Duration::from_secs(4);
         app.raise_flash("first".into(), first);
@@ -525,7 +481,7 @@ mod tests {
 
     #[test]
     fn clearing_retires_a_flash_before_its_deadline() {
-        let (_dir, mut app) = app();
+        let (_fx, mut app) = app();
         let raised = Instant::now();
         app.raise_flash("gone on the next key".into(), raised);
         app.clear_flash();
@@ -534,7 +490,7 @@ mod tests {
 
     #[test]
     fn an_expired_flash_asks_for_the_frame_that_removes_it_exactly_once() {
-        let (_dir, mut app) = app();
+        let (_fx, mut app) = app();
         let raised = Instant::now();
         app.raise_flash("timed".into(), raised);
         assert!(app.take_redraw_request(), "a raised flash owes a frame");
@@ -552,7 +508,7 @@ mod tests {
 
     #[test]
     fn entering_a_row_with_nothing_under_it_says_why_nothing_happened() {
-        let (_dir, mut app) = app();
+        let (_fx, mut app) = app();
         app.apply(Action::Descend).unwrap(); // into the epic
         app.apply(Action::Descend).unwrap(); // into the ticket
         assert_eq!(
@@ -568,7 +524,7 @@ mod tests {
 
     #[test]
     fn the_preview_titles_itself_with_the_reference_it_shows() {
-        let (_dir, mut app) = app();
+        let (_fx, mut app) = app();
         app.sync_preview(60);
         assert_eq!(app.preview_title(), "feature");
         app.apply(Action::Descend).unwrap();

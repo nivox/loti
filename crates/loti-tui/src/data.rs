@@ -215,49 +215,231 @@ pub fn preview(store: &Store, selection: &Selection) -> Result<String> {
     Ok(render::show_markdown(&value, &children, &comments))
 }
 
+/// Test support for the whole crate: the one throwaway store its tests read,
+/// and the row builders for tests that need rows without a store.
+///
+/// It lives inside the core seam because building a store means calling
+/// `loti_core`, and the rule that this module is the only one naming `loti_core`
+/// holds for test code too — a fixture module of its own would break it.
+#[cfg(test)]
+pub(crate) mod fixture {
+    use loti_core::ops::{self, NewEpic, NewNode, Target};
+    use loti_core::Actor;
+
+    use super::*;
+
+    /// A store built for one test, with the references into it that a test needs
+    /// to name a target.
+    ///
+    /// The layout is the smallest one that reaches every level the browser has —
+    /// an epic, a ticket under it, a subticket under that — plus a sibling
+    /// ticket, which exists because a blocker has to be an entity of its own: no
+    /// node may block itself, and a subticket blocking its own parent is not a
+    /// shape any workflow produces.
+    ///
+    /// Meta sits on the epic and on `node`: labels, one comment, one asset, and
+    /// `blocked-by` on the node. `subnode` deliberately carries none, so a test
+    /// that needs an entity with every collection empty has one.
+    pub(crate) struct Fixture {
+        /// The store lives under this directory; dropping it removes the store,
+        /// so a fixture has to outlive every read of it.
+        _dir: tempfile::TempDir,
+        /// The handle on the store, cloned when a surface has to own one.
+        pub(crate) store: Store,
+        /// The epic's id.
+        pub(crate) epic: String,
+        /// The top-level ticket, which has one subticket and carries meta.
+        pub(crate) node: NodeRef,
+        /// The subticket under `node`, a leaf with no meta.
+        pub(crate) subnode: NodeRef,
+        /// The sibling ticket `node` is blocked by; a leaf with no meta.
+        pub(crate) blocker: NodeRef,
+    }
+
+    impl Fixture {
+        /// Build the store. Every entity is created through the operation layer
+        /// rather than written as files, so a fixture can never hold a shape the
+        /// real write path would refuse.
+        pub(crate) fn build() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join(".loti");
+            loti_core::store::init(dir.path(), &root).unwrap();
+            let store = Store::at(&root);
+            let epic = "feature".to_string();
+
+            ops::create_epic(
+                &store,
+                NewEpic {
+                    epic_id: epic.clone(),
+                    name: "A feature".into(),
+                    summary: "Epic scope".into(),
+                    body: "epic body\n".into(),
+                    labels: vec![],
+                },
+            )
+            .unwrap();
+
+            let node = new_node(&store, &epic, None, "Parent", "node body\n");
+            let subnode = new_node(&store, &epic, Some(&node), "Child", "");
+            let blocker = new_node(&store, &epic, None, "Prerequisite", "");
+
+            add_meta(&store, Target::Epic(epic.clone()));
+            add_meta(&store, Target::Node(node.clone()));
+            ops::add_blocked_by(&store, &node, std::slice::from_ref(&blocker)).unwrap();
+
+            Self {
+                _dir: dir,
+                store,
+                epic,
+                node,
+                subnode,
+                blocker,
+            }
+        }
+
+        /// The epic as a selection, which is how a surface addresses it.
+        pub(crate) fn epic_selection(&self) -> Selection {
+            Selection::Epic(self.epic.clone())
+        }
+    }
+
+    fn new_node(
+        store: &Store,
+        epic: &str,
+        parent: Option<&NodeRef>,
+        name: &str,
+        body: &str,
+    ) -> NodeRef {
+        let node = ops::create_node(
+            store,
+            NewNode {
+                epic_id: epic.to_string(),
+                parent: parent.cloned(),
+                name: name.to_string(),
+                summary: format!("{name} scope"),
+                body: body.to_string(),
+                labels: vec![],
+            },
+        )
+        .unwrap();
+        NodeRef::new(epic, node.frontmatter.number)
+    }
+
+    /// The meta an editing surface can land on, on one target.
+    ///
+    /// The comment is authored by the human because the browser writes as the
+    /// human and nobody else: a comment attributed to an agent could not be
+    /// edited or deleted through the surface under test.
+    fn add_meta(store: &Store, target: Target) {
+        ops::add_labels(store, &target, &["ui".to_string(), "perf".to_string()]).unwrap();
+        ops::add_comment(store, &target, Actor::Human, "a remark\n".to_string()).unwrap();
+        ops::add_asset(store, &target, "sketch.txt", None, b"sketch\n").unwrap();
+    }
+
+    /// An epic row, for a test that exercises the navigation model without a
+    /// store behind it.
+    pub(crate) fn epic_row(id: &str, children: usize) -> Row {
+        Row {
+            selection: Selection::Epic(id.to_string()),
+            label: id.to_string(),
+            name: format!("the {id} epic"),
+            status: "open".to_string(),
+            children,
+        }
+    }
+
+    /// A node row; see [`epic_row`].
+    pub(crate) fn node_row(epic: &str, number: u64, children: usize) -> Row {
+        Row {
+            selection: Selection::Node(NodeRef::new(epic, number)),
+            label: number.to_string(),
+            name: format!("ticket {number}"),
+            status: "to-do".to_string(),
+            children,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::fixture::Fixture;
     use super::*;
-    use loti_core::ops::{self, EpicEdits, NewEpic, NewNode, NodeEdits};
+    use loti_core::ops::{self, EpicEdits, NodeEdits};
 
-    /// A store with one epic and one ticket in it.
-    fn fixture() -> (tempfile::TempDir, Store, NodeRef) {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join(".loti");
-        loti_core::store::init(dir.path(), &root).unwrap();
-        let store = Store::at(&root);
-        ops::create_epic(
-            &store,
-            NewEpic {
-                epic_id: "feature".into(),
-                name: "A feature".into(),
-                summary: "Epic scope".into(),
-                body: "epic body\n".into(),
-                labels: vec![],
-            },
-        )
-        .unwrap();
-        let node = ops::create_node(
-            &store,
-            NewNode {
-                epic_id: "feature".into(),
-                parent: None,
-                name: "A ticket".into(),
-                summary: "Ticket scope".into(),
-                body: "node body\n".into(),
-                labels: vec![],
-            },
-        )
-        .unwrap();
-        let node_ref = NodeRef::new("feature", node.frontmatter.number);
-        (dir, store, node_ref)
+    /// The fixture is a contract: every test module in the crate reads the shape
+    /// asserted here, so a drift in it has to fail once, here, rather than as an
+    /// unrelated assertion elsewhere.
+    #[test]
+    fn the_fixture_holds_an_epic_a_ticket_a_subticket_and_meta() {
+        let fx = Fixture::build();
+
+        let epics = rows(&fx.store, &Level::Epics).unwrap();
+        assert_eq!(
+            epics
+                .iter()
+                .map(|r| r.selection.clone())
+                .collect::<Vec<_>>(),
+            vec![fx.epic_selection()]
+        );
+
+        // The epic's own level lists its top-level tickets: the one under test
+        // and the one that blocks it.
+        let tickets = rows(&fx.store, &Level::Epic(fx.epic.clone())).unwrap();
+        assert_eq!(
+            tickets
+                .iter()
+                .map(|r| r.selection.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Selection::Node(fx.node.clone()),
+                Selection::Node(fx.blocker.clone())
+            ]
+        );
+        // Only the ticket with the subticket is enterable, which is what lets a
+        // test exercise both a level with something under it and a leaf.
+        assert_eq!((tickets[0].children, tickets[1].children), (1, 0));
+
+        let subtickets = rows(&fx.store, &Level::Node(fx.node.clone())).unwrap();
+        assert_eq!(
+            subtickets
+                .iter()
+                .map(|r| r.selection.clone())
+                .collect::<Vec<_>>(),
+            vec![Selection::Node(fx.subnode.clone())]
+        );
+
+        let node = fx
+            .store
+            .read_node(&fx.node.epic_id, fx.node.number)
+            .unwrap();
+        let epic = fx.store.read_epic(&fx.epic).unwrap();
+        for meta in [&epic.frontmatter.labels, &node.frontmatter.labels] {
+            assert!(meta.len() > 1, "a removal test needs more than one label");
+        }
+        assert_eq!(epic.frontmatter.comments.len(), 1);
+        assert_eq!(epic.frontmatter.assets.len(), 1);
+        assert_eq!(node.frontmatter.comments.len(), 1);
+        assert_eq!(node.frontmatter.assets.len(), 1);
+        assert_eq!(node.frontmatter.blocked_by, vec![fx.blocker.to_string()]);
+
+        // The subticket carries no meta at all, so a test that needs empty
+        // collections has an entity with them.
+        let subnode = fx
+            .store
+            .read_node(&fx.subnode.epic_id, fx.subnode.number)
+            .unwrap();
+        assert!(subnode.frontmatter.labels.is_empty());
+        assert!(subnode.frontmatter.comments.is_empty());
+        assert!(subnode.frontmatter.assets.is_empty());
+        assert!(subnode.frontmatter.blocked_by.is_empty());
     }
 
     #[test]
     fn an_epic_target_carries_its_stored_fields_and_stamp() {
-        let (_d, store, _) = fixture();
-        let target = edit_target(&store, &Selection::Epic("feature".into())).unwrap();
-        let stored = store.read_epic("feature").unwrap();
+        let fx = Fixture::build();
+        let store = &fx.store;
+        let target = edit_target(store, &fx.epic_selection()).unwrap();
+        let stored = store.read_epic(&fx.epic).unwrap();
         assert_eq!(target.name, stored.frontmatter.name);
         assert_eq!(target.summary, stored.frontmatter.summary);
         assert_eq!(target.body, stored.body);
@@ -266,8 +448,9 @@ mod tests {
 
     #[test]
     fn a_node_target_carries_its_stored_fields_and_stamp() {
-        let (_d, store, r) = fixture();
-        let target = edit_target(&store, &Selection::Node(r.clone())).unwrap();
+        let fx = Fixture::build();
+        let (store, r) = (&fx.store, &fx.node);
+        let target = edit_target(store, &Selection::Node(r.clone())).unwrap();
         let stored = store.read_node(&r.epic_id, r.number).unwrap();
         assert_eq!(target.name, stored.frontmatter.name);
         assert_eq!(target.summary, stored.frontmatter.summary);
@@ -277,14 +460,15 @@ mod tests {
 
     #[test]
     fn a_target_is_re_read_so_a_change_since_the_last_listing_is_already_in_it() {
-        let (_d, store, r) = fixture();
-        let before = edit_target(&store, &Selection::Node(r.clone())).unwrap();
+        let fx = Fixture::build();
+        let (store, r) = (&fx.store, &fx.node);
+        let before = edit_target(store, &Selection::Node(r.clone())).unwrap();
 
         // Someone else's write between two reads: the second read must show it,
         // which is why an editing surface re-reads instead of trusting a preview.
         ops::edit_node(
-            &store,
-            &r,
+            store,
+            r,
             NodeEdits {
                 body: Some("theirs\n".into()),
                 ..Default::default()
@@ -292,21 +476,21 @@ mod tests {
         )
         .unwrap();
 
-        let after = edit_target(&store, &Selection::Node(r)).unwrap();
+        let after = edit_target(store, &Selection::Node(r.clone())).unwrap();
         assert_eq!(after.body, "theirs\n");
         assert_ne!(after.stamp, before.stamp);
     }
 
     #[test]
     fn the_stamp_of_an_epic_target_is_the_one_a_precondition_accepts() {
-        let (_d, store, _) = fixture();
-        let selection = Selection::Epic("feature".into());
-        let target = edit_target(&store, &selection).unwrap();
+        let fx = Fixture::build();
+        let store = &fx.store;
+        let target = edit_target(store, &fx.epic_selection()).unwrap();
 
         // Nothing changed since the read, so the write the stamp guards applies.
         ops::edit_epic(
-            &store,
-            "feature",
+            store,
+            &fx.epic,
             EpicEdits {
                 body: Some("mine\n".into()),
                 expect_updated: Some(target.stamp.0),
@@ -314,13 +498,13 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(store.read_epic("feature").unwrap().body, "mine\n");
+        assert_eq!(store.read_epic(&fx.epic).unwrap().body, "mine\n");
 
         // The write bumped the stamp, so the one read before it is now stale and
         // the same precondition refuses.
         assert!(ops::edit_epic(
-            &store,
-            "feature",
+            store,
+            &fx.epic,
             EpicEdits {
                 body: Some("again\n".into()),
                 expect_updated: Some(target.stamp.0),
@@ -328,17 +512,18 @@ mod tests {
             },
         )
         .is_err());
-        assert_eq!(store.read_epic("feature").unwrap().body, "mine\n");
+        assert_eq!(store.read_epic(&fx.epic).unwrap().body, "mine\n");
     }
 
     #[test]
     fn the_stamp_of_a_node_target_is_the_one_a_precondition_accepts() {
-        let (_d, store, r) = fixture();
-        let target = edit_target(&store, &Selection::Node(r.clone())).unwrap();
+        let fx = Fixture::build();
+        let (store, r) = (&fx.store, &fx.node);
+        let target = edit_target(store, &Selection::Node(r.clone())).unwrap();
 
         ops::edit_node(
-            &store,
-            &r,
+            store,
+            r,
             NodeEdits {
                 body: Some("mine\n".into()),
                 expect_updated: Some(target.stamp.0),
@@ -352,8 +537,8 @@ mod tests {
         );
 
         assert!(ops::edit_node(
-            &store,
-            &r,
+            store,
+            r,
             NodeEdits {
                 body: Some("again\n".into()),
                 expect_updated: Some(target.stamp.0),
@@ -369,9 +554,10 @@ mod tests {
 
     #[test]
     fn a_target_that_is_gone_names_it_rather_than_a_path() {
-        let (_d, store, r) = fixture();
+        let fx = Fixture::build();
+        let (store, r) = (&fx.store, &fx.node);
         std::fs::remove_file(store.node_path(&r.epic_id, r.number)).unwrap();
-        let err = edit_target(&store, &Selection::Node(r.clone()))
+        let err = edit_target(store, &Selection::Node(r.clone()))
             .unwrap_err()
             .to_string();
         // The reference alone is not evidence: a raw I/O error quotes the file
