@@ -466,7 +466,10 @@ fn is_node_value(value: &Value) -> bool {
     value.get("ref").is_some()
 }
 
-/// A direct-children row for the markdown table: reference, name, status.
+/// A direct-children row: reference, name, status, plus who holds the child's
+/// claim. The markdown children table renders the first three; the holder is
+/// there so a surface drawing one level can mark the claimed rows without
+/// reading every child.
 #[derive(Debug, Clone)]
 pub struct ChildRow {
     /// The child's `<epic-id>/<n>` reference.
@@ -475,6 +478,10 @@ pub struct ChildRow {
     pub name: String,
     /// Its state's wire name.
     pub status: String,
+    /// Who holds the child's single-holder claim; absent exactly when the child
+    /// is unclaimed. Only the holder travels with the row — when the claim was
+    /// taken belongs to the whole-entity view.
+    pub claimed_by: Option<String>,
 }
 
 /// Render `show --markdown` (the default, viewer-friendly form): everything in
@@ -1250,6 +1257,7 @@ mod tests {
             reference: "e/2".into(),
             name: "child".into(),
             status: "to-do".into(),
+            claimed_by: Some("agent:builder".into()),
         }];
         let comments = vec![CommentLine::Live {
             id: 1,
@@ -1277,6 +1285,11 @@ mod tests {
         }
         assert!(md.contains("e/2"));
         assert!(md.contains("the body"));
+        // The children table is ref/name/status only: a child's holder never
+        // reaches the rendered document, claimed or not.
+        assert!(md.contains("| ref | name | status |"));
+        assert!(md.contains("| e/2 | child | to-do |"));
+        assert!(!md.contains("agent:builder"));
     }
 
     // -- list --------------------------------------------------------------

@@ -35,7 +35,8 @@ pub fn epic_json(store: &Store, epic_id: &str) -> Result<Value, OpError> {
     Ok(render::epic_to_json(&epic, &statuses))
 }
 
-/// The direct children of a node, as markdown-table rows in ascending order.
+/// The direct children of a node, as rows in ascending order, each carrying its
+/// holder when claimed.
 pub fn node_children(store: &Store, node_ref: &NodeRef) -> Result<Vec<ChildRow>, OpError> {
     let nodes = load_epic_nodes(store, &node_ref.epic_id)?;
     let mut rows: Vec<(u64, ChildRow)> = nodes
@@ -47,7 +48,8 @@ pub fn node_children(store: &Store, node_ref: &NodeRef) -> Result<Vec<ChildRow>,
     Ok(rows.into_iter().map(|(_, r)| r).collect())
 }
 
-/// The top-level nodes of an epic (those with no parent), as table rows.
+/// The top-level nodes of an epic (those with no parent), as rows, each
+/// carrying its holder when claimed.
 pub fn epic_children(store: &Store, epic_id: &str) -> Result<Vec<ChildRow>, OpError> {
     let nodes = load_epic_nodes(store, epic_id)?;
     let mut rows: Vec<(u64, ChildRow)> = nodes
@@ -337,6 +339,9 @@ fn child_row(epic_id: &str, n: &NodeFile) -> ChildRow {
         reference: format!("{}/{}", epic_id, n.frontmatter.number),
         name: n.frontmatter.name.clone(),
         status: n.frontmatter.status.wire_name().to_string(),
+        // The holder alone identifies a claim for a listing: an unclaimed child
+        // carries none, so presence in the row is exactly "this child is claimed".
+        claimed_by: n.frontmatter.claim.as_ref().map(|c| c.by.clone()),
     }
 }
 
@@ -422,7 +427,8 @@ mod tests {
     use super::*;
     use crate::lock::LockConfig;
     use crate::ops::{
-        create_epic, create_node, set_node_status, NewEpic, NewNode, NodeStatusChange,
+        create_epic, create_node, release_claim, set_node_status, take_claim, NewEpic, NewNode,
+        NodeStatusChange,
     };
     use std::time::Duration;
 
@@ -581,6 +587,49 @@ mod tests {
         let node_kids = node_children(&s, &ar).unwrap();
         assert_eq!(node_kids.len(), 1);
         assert_eq!(node_kids[0].name, "b");
+    }
+
+    #[test]
+    fn children_rows_carry_the_holder_only_when_claimed() {
+        // A level mixes claimed and unclaimed children, and the row says which is
+        // which without anyone reading the children themselves.
+        let (_d, s) = seeded();
+        create_epic(&s, new_epic("e")).unwrap();
+        let a = create_node(&s, new_node("e", None, "a")).unwrap();
+        let ar = NodeRef::new("e", a.frontmatter.number);
+        create_node(&s, new_node("e", None, "b")).unwrap();
+        take_claim(&s, &ar, "agent:builder").unwrap();
+
+        let rows = epic_children(&s, "e").unwrap();
+        assert_eq!(rows.len(), 2);
+        let claimed = rows.iter().find(|r| r.name == "a").expect("node a");
+        assert_eq!(claimed.claimed_by.as_deref(), Some("agent:builder"));
+        let unclaimed = rows.iter().find(|r| r.name == "b").expect("node b");
+        assert_eq!(unclaimed.claimed_by, None);
+    }
+
+    #[test]
+    fn node_children_rows_carry_the_holder_and_drop_it_on_release() {
+        // The same rule one level down, and releasing empties the row's holder:
+        // the row never keeps a stale claim.
+        let (_d, s) = seeded();
+        create_epic(&s, new_epic("e")).unwrap();
+        let parent = create_node(&s, new_node("e", None, "parent")).unwrap();
+        let pr = NodeRef::new("e", parent.frontmatter.number);
+        let kid = create_node(&s, new_node("e", Some(pr.clone()), "kid")).unwrap();
+        let kr = NodeRef::new("e", kid.frontmatter.number);
+        create_node(&s, new_node("e", Some(pr.clone()), "other kid")).unwrap();
+        take_claim(&s, &kr, "alice@example.com").unwrap();
+
+        let rows = node_children(&s, &pr).unwrap();
+        let claimed = rows.iter().find(|r| r.name == "kid").expect("the kid");
+        assert_eq!(claimed.claimed_by.as_deref(), Some("alice@example.com"));
+        let other = rows.iter().find(|r| r.name == "other kid").expect("other");
+        assert_eq!(other.claimed_by, None);
+
+        release_claim(&s, &kr).unwrap();
+        let rows = node_children(&s, &pr).unwrap();
+        assert!(rows.iter().all(|r| r.claimed_by.is_none()));
     }
 
     #[test]
