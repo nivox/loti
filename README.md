@@ -112,6 +112,17 @@ website-redesign/2 Design new layout (to-do)
 Every read supports `--json` (the canonical form) so scripts and tools can
 consume it. Run `loti --help-full` for the complete, annotated command surface.
 
+**7. Browse it full-screen:**
+
+```sh
+loti tui                              # a two-pane browser: navigate left, read right
+```
+
+Epics are the top level; `Enter` opens an epic's tickets, then a ticket's
+subtickets, with a breadcrumb showing where you are and a preview pane rendering
+the same document `loti ticket show` prints (tables, code blocks and mermaid
+diagrams included). Press `?` for the keys. See [`docs/tui.md`](docs/tui.md).
+
 ## Using loti with AI agents
 
 `loti` ships its own agent instructions. Running `loti skill` prints a static,

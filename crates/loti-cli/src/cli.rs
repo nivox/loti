@@ -64,6 +64,10 @@ pub enum Command {
     /// Print the static, hand-authored SKILL.md verbatim.
     Skill,
 
+    /// Browse epics and tickets in a full-screen terminal interface. Needs an
+    /// interactive terminal; press ? inside it for the keys.
+    Tui,
+
     /// Align an older on-disk store format to this binary.
     MigrateStore(MigrateStoreArgs),
 }

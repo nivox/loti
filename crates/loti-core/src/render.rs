@@ -1079,23 +1079,65 @@ fn blocked_style() -> anstyle::Style {
 }
 
 fn status_style(status: &str) -> anstyle::Style {
-    let color = match status {
-        "done" => anstyle::AnsiColor::Green,
-        "closed" => anstyle::AnsiColor::BrightBlack,
-        "blocked" => anstyle::AnsiColor::Yellow,
-        "in-progress" => anstyle::AnsiColor::Cyan,
-        _ => anstyle::AnsiColor::White,
+    hue_style(node_status_hue(status))
+}
+
+fn epic_status_style(state: &str) -> anstyle::Style {
+    hue_style(epic_status_hue(state))
+}
+
+fn hue_style(hue: Hue) -> anstyle::Style {
+    let color = match hue {
+        Hue::Resolved => anstyle::AnsiColor::Green,
+        Hue::Abandoned => anstyle::AnsiColor::BrightBlack,
+        Hue::Attention => anstyle::AnsiColor::Yellow,
+        Hue::Active => anstyle::AnsiColor::Cyan,
+        Hue::Pending => anstyle::AnsiColor::White,
     };
     anstyle::Style::new().fg_color(Some(color.into()))
 }
 
-fn epic_status_style(state: &str) -> anstyle::Style {
-    let color = match state {
-        "completed" => anstyle::AnsiColor::Green,
-        "closed" => anstyle::AnsiColor::BrightBlack,
-        _ => anstyle::AnsiColor::Cyan,
-    };
-    anstyle::Style::new().fg_color(Some(color.into()))
+/// The terminal-neutral hue a status is painted in — the single definition of
+/// loti's status palette, shared by every surface. Each surface maps a hue to
+/// its own colour type (ANSI for the plain text forms, a widget colour for a
+/// full-screen UI) so no surface restates which status is which colour and two
+/// views of the same store can never disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hue {
+    /// Work not started.
+    Pending,
+    /// Work under way.
+    Active,
+    /// Work that needs a human's attention before it can move.
+    Attention,
+    /// Work delivered successfully.
+    Resolved,
+    /// Work resolved without being completed.
+    Abandoned,
+}
+
+/// The hue for a node status in its wire form (`to-do`, `in-progress`,
+/// `blocked`, `done`, `closed`). An unknown status reads as pending rather than
+/// failing: a palette lookup never gates a read.
+pub fn node_status_hue(status: &str) -> Hue {
+    match status {
+        "done" => Hue::Resolved,
+        "closed" => Hue::Abandoned,
+        "blocked" => Hue::Attention,
+        "in-progress" => Hue::Active,
+        _ => Hue::Pending,
+    }
+}
+
+/// The hue for an epic state in its wire form (`open`, `completed`, `closed`).
+/// An epic is never "pending": an epic with no tickets is open, which is the
+/// active hue.
+pub fn epic_status_hue(state: &str) -> Hue {
+    match state {
+        "completed" => Hue::Resolved,
+        "closed" => Hue::Abandoned,
+        _ => Hue::Active,
+    }
 }
 
 #[cfg(test)]

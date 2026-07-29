@@ -53,6 +53,10 @@ pub fn run<R: Read, O: Write, E: Write>(
             write!(out, "{}", crate::skill::SKILL)?;
             Ok(())
         }
+        // The browser owns the screen for its whole run, so it takes neither
+        // the stdin payload helper nor the output sinks: it resolves the store
+        // itself and prints nothing to them.
+        Command::Tui => loti_tui::run(cli.root.as_deref()),
         Command::MigrateStore(a) => run_migrate_store(cli, a, out, err),
         Command::Epic(epic) => run_epic(
             cli,

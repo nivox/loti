@@ -14,7 +14,7 @@ document assumes that model.
 
 - **Grammar: noun-verb.** Nouns: `epic`, `ticket` (a subticket is
   `ticket create <epic-id> --parent <ref>`), plus top-level `init`, `skill`,
-  `migrate-store`. Collections nest a third level (`ticket comment add`).
+  `tui`, `migrate-store`. Collections nest a third level (`ticket comment add`).
 - **Operations grouped by nature:** `edit` = plain scalar fields
   (`name`/`summary`/`body`/`parent`); `status` = the state machine (**set-only**;
   read via `show`); `claim` = the node-only single-holder claim
@@ -41,7 +41,7 @@ document assumes that model.
   to the wrong node.
 
 ```
-loti [--root <path>] <init|epic|ticket|skill|migrate-store> ...
+loti [--root <path>] <init|epic|ticket|skill|tui|migrate-store> ...
 
 loti init [<dir>]        # default container: .loti/ here (no pointer). --root or
                          # the positional <dir> (equivalent, mutually exclusive)
@@ -89,6 +89,8 @@ loti <e|t> asset delete <ref> <name>                                 # hard
 loti <e|t> asset list   <ref>
 
 loti skill              # prints the static SKILL.md (see The `skill` subcommand & help)
+loti tui                # full-screen browser for epics and tickets; requires an
+                        #   interactive terminal (see docs/tui.md for the keys)
 ```
 
 - **`ticket list` requires a scope** — `<epic-id>` (whole epic) or `<epic-id>/<n>`
@@ -128,6 +130,10 @@ loti skill              # prints the static SKILL.md (see The `skill` subcommand
   are `show`-only.
 - **Colour.** Default plain-text `list` MAY use ANSI colour on a TTY, auto-stripped
   when piped. `--raw`/`--json`/`--ndjson`/`--markdown` are never coloured.
+- **One status palette (MUST).** Which colour a status is painted in is defined
+  once and shared by every surface that paints one, so two views of the same
+  store cannot disagree about a state's colour. A surface maps that palette onto
+  its own colour type; it MUST NOT restate the status-to-colour mapping.
 - **Actor format** in output: `human` / `agent:<name>`. Deleted comments hidden by
   default; shown as an author+timestamp **tombstone** (text withheld) under
   `--include-deleted`.
@@ -207,3 +213,22 @@ loti skill              # prints the static SKILL.md (see The `skill` subcommand
 - **SKILL.md structure (7 sections):** frontmatter → what/when → the hard rule
   (prominent) → distilled core concepts (self-contained, no external glossary) →
   lifecycle/workflow → gotchas → `--help-full` handoff.
+
+---
+
+## 5. The `tui` subcommand
+
+- **`loti tui` is a full-screen browser** for the store's epics and tickets: a
+  navigation pane over the epic/ticket hierarchy beside a preview pane, with a
+  breadcrumb naming the path to the level on screen.
+- **It requires an interactive terminal (MUST).** With output not attached to a
+  terminal it MUST refuse with a plain message and a non-zero exit rather than
+  emitting anything, since it has no non-interactive rendering.
+- **Preconditions are checked before the screen is taken over.** Store discovery
+  (including `--root`) and the format-version check behave exactly as for any
+  other command, and a refusal MUST leave the terminal untouched.
+- **The preview shows a `show` document.** What the preview renders for an epic
+  or a node is the markdown `show` produces for it, so the browser presents no
+  document shape of its own.
+- **The key bindings are not normative** — they are documented in
+  [`../tui.md`](../tui.md) and listed by the browser's own help overlay.

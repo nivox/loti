@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/loti-core",
     "crates/loti-cli",
+    "crates/loti-tui",
 ]
 
 [workspace.package]
@@ -18,6 +19,7 @@ publish = false
 
 [workspace.dependencies]
 loti-core = { path = "crates/loti-core" }
+loti-tui = { path = "crates/loti-tui" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 thiserror = "2"
@@ -30,6 +32,11 @@ regex = "1"
 tempfile = "3"
 anstream = "0.6"
 anstyle = "1"
+# The full-screen surface. ratatui-markdown pins ratatui 0.29, which in turn
+# fixes the crossterm line; keep all three in step when bumping any of them.
+ratatui = "0.29"
+ratatui-markdown = "0.3"
+crossterm = "0.28"
 assert_cmd = "2"
 
 # Single static binary: optimize for size, strip, LTO (SPEC §8 goal).

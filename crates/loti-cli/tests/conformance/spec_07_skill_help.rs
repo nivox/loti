@@ -72,10 +72,23 @@ fn help_full_covers_the_whole_surface() {
         "list",
         "init",
         "skill",
+        "tui",
         "migrate-store",
     ] {
         assert!(text.contains(needle), "--help-full missing '{needle}'");
     }
+}
+
+#[test]
+fn tui_is_part_of_the_surface_and_says_it_needs_a_terminal() {
+    // The browser is a top-level command like any other, and its help states the
+    // one precondition a caller cannot discover from the grammar: it takes over
+    // an interactive terminal, so it cannot be piped or scripted.
+    let text = stdout_of(&["tui", "--help"]).to_lowercase();
+    assert!(
+        text.contains("terminal"),
+        "`tui --help` must state that it needs an interactive terminal:\n{text}"
+    );
 }
 
 #[test]

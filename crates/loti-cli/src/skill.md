@@ -293,6 +293,10 @@ loti ticket asset show <ref> <name>                      # bytes → stdout
 Epic and ticket share the same collection verbs (`comment`, `label`, `asset`)
 with identical flags — swap the noun and the reference.
 
+**`loti tui` is not for you.** It opens a full-screen browser of the epics and
+tickets for the human to read; it takes over an interactive terminal and only
+exits on a keypress. Never invoke it — read with `show` and `list` instead.
+
 ## The whole command surface
 
 When you need a command not on the cheat-sheet, or its full flag list, use the
