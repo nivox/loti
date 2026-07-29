@@ -312,6 +312,9 @@ fn run_epic<R: Read, O: Write, E: Write>(
                     name: a.name.clone(),
                     summary: a.summary.clone(),
                     body,
+                    // No expected stamp: a one-shot command composes and commits
+                    // in one act, so there is no held buffer to guard.
+                    expect_updated: None,
                 },
             )?;
             // Echo the name so a mistyped id/ref is caught by eye, not silently
@@ -408,6 +411,8 @@ fn run_ticket<R: Read, O: Write, E: Write>(
                     summary: a.summary.clone(),
                     parent,
                     body,
+                    // No expected stamp, for the same reason as an epic edit.
+                    expect_updated: None,
                 },
             )?;
             // Echo the name: refs are numeric, so a wrong-but-valid number would
@@ -689,7 +694,8 @@ fn run_comment<R: Read, O: Write, E: Write>(
             let target = target_of(kind, &a.reference)?;
             let actor = actor_of(&a.actor)?;
             let text = read_text(a.content.file.as_deref(), stdin, stdin_is_tty, true)?;
-            ops::edit_comment(&store, &target, a.comment_id, actor, text)?;
+            // No expected stamp: a one-shot command has no held buffer to guard.
+            ops::edit_comment(&store, &target, a.comment_id, actor, text, None)?;
             writeln!(out, "loti: edited comment #{}", a.comment_id)?;
         }
         CommentCommand::Delete(a) => {

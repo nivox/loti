@@ -261,6 +261,12 @@ pub struct EpicEdits {
     pub summary: Option<String>,
     /// Replacement body (already resolved from stdin/--file); `None` = leave.
     pub body: Option<String>,
+    /// Apply only while the epic's stored `updated` stamp still equals this one
+    /// — the opt-in guard against silently discarding a change made while the
+    /// replacement text was being composed. `None` applies unconditionally
+    /// (last write wins). It is a precondition, not a change, so a stamp alone
+    /// never makes an otherwise-empty edit write.
+    pub expect_updated: Option<Timestamp>,
 }
 
 impl EpicEdits {
@@ -284,7 +290,7 @@ pub fn edit_epic(store: &Store, epic_id: &str, edits: EpicEdits) -> Result<EpicF
             epic.body = body;
         }
         epic.frontmatter.updated = now();
-        store.write_epic(epic_id, &epic)?;
+        store.write_epic_expecting(epic_id, &epic, edits.expect_updated)?;
     }
     Ok(epic)
 }
@@ -300,6 +306,10 @@ pub struct NodeEdits {
     pub parent: Option<NodeRef>,
     /// Replacement body (already resolved from stdin/--file); `None` = leave.
     pub body: Option<String>,
+    /// Apply only while the node's stored `updated` stamp still equals this one;
+    /// `None` applies unconditionally (last write wins). As on an epic, it is a
+    /// precondition and never a change in its own right.
+    pub expect_updated: Option<Timestamp>,
 }
 
 impl NodeEdits {
@@ -335,7 +345,12 @@ pub fn edit_node(store: &Store, node_ref: &NodeRef, edits: NodeEdits) -> Result<
             node.body = body;
         }
         node.frontmatter.updated = now();
-        store.write_node(&node_ref.epic_id, node_ref.number, &node)?;
+        store.write_node_expecting(
+            &node_ref.epic_id,
+            node_ref.number,
+            &node,
+            edits.expect_updated,
+        )?;
     }
     Ok(node)
 }
@@ -816,7 +831,9 @@ pub fn add_comment(
     actor: Actor,
     text: String,
 ) -> Result<Comment, OpError> {
-    with_comments(store, target, |comments| {
+    // An append names no expected stamp: it adds a slot of its own, so a
+    // concurrent change cannot be discarded by it and both survive.
+    with_comments(store, target, None, |comments| {
         let comment = Comment {
             id: next_comment_id(comments),
             author: actor,
@@ -831,14 +848,22 @@ pub fn add_comment(
 
 /// Edit a comment's text — own author only, and not an already-deleted comment.
 /// Returns the edited comment.
+///
+/// The text is a whole-field replacement, so it takes the opt-in precondition:
+/// with `expect_updated` set the edit applies only while the target's stored
+/// `updated` stamp still equals it, and otherwise refuses with
+/// [`StoreError::Conflict`] having written nothing. `None` applies
+/// unconditionally (last write wins). The stamp covers the whole epic or node,
+/// not the one comment, so any concurrent change to the target refuses the edit.
 pub fn edit_comment(
     store: &Store,
     target: &Target,
     comment_id: u64,
     actor: Actor,
     text: String,
+    expect_updated: Option<Timestamp>,
 ) -> Result<Comment, OpError> {
-    with_comments(store, target, |comments| {
+    with_comments(store, target, expect_updated, |comments| {
         let slot = comments
             .iter_mut()
             .find(|c| c.id == comment_id)
@@ -858,7 +883,9 @@ pub fn delete_comment(
     comment_id: u64,
     actor: Actor,
 ) -> Result<Comment, OpError> {
-    with_comments(store, target, |comments| {
+    // A tombstone replaces no text of anyone's: it flags one slot, so it names
+    // no expected stamp either.
+    with_comments(store, target, None, |comments| {
         let slot = comments
             .iter_mut()
             .find(|c| c.id == comment_id)
@@ -917,10 +944,13 @@ pub fn list_comments(
 }
 
 /// Read a target's comment list, mutate it, write back (bumping `updated`), and
-/// return whatever the transform produced. Shared by add/edit/delete.
+/// return whatever the transform produced. Shared by add/edit/delete, so each
+/// takes the guarded path; `expect_updated` carries the caller's precondition
+/// (`None` = unconditional).
 fn with_comments<T>(
     store: &Store,
     target: &Target,
+    expect_updated: Option<Timestamp>,
     transform: impl FnOnce(&mut Vec<Comment>) -> Result<T, OpError>,
 ) -> Result<T, OpError> {
     match target {
@@ -928,14 +958,14 @@ fn with_comments<T>(
             let mut epic = read_epic(store, id)?;
             let out = transform(&mut epic.frontmatter.comments)?;
             epic.frontmatter.updated = now();
-            store.write_epic(id, &epic)?;
+            store.write_epic_expecting(id, &epic, expect_updated)?;
             Ok(out)
         }
         Target::Node(r) => {
             let mut node = read_node(store, r)?;
             let out = transform(&mut node.frontmatter.comments)?;
             node.frontmatter.updated = now();
-            store.write_node(&r.epic_id, r.number, &node)?;
+            store.write_node_expecting(&r.epic_id, r.number, &node, expect_updated)?;
             Ok(out)
         }
     }
@@ -1333,14 +1363,147 @@ mod tests {
             "e",
             EpicEdits {
                 name: Some("new name".into()),
-                summary: None,
                 body: Some("new body\n".into()),
+                ..Default::default()
             },
         )
         .unwrap();
         assert_eq!(edited.frontmatter.name, "new name");
         assert_eq!(edited.body, "new body\n");
         assert!(edited.frontmatter.updated >= created.frontmatter.updated);
+    }
+
+    // -- the opt-in `updated` precondition ---------------------------------
+
+    #[test]
+    fn an_epic_edit_naming_the_read_stamp_applies_and_a_stale_stamp_refuses() {
+        let (_d, s) = seeded();
+        let created = create_epic(&s, new_epic("e")).unwrap();
+
+        // The stamp read with the epic still stands, so the replacement applies.
+        let edited = edit_epic(
+            &s,
+            "e",
+            EpicEdits {
+                body: Some("mine\n".into()),
+                expect_updated: Some(created.frontmatter.updated),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(edited.body, "mine\n");
+
+        // An unrelated write to the same epic bumps `updated`, so the stamp taken
+        // before it is stale: the next replacement is refused, having written
+        // nothing. Granularity is the entity, not the field.
+        let stale = edited.frontmatter.updated;
+        add_labels(&s, &Target::Epic("e".into()), &["x".into()]).unwrap();
+        assert!(matches!(
+            edit_epic(
+                &s,
+                "e",
+                EpicEdits {
+                    body: Some("theirs\n".into()),
+                    expect_updated: Some(stale),
+                    ..Default::default()
+                },
+            ),
+            Err(OpError::Store(StoreError::Conflict { .. }))
+        ));
+        assert_eq!(s.read_epic("e").unwrap().body, "mine\n");
+
+        // Naming no stamp keeps last-write-wins.
+        edit_epic(
+            &s,
+            "e",
+            EpicEdits {
+                body: Some("theirs\n".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(s.read_epic("e").unwrap().body, "theirs\n");
+    }
+
+    #[test]
+    fn a_node_edit_naming_the_read_stamp_applies_and_a_stale_stamp_refuses() {
+        let (_d, s) = seeded();
+        create_epic(&s, new_epic("e")).unwrap();
+        let created = create_node(&s, new_node("e", None)).unwrap();
+        let r = NodeRef::new("e", created.frontmatter.number);
+
+        let edited = edit_node(
+            &s,
+            &r,
+            NodeEdits {
+                body: Some("mine\n".into()),
+                expect_updated: Some(created.frontmatter.updated),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(edited.body, "mine\n");
+
+        // A claim landing mid-edit is an unrelated change to the same node, and
+        // refuses the stamp taken before it.
+        let stale = edited.frontmatter.updated;
+        take_claim(&s, &r, "alice").unwrap();
+        assert!(matches!(
+            edit_node(
+                &s,
+                &r,
+                NodeEdits {
+                    body: Some("theirs\n".into()),
+                    expect_updated: Some(stale),
+                    ..Default::default()
+                },
+            ),
+            Err(OpError::Store(StoreError::Conflict { .. }))
+        ));
+        assert_eq!(s.read_node("e", r.number).unwrap().body, "mine\n");
+
+        edit_node(
+            &s,
+            &r,
+            NodeEdits {
+                body: Some("theirs\n".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(s.read_node("e", r.number).unwrap().body, "theirs\n");
+    }
+
+    #[test]
+    fn a_comment_edit_naming_the_read_stamp_applies_and_a_stale_stamp_refuses() {
+        let (_d, s) = seeded();
+        create_epic(&s, new_epic("e")).unwrap();
+        let target = Target::Epic("e".into());
+        let c = add_comment(&s, &target, Actor::Human, "first".into()).unwrap();
+
+        let stamp = s.read_epic("e").unwrap().frontmatter.updated;
+        let edited = edit_comment(
+            &s,
+            &target,
+            c.id,
+            Actor::Human,
+            "second".into(),
+            Some(stamp),
+        )
+        .unwrap();
+        assert_eq!(edited.text, "second");
+
+        // Another comment arriving is exactly the accepted cost: it bumps the
+        // epic's stamp, so the older one no longer applies.
+        add_comment(&s, &target, Actor::Human, "meanwhile".into()).unwrap();
+        assert!(matches!(
+            edit_comment(&s, &target, c.id, Actor::Human, "third".into(), Some(stamp)),
+            Err(OpError::Store(StoreError::Conflict { .. }))
+        ));
+
+        // Naming no stamp applies regardless.
+        let forced = edit_comment(&s, &target, c.id, Actor::Human, "third".into(), None).unwrap();
+        assert_eq!(forced.text, "third");
     }
 
     #[test]
@@ -1761,12 +1924,12 @@ mod tests {
 
         // A non-author cannot edit.
         assert!(matches!(
-            edit_comment(&s, &target, c.id, other.clone(), "nope".into()),
+            edit_comment(&s, &target, c.id, other.clone(), "nope".into(), None),
             Err(OpError::CommentAuth(domain::CommentAuthError::NotAuthor))
         ));
 
         // The author can edit.
-        let edited = edit_comment(&s, &target, c.id, bot.clone(), "hi again".into()).unwrap();
+        let edited = edit_comment(&s, &target, c.id, bot.clone(), "hi again".into(), None).unwrap();
         assert_eq!(edited.text, "hi again");
 
         // The author soft-deletes it.
@@ -1812,7 +1975,7 @@ mod tests {
         create_epic(&s, new_epic("e")).unwrap();
         let target = Target::Epic("e".into());
         assert!(matches!(
-            edit_comment(&s, &target, 42, Actor::Human, "x".into()),
+            edit_comment(&s, &target, 42, Actor::Human, "x".into(), None),
             Err(OpError::NoSuchComment(42))
         ));
     }
