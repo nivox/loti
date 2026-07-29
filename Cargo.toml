@@ -39,7 +39,11 @@ ratatui-markdown = "0.3"
 crossterm = "0.28"
 assert_cmd = "2"
 
-# Single static binary: optimize for size, strip, LTO (SPEC §8 goal).
+# A release is one self-contained executable, small enough to drop into a
+# checkout or a container: size wins over speed (opt-level "z", one codegen
+# unit, whole-program LTO, symbols stripped), and there is no unwinding — a
+# panic aborts, so anything that must run before the process dies has to be a
+# panic hook rather than a destructor.
 [profile.release]
 opt-level = "z"
 lto = true

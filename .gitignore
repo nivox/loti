@@ -7,3 +7,9 @@ target/
 # Nix build result symlinks
 /result
 /result-*
+
+# A store created in this checkout while trying the CLI or the browser out.
+# This project tracks its own work elsewhere, so a .loti/ here is always
+# scratch — and must never be committed as if it were project data.
+/.loti/
+/.loti.conf
