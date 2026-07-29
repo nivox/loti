@@ -175,6 +175,18 @@ impl Store {
         classify_read(self.observed_version(), FORMAT_VERSION.0)
     }
 
+    /// Verify the store may be *mutated*: the write-side twin of
+    /// [`Store::verify_readable`]. It consults the very gate every mutation is
+    /// bracketed by and refuses with the same reason that mutation would, so a
+    /// surface can ask up front instead of learning it from a failed write.
+    ///
+    /// The answer is a snapshot, never a licence: the store's version can change
+    /// between the question and the write, so a mutation still re-verifies the
+    /// gate while holding the lock.
+    pub fn verify_mutable(&self) -> Result<(), VersionRefusal> {
+        self.version_gate().verify()
+    }
+
     /// The directory holding one epic and its nodes.
     pub fn epic_dir(&self, epic_id: &str) -> PathBuf {
         self.root.join(epic_id)
@@ -1070,6 +1082,7 @@ mod tests {
         let (major, minor) = FORMAT_VERSION;
         let store = store_with_version(dir.path(), &format!("{major}.{minor}"));
         assert!(store.verify_readable().is_ok());
+        assert!(store.verify_mutable().is_ok());
         // A mutation succeeds at the equal version.
         let mut e = store.read_epic("my-epic").unwrap();
         e.frontmatter.name = "renamed".into();
@@ -1086,7 +1099,9 @@ mod tests {
             store.verify_readable(),
             Err(VersionRefusal::StoreTooNew)
         ));
-        // Writes are refused too.
+        // Writes are refused too, and asking up front gives the same reason as
+        // attempting the write.
+        assert_eq!(store.verify_mutable(), Err(VersionRefusal::StoreTooNew));
         assert!(matches!(
             store.write_epic("my-epic", &epic()),
             Err(StoreError::Version(VersionRefusal::StoreTooNew))
@@ -1107,7 +1122,9 @@ mod tests {
         // Reads are fine on an older major.
         assert!(store.verify_readable().is_ok());
         assert!(store.read_epic("my-epic").is_ok());
-        // Any mutation is refused, pointing at migrate-store.
+        // Any mutation is refused, pointing at migrate-store, and the up-front
+        // check says so before a write is attempted.
+        assert_eq!(store.verify_mutable(), Err(VersionRefusal::NeedsMigration));
         assert!(matches!(
             store.write_epic("my-epic", &epic()),
             Err(StoreError::Version(VersionRefusal::NeedsMigration))
@@ -1122,6 +1139,7 @@ mod tests {
         // reader handles any additive keys).
         let store = store_with_version(dir.path(), &format!("{major}.{}", minor + 1));
         assert!(store.verify_readable().is_ok());
+        assert!(store.verify_mutable().is_ok());
         assert!(store.write_epic("my-epic", &epic()).is_ok());
     }
 
@@ -1134,7 +1152,11 @@ mod tests {
         let store = store_with_version(dir.path(), &format!("{major}.{minor}-migrate"));
         // Reads remain allowed (the store is not too-new).
         assert!(store.verify_readable().is_ok());
-        // Every mutation is refused as mid-migration.
+        // Every mutation is refused as mid-migration, up-front check included.
+        assert_eq!(
+            store.verify_mutable(),
+            Err(VersionRefusal::MigrationInProgress)
+        );
         assert!(matches!(
             store.write_epic("my-epic", &epic()),
             Err(StoreError::Version(VersionRefusal::MigrationInProgress))
@@ -1145,6 +1167,7 @@ mod tests {
     fn unreadable_version_refuses_mutation() {
         let dir = tempfile::tempdir().unwrap();
         let store = store_with_version(dir.path(), "not-a-version");
+        assert_eq!(store.verify_mutable(), Err(VersionRefusal::Unreadable));
         assert!(matches!(
             store.write_epic("my-epic", &epic()),
             Err(StoreError::Version(VersionRefusal::Unreadable))
