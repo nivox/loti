@@ -361,6 +361,7 @@ impl App {
 mod tests {
     use super::*;
     use crate::data::fixture::Fixture;
+    use crate::data::RowKind;
     use crate::theme::Theme;
 
     /// The browser on the shared fixture store. The fixture is returned with it
@@ -369,6 +370,26 @@ mod tests {
         let fx = Fixture::build();
         let app = App::new(fx.store.clone(), Theme::with_color(false)).unwrap();
         (fx, app)
+    }
+
+    /// Put the cursor on the first row of the given kind on the level on screen.
+    fn to_row(app: &mut App, wanted: impl Fn(&RowKind) -> bool) {
+        let index = app
+            .nav()
+            .rows()
+            .iter()
+            .position(|r| wanted(&r.kind))
+            .expect("the level has such a row");
+        app.apply(Action::CursorFirst).unwrap();
+        for _ in 0..index {
+            app.apply(Action::CursorDown).unwrap();
+        }
+    }
+
+    /// Put the cursor on the first work row. Every epic and node level leads with
+    /// its collection rows, so reaching a ticket means walking past them.
+    fn to_work_row(app: &mut App) {
+        to_row(app, |kind| matches!(kind, RowKind::Work(_)));
     }
 
     #[test]
@@ -418,11 +439,42 @@ mod tests {
     fn descending_walks_epic_then_ticket_then_subticket() {
         let (_fx, mut app) = app();
         app.apply(Action::Descend).unwrap(); // into the epic
+        to_work_row(&mut app);
         app.apply(Action::Descend).unwrap(); // into the ticket
         assert_eq!(app.nav().crumbs(), vec!["epics", "feature", "1 Parent"]);
-        // The subticket is a leaf, so entering it does nothing.
+        // The subticket carries no meta and no subtickets of its own, and is
+        // still enterable: its collection rows are there whatever it holds.
+        to_work_row(&mut app);
+        app.apply(Action::Descend).unwrap();
+        assert_eq!(
+            app.nav().crumbs(),
+            vec!["epics", "feature", "1 Parent", "2 Child"]
+        );
+    }
+
+    #[test]
+    fn a_collection_is_a_level_of_its_own_and_the_breadcrumb_names_it() {
+        let (_fx, mut app) = app();
+        app.apply(Action::Descend).unwrap(); // into the epic
+        to_row(
+            &mut app,
+            |kind| matches!(kind, RowKind::Collection(c) if c.name() == "comments"),
+        );
+        app.apply(Action::Descend).unwrap();
+        assert_eq!(app.nav().crumbs(), vec!["epics", "feature", "comments"]);
+        assert!(app.nav().at_collection());
+
+        // A member is a leaf: it is read where it stands.
         app.apply(Action::Descend).unwrap();
         assert_eq!(app.nav().crumbs().len(), 3);
+        assert_eq!(app.flash_message(), Some("nothing to open here"));
+
+        // Leaving lands back on the row the level was entered from.
+        app.apply(Action::Ascend).unwrap();
+        assert_eq!(
+            app.nav().frame().current().map(|r| r.name.clone()),
+            Some("comments".to_string())
+        );
     }
 
     #[test]
@@ -510,6 +562,7 @@ mod tests {
     fn entering_a_row_with_nothing_under_it_says_why_nothing_happened() {
         let (_fx, mut app) = app();
         app.apply(Action::Descend).unwrap(); // into the epic
+        to_work_row(&mut app);
         app.apply(Action::Descend).unwrap(); // into the ticket
         assert_eq!(
             app.flash_message(),
@@ -517,9 +570,17 @@ mod tests {
             "a level opened, so nothing to say"
         );
 
-        app.apply(Action::Descend).unwrap(); // the subticket is a leaf
+        // An empty collection prints no count and has nothing to show.
+        to_work_row(&mut app);
+        app.apply(Action::Descend).unwrap(); // into the subticket, which has no meta
+        let depth = app.nav().crumbs().len();
+        app.apply(Action::Descend).unwrap();
         assert_eq!(app.flash_message(), Some("nothing to open here"));
-        assert_eq!(app.nav().crumbs().len(), 3, "the level must not have moved");
+        assert_eq!(
+            app.nav().crumbs().len(),
+            depth,
+            "the level must not have moved"
+        );
     }
 
     #[test]
@@ -528,7 +589,31 @@ mod tests {
         app.sync_preview(60);
         assert_eq!(app.preview_title(), "feature");
         app.apply(Action::Descend).unwrap();
+        to_work_row(&mut app);
         app.sync_preview(60);
         assert_eq!(app.preview_title(), "feature/1");
+    }
+
+    #[test]
+    fn a_collection_row_keeps_the_containers_document_in_the_pane() {
+        let (fx, mut app) = app();
+        app.apply(Action::Descend).unwrap(); // into the epic
+        app.sync_preview(60);
+        // The pane title names the container, because the container's document is
+        // what it shows: a collection has none of its own.
+        assert_eq!(app.preview_title(), "feature");
+
+        // And it does not change as the cursor moves down the collection rows,
+        // nor when it reaches the labels themselves.
+        to_row(
+            &mut app,
+            |kind| matches!(kind, RowKind::Collection(c) if c.name() == "labels"),
+        );
+        app.apply(Action::Descend).unwrap();
+        for _ in 0..app.nav().rows().len() {
+            app.sync_preview(60);
+            assert_eq!(app.preview_title(), fx.epic);
+            app.apply(Action::CursorDown).unwrap();
+        }
     }
 }

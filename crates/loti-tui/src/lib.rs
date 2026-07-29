@@ -4,6 +4,10 @@
 //! lists its tickets, entering a ticket lists its subtickets, and a preview pane
 //! shows the same document `loti epic show` / `loti ticket show` print.
 //!
+//! An epic's and a ticket's own meta — its labels, comments, dependencies and
+//! assets — are rows on that same level, so a comment or a blocker is reached by
+//! the same two keys as a subticket rather than by a vocabulary of its own.
+//!
 //! The crate owns the terminal and nothing else. Store access lives in
 //! [`data`], the position in [`nav`], the state machine in [`app`], and drawing
 //! in [`ui`], so none of those needs a terminal to be exercised.

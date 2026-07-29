@@ -6,17 +6,20 @@
 //! upstream release into a test failure without telling us anything about loti.
 
 use loti_core::domain::NodeRef;
-use loti_core::ops::{self, NewEpic, NewNode};
+use loti_core::ops::{self, NewEpic, NewNode, Target};
 use loti_core::store::{self, Store};
+use loti_core::Actor;
 use loti_tui::action::Action;
 use loti_tui::app::App;
+use loti_tui::data::RowKind;
 use loti_tui::theme::Theme;
 use loti_tui::ui;
 use ratatui::backend::TestBackend;
 use ratatui::style::{Color, Modifier};
 use ratatui::Terminal;
 
-/// A store with one epic, a ticket with a subticket, and a childless ticket.
+/// A store with one epic carrying meta, a ticket with a subticket, and a
+/// childless ticket.
 fn fixture() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join(".loti");
@@ -72,7 +75,27 @@ fn fixture() -> (tempfile::TempDir, Store) {
         },
     )
     .unwrap();
+    // Meta on the epic, so a drawn frame has a populated collection row to enter
+    // as well as empty ones.
+    let epic = Target::Epic("browser".into());
+    ops::add_labels(&store, &epic, &["ui".to_string()]).unwrap();
+    ops::add_comment(&store, &epic, Actor::Human, "a remark\n".to_string()).unwrap();
     (dir, store)
+}
+
+/// Put the cursor on the first work row of the level on screen. Every epic and
+/// node level leads with its collection rows.
+fn to_work_row(app: &mut App) {
+    let index = app
+        .nav()
+        .rows()
+        .iter()
+        .position(|r| matches!(r.kind, RowKind::Work(_)))
+        .expect("the level has a work row");
+    app.apply(Action::CursorFirst).unwrap();
+    for _ in 0..index {
+        app.apply(Action::CursorDown).unwrap();
+    }
 }
 
 /// The frame's lines as plain strings, top to bottom.
@@ -148,6 +171,7 @@ fn zoom_replaces_the_navigation_pane_but_keeps_the_breadcrumb() {
     let (_dir, store) = fixture();
     let mut app = App::new(store, Theme::with_color(false)).unwrap();
     app.apply(Action::Descend).unwrap();
+    to_work_row(&mut app);
     app.apply(Action::ToggleZoom).unwrap();
     let (_t, lines) = draw(&mut app);
 
@@ -157,6 +181,85 @@ fn zoom_replaces_the_navigation_pane_but_keeps_the_breadcrumb() {
         "the navigation pane should be gone while zoomed"
     );
     assert!(lines.iter().any(|l| l.contains("browser/1")));
+}
+
+#[test]
+fn a_level_leads_with_its_collections_and_a_rule_before_the_work() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store, Theme::with_color(false)).unwrap();
+    app.apply(Action::Descend).unwrap();
+    let width = nav_pane_width(&app);
+    let (terminal, _) = draw(&mut app);
+    // Bounded to the navigation pane's rows: the pane's own border is drawn with
+    // the same character the rule is, and the preview shares every line.
+    let all = nav_lines(&terminal, width);
+    let lines = &all[2..];
+
+    let at = |needle: &str| {
+        lines
+            .iter()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no line containing {needle:?} in {lines:#?}"))
+    };
+    // An epic has no dependency list, so it carries three collections.
+    assert!(at("labels") < at("comments"));
+    assert!(at("comments") < at("assets"));
+    // One rule separates structure from work, and the work is below it.
+    assert!(at("assets") < at("\u{2500}\u{2500}\u{2500}"));
+    assert!(at("\u{2500}\u{2500}\u{2500}") < at("Navigation pane"));
+
+    // A count is printed when the collection has members and blank when it has
+    // none — the same contract a child count follows.
+    let row = |needle: &str| lines[at(needle)].clone();
+    assert!(row("labels").contains("(1)"), "{:?}", row("labels"));
+    assert!(!row("assets").contains('('), "{:?}", row("assets"));
+}
+
+#[test]
+fn a_collection_row_has_no_glyph_so_a_glyph_means_work() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store, Theme::with_color(false)).unwrap();
+    app.apply(Action::Descend).unwrap();
+    let width = nav_pane_width(&app);
+    let (terminal, _) = draw(&mut app);
+
+    // A collection has no state, so inventing a glyph for it would claim one.
+    let comments = row_cells(&terminal, "comments", width);
+    assert_eq!(comments[0].0, " ");
+    let work = row_cells(&terminal, "Navigation pane", width);
+    assert_ne!(work[0].0, " ");
+}
+
+#[test]
+fn entering_a_collection_names_it_in_the_breadcrumb_and_dims_the_crumb() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store, Theme::with_color(true)).unwrap();
+    app.apply(Action::Descend).unwrap(); // into the epic
+    app.apply(Action::CursorDown).unwrap(); // onto `comments`
+    app.apply(Action::Descend).unwrap();
+    let width = nav_pane_width(&app);
+    let (terminal, lines) = draw(&mut app);
+
+    assert_eq!(lines[0].trim(), "epics › browser › comments");
+    // Bounded to the navigation pane: the author is in the preview pane's own
+    // metadata table on the same terminal lines, so a whole-line search would
+    // pass with the row empty.
+    let rows = nav_lines(&terminal, width);
+    assert!(
+        rows.iter().any(|l| l.contains("human")),
+        "expected the comment's author on its row: {rows:#?}"
+    );
+
+    // The deepest crumb is dim, like the row it was entered from; the path above
+    // it keeps the accent.
+    let buffer = terminal.backend().buffer();
+    let crumb = lines[0].find("comments").unwrap() as u16;
+    let path = lines[0].find("browser").unwrap() as u16;
+    assert_ne!(
+        buffer[(crumb, 0)].style().fg,
+        buffer[(path, 0)].style().fg,
+        "a collection crumb must not read as part of the work path"
+    );
 }
 
 #[test]
@@ -282,6 +385,21 @@ fn every_epic_state() -> (tempfile::TempDir, Store) {
 /// The width of the navigation pane in the 100-column test frame.
 fn nav_pane_width(app: &App) -> u16 {
     100 * app.nav_percent() / 100
+}
+
+/// The navigation pane's interior, line by line: the rows the cursor moves over,
+/// without the border or the preview pane's text from the same terminal line.
+fn nav_lines(terminal: &Terminal<TestBackend>, nav_width: u16) -> Vec<String> {
+    let buffer = terminal.backend().buffer();
+    (0..buffer.area.height)
+        .map(|y| {
+            (1..nav_width - 1)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect()
 }
 
 /// The styled cells of the navigation row containing `needle`.

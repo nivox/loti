@@ -13,12 +13,15 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 use crate::app::App;
-use crate::data::{Row, Selection};
+use crate::data::{Row, RowKind, Selection};
 use crate::keymap;
 use crate::theme::{glyph, Theme};
 
 /// The separator between breadcrumb entries.
 const CRUMB_SEPARATOR: &str = " › ";
+
+/// The rule drawn between a level's collection rows and its work rows.
+const STRUCTURE_RULE: &str = "─";
 
 /// Draw one frame.
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -137,14 +140,28 @@ fn hint_strip(width: usize) -> String {
 fn draw_breadcrumb(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let crumbs = app.nav().crumbs();
     let text = elide_left(&crumbs, area.width.saturating_sub(1) as usize);
+    let path = Style::default()
+        .fg(theme.accent())
+        .add_modifier(Modifier::BOLD);
+    // A collection is structure, not work, so its crumb is dimmed exactly as its
+    // row is. Elision drops from the left, so the deepest entry is the one that
+    // survives — and it is the one to style.
+    let spans = match app.nav().at_collection() {
+        true => match text.rsplit_once(CRUMB_SEPARATOR) {
+            Some((head, tail)) => vec![
+                Span::styled(format!(" {head}{CRUMB_SEPARATOR}"), path),
+                Span::styled(tail.to_string(), Style::default().fg(theme.muted())),
+            ],
+            // Elision kept nothing but the collection itself.
+            None => vec![Span::styled(
+                format!(" {text}"),
+                Style::default().fg(theme.muted()),
+            )],
+        },
+        false => vec![Span::styled(format!(" {text}"), path)],
+    };
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!(" {text}"),
-            Style::default()
-                .fg(theme.accent())
-                .add_modifier(Modifier::BOLD),
-        )))
-        .alignment(Alignment::Left),
+        Paragraph::new(Line::from(spans)).alignment(Alignment::Left),
         area,
     );
 }
@@ -192,19 +209,25 @@ fn draw_nav(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
             .map(|r| count_cell(r).chars().count())
             .max()
             .unwrap_or(0);
-        rows.iter()
-            .enumerate()
-            .map(|(index, row)| {
-                ListItem::new(row_line(
-                    row,
-                    theme,
-                    label_width,
-                    count_width,
-                    inner.width as usize,
-                    index == app.nav().cursor(),
-                ))
-            })
-            .collect()
+        let rule_at = rule_position(rows);
+        let mut items: Vec<ListItem> = Vec::with_capacity(rows.len() + 1);
+        for (index, row) in rows.iter().enumerate() {
+            if Some(index) == rule_at {
+                items.push(ListItem::new(Line::from(Span::styled(
+                    STRUCTURE_RULE.repeat(inner.width as usize),
+                    Style::default().fg(theme.muted()),
+                ))));
+            }
+            items.push(ListItem::new(row_line(
+                row,
+                theme,
+                label_width,
+                count_width,
+                inner.width as usize,
+                index == app.nav().cursor(),
+            )));
+        }
+        items
     };
 
     let list = List::new(items).block(block).highlight_style(
@@ -214,13 +237,41 @@ fn draw_nav(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
     );
     let mut state = ListState::default();
     if !rows.is_empty() {
-        state.select(Some(app.nav().cursor()));
+        state.select(Some(highlight_index(rows, app.nav().cursor())));
     }
     f.render_stateful_widget(list, area, &mut state);
 }
 
-/// The child-count cell: how many direct children the row has, or nothing for a
-/// leaf. An absent count is the signal that entering the row would do nothing.
+/// Where the rule that separates structure from work goes: before the first work
+/// row of a level that leads with collection rows.
+///
+/// `None` when there is nothing to separate — the roster, a collection's members,
+/// or an epic or node whose only rows are its collections — since a rule with
+/// nothing under it says the level is missing something.
+fn rule_position(rows: &[Row]) -> Option<usize> {
+    let collections = rows
+        .iter()
+        .take_while(|r| matches!(r.kind, RowKind::Collection(_)))
+        .count();
+    (collections > 0 && collections < rows.len()).then_some(collections)
+}
+
+/// The list index of the cursor's row. The rule is an item of the list but not a
+/// row of the level, so everything below it is drawn one line further down than
+/// the cursor counts — and the highlight must land on the row, never on the rule.
+fn highlight_index(rows: &[Row], cursor: usize) -> usize {
+    match rule_position(rows) {
+        Some(at) if cursor >= at => cursor + 1,
+        _ => cursor,
+    }
+}
+
+/// The child-count cell: how many direct children the row has, or nothing when
+/// it has none.
+///
+/// For a collection row an absent count is the signal that entering it would do
+/// nothing. For an epic or a node it means "no subtickets" only — every epic and
+/// node is enterable, because its collections are always rows there.
 fn count_cell(row: &Row) -> String {
     if row.children == 0 {
         String::new()
@@ -237,6 +288,11 @@ fn count_cell(row: &Row) -> String {
 /// state's colour and full contrast; only the child count is muted, since it is
 /// a hint rather than something to read off.
 ///
+/// A row that is not work has an empty glyph column — inventing a glyph would
+/// claim a state it has not got — so a glyph in that column is itself the signal
+/// that the row is work. A collection row and a withdrawn comment are dim over
+/// their whole width, because neither is work to be done.
+///
 /// The highlighted row is drawn without any per-column colour: the selection is
 /// shown by inverting the line, and inverting a line whose columns each carry
 /// their own foreground breaks the bar into mismatched blocks.
@@ -248,30 +304,36 @@ fn row_line<'a>(
     pane_width: usize,
     selected: bool,
 ) -> Line<'a> {
-    let status_color = match &row.selection {
-        Selection::Epic(_) => theme.epic_status(&row.status),
-        Selection::Node(_) => theme.node_status(&row.status),
+    let muted = Style::default().fg(theme.muted());
+    let plain = Style::default();
+    let (glyph_cell, id_style, name_style) = match &row.kind {
+        RowKind::Work(status) => {
+            // Only an epic, a node or a blocker is ever work, and the last two
+            // are nodes: an epic's states are its own.
+            let color = match &row.selection {
+                Selection::Epic(_) => theme.epic_status(status),
+                _ => theme.node_status(status),
+            };
+            (glyph(status), Style::default().fg(color), plain)
+        }
+        RowKind::Collection(_) | RowKind::Withdrawn => (" ", muted, muted),
+        RowKind::Member => (" ", plain, plain),
     };
-    let status_style = if selected {
-        Style::default()
+    let (id_style, count_style, name_style) = if selected {
+        (plain, plain, plain)
     } else {
-        Style::default().fg(status_color)
-    };
-    let muted_style = if selected {
-        Style::default()
-    } else {
-        Style::default().fg(theme.muted())
+        (id_style, muted, name_style)
     };
     let prefix_width = 2 + label_width + 1 + count_width + 2;
     let name_budget = pane_width.saturating_sub(prefix_width);
     Line::from(vec![
-        Span::styled(glyph(&row.status), status_style),
+        Span::styled(glyph_cell, id_style),
         Span::raw(" "),
-        Span::styled(format!("{:<label_width$}", row.label), status_style),
+        Span::styled(format!("{:<label_width$}", row.label), id_style),
         Span::raw(" "),
-        Span::styled(format!("{:<count_width$}", count_cell(row)), muted_style),
+        Span::styled(format!("{:<count_width$}", count_cell(row)), count_style),
         Span::raw("  "),
-        Span::raw(truncate(&row.name, name_budget)),
+        Span::styled(truncate(&row.name, name_budget), name_style),
     ])
 }
 
@@ -365,20 +427,73 @@ mod tests {
     }
 
     #[test]
-    fn a_leaf_has_no_count_cell_so_the_absence_marks_it() {
-        let leaf = Row {
-            selection: Selection::Epic("e".into()),
-            label: "e".into(),
-            name: "n".into(),
-            status: "open".into(),
-            children: 0,
-        };
-        let parent = Row {
-            children: 3,
-            ..leaf.clone()
-        };
-        assert_eq!(count_cell(&leaf), "");
+    fn a_row_with_nothing_under_it_has_no_count_cell() {
+        let childless = crate::data::fixture::epic_row("e", 0);
+        let parent = crate::data::fixture::epic_row("e", 3);
+        assert_eq!(count_cell(&childless), "");
         assert_eq!(count_cell(&parent), "(3)");
+    }
+
+    /// A node level as the browser builds it: its collections, then its work.
+    fn mixed_level() -> Vec<Row> {
+        use crate::data::fixture::{collection_row, node_container, node_row};
+        let container = node_container("e", 1);
+        let mut rows: Vec<Row> = container
+            .collections()
+            .iter()
+            .map(|kind| collection_row(container.clone(), *kind, 0))
+            .collect();
+        rows.push(node_row("e", 2, 0));
+        rows
+    }
+
+    #[test]
+    fn the_rule_sits_between_the_collections_and_the_work() {
+        let rows = mixed_level();
+        assert_eq!(rule_position(&rows), Some(rows.len() - 1));
+    }
+
+    #[test]
+    fn a_level_with_nothing_to_separate_gets_no_rule() {
+        use crate::data::fixture::{epic_row, label_row};
+        use crate::data::Container;
+        // The roster: work rows only.
+        assert_eq!(rule_position(&[epic_row("a", 0)]), None);
+        // A collection's members: no work rows at all.
+        let container = Container::Epic("a".into());
+        assert_eq!(rule_position(&[label_row(container, "ui")]), None);
+        // A childless ticket: collections and nothing to separate them from.
+        let mut collections = mixed_level();
+        collections.pop();
+        assert_eq!(rule_position(&collections), None);
+    }
+
+    #[test]
+    fn the_highlight_never_lands_on_the_rule() {
+        let rows = mixed_level();
+        let at = rule_position(&rows).unwrap();
+        for cursor in 0..rows.len() {
+            let index = highlight_index(&rows, cursor);
+            assert_ne!(index, at, "cursor {cursor} highlighted the rule");
+            // Every row keeps its own line: the rule shifts only what follows it.
+            assert_eq!(index, if cursor < at { cursor } else { cursor + 1 });
+        }
+    }
+
+    #[test]
+    fn only_a_work_row_carries_a_glyph() {
+        let theme = Theme::with_color(false);
+        for row in mixed_level() {
+            let line = row_line(&row, theme, 2, 3, 40, false);
+            let cell = line.spans[0].content.to_string();
+            let is_work = matches!(row.kind, RowKind::Work(_));
+            assert_eq!(
+                cell != " ",
+                is_work,
+                "{:?} drew the glyph cell {cell:?}",
+                row.kind
+            );
+        }
     }
 
     #[test]

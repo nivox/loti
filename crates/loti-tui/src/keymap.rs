@@ -58,7 +58,10 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
 pub const HELP: &[(&str, &str)] = &[
     ("j / k / ↓ / ↑", "move the cursor"),
     ("g / G", "first / last row"),
-    ("Enter / l / →", "open the row (nothing if it is a leaf)"),
+    (
+        "Enter / l / →",
+        "open the row (nothing if it has nothing below)",
+    ),
     ("Backspace / Esc / h / ←", "leave the level"),
     ("Ctrl-D / Ctrl-U", "scroll the preview half a screen"),
     ("PgDn / PgUp / Space", "scroll the preview a screen"),

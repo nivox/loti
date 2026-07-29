@@ -5,8 +5,11 @@
 //! are, and it is never redundant with the list.
 //!
 //! Two rules shape this module:
-//!   * a row with no children is not enterable, so every level on the stack is
-//!     guaranteed non-empty and the cursor always has something to point at;
+//!   * only an enterable row opens a level, and every level a row opens has at
+//!     least one row of its own — an epic's or a node's collections are always
+//!     listed, and a collection is enterable only when it has members — so every
+//!     level on the stack is non-empty and the cursor always has something to
+//!     point at;
 //!   * a cursor is remembered by its row's selection, not its index, so a
 //!     reload that adds or removes siblings leaves the highlight on the same
 //!     ticket rather than on whatever slid into that position.
@@ -29,7 +32,8 @@ pub struct Frame {
 
 impl Frame {
     /// The highlighted row, or `None` for a level with no rows (only possible
-    /// at the roster of an empty store, since a childless row is not enterable).
+    /// at the roster of an empty store: every other level is entered through a
+    /// row that guarantees it has something in it).
     pub fn current(&self) -> Option<&Row> {
         self.rows.get(self.cursor)
     }
@@ -115,15 +119,14 @@ impl Nav {
         self.frame_mut().cursor = last;
     }
 
-    /// Whether the highlighted row can be entered — that is, whether it has
-    /// children to show.
+    /// Whether the highlighted row can be entered.
     pub fn can_descend(&self) -> bool {
-        self.frame().current().is_some_and(|r| r.children > 0)
+        self.frame().current().is_some_and(Row::enterable)
     }
 
     /// Enter the highlighted row. `load` supplies the new level's rows. A row
-    /// with no children is not enterable and descending it does nothing, so a
-    /// keypress can never lead to an empty level.
+    /// that is not enterable does nothing, so a keypress can never lead to an
+    /// empty level.
     pub fn descend<F, E>(&mut self, load: F) -> Result<(), E>
     where
         F: FnOnce(&Level) -> Result<Vec<Row>, E>,
@@ -136,9 +139,9 @@ impl Nav {
             .current()
             .expect("can_descend implies a highlighted row")
             .clone();
-        let level = match &row.selection {
-            Selection::Epic(id) => Level::Epic(id.clone()),
-            Selection::Node(r) => Level::Node(r.clone()),
+        let Some(level) = row.selection.level() else {
+            // A leaf has no level, and `can_descend` has already refused it.
+            return Ok(());
         };
         let rows = load(&level)?;
         let crumb = crumb_for(&row);
@@ -163,6 +166,12 @@ impl Nav {
     /// Whether there is a level above the current one.
     pub fn can_ascend(&self) -> bool {
         self.stack.len() > 1
+    }
+
+    /// Whether the level on screen is a collection's members. Structure rather
+    /// than work, which is what its breadcrumb entry has to say.
+    pub fn at_collection(&self) -> bool {
+        matches!(self.frame().level, Level::Collection(..))
     }
 
     /// Re-read every level from the store, keeping each cursor on the same
@@ -205,51 +214,139 @@ impl Nav {
 
 /// The breadcrumb text for a level entered through `row`: an epic contributes
 /// its id, a node its number and name — enough to retrace the path without the
-/// list that was on screen when it was entered.
+/// list that was on screen when it was entered — and a collection its own name,
+/// which is as deep as a path ever goes.
 fn crumb_for(row: &Row) -> String {
     match &row.selection {
         Selection::Epic(id) => id.clone(),
         Selection::Node(r) => format!("{} {}", r.number, row.name),
+        Selection::Collection(_, kind) => kind.name().to_string(),
+        // A member is a leaf, so it is never entered and never becomes a crumb;
+        // the arm exists only because the mapping has to be total.
+        Selection::Label(..)
+        | Selection::Comment(..)
+        | Selection::Asset(..)
+        | Selection::Blocker(..) => row.label.clone(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::fixture::{epic_row, node_row};
+    use crate::data::fixture::{collection_row, epic_row, label_row, node_row};
+    use crate::data::{Collection, Container};
 
-    /// Loader for a fixture store: epic `a` has nodes 1 (with child 5) and 2.
+    /// Loader for a fixture store: epic `a` has nodes 1 (with child 5) and 2,
+    /// and every epic and node level leads with its collection rows.
     fn load(level: &Level) -> Result<Vec<Row>, ()> {
+        let container = |c: &Container, populated: bool| {
+            c.collections()
+                .iter()
+                .map(|kind| {
+                    // Only `labels` has members, so one level carries both an
+                    // enterable collection and empty ones.
+                    let members = usize::from(populated && *kind == Collection::Labels);
+                    collection_row(c.clone(), *kind, members)
+                })
+                .collect::<Vec<_>>()
+        };
         Ok(match level {
             Level::Epics => vec![epic_row("a", 2), epic_row("b", 0)],
-            Level::Epic(id) if id == "a" => vec![node_row("a", 1, 1), node_row("a", 2, 0)],
-            Level::Node(r) if r.number == 1 => vec![node_row("a", 5, 0)],
-            _ => vec![],
+            Level::Epic(id) => {
+                let mut rows = container(&Container::Epic(id.clone()), id == "a");
+                if id == "a" {
+                    rows.extend([node_row("a", 1, 1), node_row("a", 2, 0)]);
+                }
+                rows
+            }
+            Level::Node(r) => {
+                let mut rows = container(&Container::Node(r.clone()), false);
+                if r.number == 1 {
+                    rows.push(node_row("a", 5, 0));
+                }
+                rows
+            }
+            Level::Collection(c, Collection::Labels) => vec![label_row(c.clone(), "ui")],
+            Level::Collection(..) => vec![],
         })
     }
 
+    /// The rows of the level on screen that are work rather than structure.
+    fn work_rows(nav: &Nav) -> Vec<String> {
+        nav.rows()
+            .iter()
+            .filter(|r| matches!(r.selection, Selection::Epic(_) | Selection::Node(_)))
+            .map(|r| r.label.clone())
+            .collect()
+    }
+
+    /// Put the cursor on the first work row of the level on screen.
+    fn to_first_work_row(nav: &mut Nav) {
+        let index = nav
+            .rows()
+            .iter()
+            .position(|r| matches!(r.selection, Selection::Epic(_) | Selection::Node(_)))
+            .expect("the level has a work row");
+        nav.cursor_first();
+        for _ in 0..index {
+            nav.cursor_down();
+        }
+    }
+
     #[test]
-    fn childless_row_is_not_enterable() {
+    fn an_epic_with_no_tickets_is_still_enterable() {
         let mut nav = Nav::new(load(&Level::Epics).unwrap());
         nav.cursor_down(); // epic "b", no tickets
+                           // Its collections are rows there whatever it holds, so a missing child
+                           // count means "no tickets", not "nothing below".
+        assert!(nav.can_descend());
+        nav.descend(load).unwrap();
+        assert_eq!(nav.crumbs(), vec!["epics", "b"]);
+        assert!(work_rows(&nav).is_empty());
+        assert_eq!(
+            nav.rows().len(),
+            Container::Epic("b".into()).collections().len()
+        );
+    }
+
+    #[test]
+    fn a_collection_with_no_members_is_not_enterable() {
+        let mut nav = Nav::new(load(&Level::Epics).unwrap());
+        nav.descend(load).unwrap(); // into epic "a"
+        nav.cursor_down(); // `comments`, which is empty
         assert!(!nav.can_descend());
         nav.descend(load).unwrap();
-        assert_eq!(nav.crumbs(), vec!["epics"]);
+        assert_eq!(nav.crumbs(), vec!["epics", "a"]);
+    }
+
+    #[test]
+    fn a_collection_member_is_a_leaf() {
+        let mut nav = Nav::new(load(&Level::Epics).unwrap());
+        nav.descend(load).unwrap(); // into epic "a"
+        nav.descend(load).unwrap(); // into `labels`, its one populated collection
+        assert_eq!(nav.crumbs(), vec!["epics", "a", "labels"]);
+        assert!(nav.at_collection());
+        assert!(!nav.can_descend());
+        nav.descend(load).unwrap();
+        assert_eq!(nav.crumbs().len(), 3, "a member must not become a crumb");
     }
 
     #[test]
     fn descending_pushes_a_crumb_per_level() {
         let mut nav = Nav::new(load(&Level::Epics).unwrap());
         nav.descend(load).unwrap();
+        to_first_work_row(&mut nav);
         nav.descend(load).unwrap();
         assert_eq!(nav.crumbs(), vec!["epics", "a", "1 ticket 1"]);
-        assert_eq!(nav.rows().len(), 1);
+        assert_eq!(work_rows(&nav), vec!["5".to_string()]);
+        assert!(!nav.at_collection());
     }
 
     #[test]
     fn ascending_returns_to_the_row_we_entered_from() {
         let mut nav = Nav::new(load(&Level::Epics).unwrap());
         nav.descend(load).unwrap(); // into epic "a"
+        to_first_work_row(&mut nav); // node 1
         nav.cursor_down(); // node 2
         nav.cursor_up(); // node 1
         nav.descend(load).unwrap(); // into node 1
@@ -302,11 +399,13 @@ mod tests {
     fn reload_drops_levels_whose_rows_are_gone() {
         let mut nav = Nav::new(load(&Level::Epics).unwrap());
         nav.descend(load).unwrap(); // epic "a"
-        nav.descend(load).unwrap(); // node 1
+        nav.descend(load).unwrap(); // its `labels`
         assert_eq!(nav.crumbs().len(), 3);
         nav.reload(|level| match level {
-            // Node 1's only child was deleted, so that level no longer exists.
-            Level::Node(_) => Ok(vec![]),
+            // The last label was removed, so that level no longer exists. Only a
+            // collection level can vanish this way: an epic's and a node's own
+            // level always keeps its collection rows.
+            Level::Collection(..) => Ok(vec![]),
             other => load(other),
         })
         .unwrap();
