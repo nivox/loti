@@ -18,9 +18,13 @@
 //! Every mutation here routes through the atomic write + temp-file advisory
 //! lock primitive: a write stages a same-directory temp file and atomically
 //! renames it over the target, and the temp file's exclusive existence is the
-//! lock bracketing the whole read-modify-write. Reads stay lock-free — a
-//! single-file read is atomic old-or-new by virtue of that rename, and
-//! multi-file aggregates are explicitly not a consistent global snapshot.
+//! lock. There are two write paths and the difference is what they read:
+//! a whole-file write publishes a value that does not depend on the target's
+//! contents, while a read-modify-write takes the lock *before* reading the
+//! target, so the whole sequence — read, change, publish — is bracketed and
+//! nothing can land in the middle of it. Reads stay lock-free — a single-file
+//! read is atomic old-or-new by virtue of that rename, and multi-file aggregates
+//! are explicitly not a consistent global snapshot.
 //!
 //! Node numbers are drawn here from a flat monotonic pool per epic: the epic's
 //! `next-number` is a hint, and a node is created by probing forward and
@@ -35,7 +39,7 @@ use thiserror::Error;
 
 use crate::discovery::CONFIG_FILE;
 use crate::lock::{
-    self, classify_read, Force, LockConfig, LockError, ObservedVersion, StoreVersionGate,
+    self, classify_read, Force, LockConfig, LockError, ObservedVersion, RmwError, StoreVersionGate,
     VersionGate, VersionRefusal,
 };
 use crate::meta::{self, Meta, StoreVersion, MARKER_DIR};
@@ -89,12 +93,14 @@ pub enum StoreError {
     /// The store's format version refuses this mutation.
     #[error(transparent)]
     Version(#[from] VersionRefusal),
-    /// A write that named the `updated` stamp it expected to still find was
-    /// refused: the entity changed since the caller read it, so nothing was
-    /// written.
+    /// The store under the lock is not the store the write was built for, so
+    /// nothing was written: either the caller named the `updated` stamp it
+    /// expected to still find and the stored stamp has moved on, or the target
+    /// is not there under the lock. A modify never creates, so it never
+    /// re-creates what another actor deleted.
     #[error("{path} changed since it was read; nothing was written")]
     Conflict {
-        /// The file whose stored stamp no longer matches.
+        /// The file that no longer matches what the write was built for.
         path: PathBuf,
     },
     /// A node could not be created because the epic it belongs to does not
@@ -235,75 +241,37 @@ impl Store {
         Ok(NodeFile::parse(&text)?)
     }
 
-    /// Render and write an epic file atomically, creating its directory if
+    /// Render and write a whole epic file atomically, creating its directory if
     /// needed. The write stages a temp file and renames it over the target
     /// under the advisory lock; a stale lock fails fast.
+    ///
+    /// This publishes the caller's value as the whole file without reading what
+    /// is there — it creates an epic, or replaces one wholesale, last write
+    /// wins. A write that must see the stored epic first goes through
+    /// [`Store::modify_epic`], which holds the lock across the read as well.
     pub fn write_epic(&self, epic_id: &str, epic: &EpicFile) -> Result<(), StoreError> {
         self.write_epic_forced(epic_id, epic, Force::Deny)
     }
 
     /// As [`Store::write_epic`], but a stale lock from an interrupted operation
-    /// is cleared and the write proceeds (the `--force` path).
+    /// is cleared and the write proceeds (the `--force` path). The one
+    /// epic-write body every public epic write funnels into, so the force
+    /// policy cannot be applied by one path and skipped by another.
     pub fn write_epic_forced(
         &self,
         epic_id: &str,
         epic: &EpicFile,
         force: Force,
     ) -> Result<(), StoreError> {
-        self.write_epic_guarded(epic_id, epic, force, None)
-    }
-
-    /// As [`Store::write_epic`], carrying the optional precondition a caller
-    /// that replaces a whole field uses so it cannot silently discard a change
-    /// made underneath it: when `expect_updated` names a stamp, the write
-    /// applies only while the stored epic's `updated` still equals it, and
-    /// otherwise refuses with [`StoreError::Conflict`] having written nothing.
-    /// `None` names no precondition and is exactly [`Store::write_epic`] —
-    /// last write wins.
-    ///
-    /// The stamp is the whole precondition because every write that changes an
-    /// entity's content bumps `updated` — the best-effort bump of the epic's
-    /// next-number hint is the sole exception, and it carries nothing a caller
-    /// composes: an equal stamp means the *entity* is unchanged. Granularity is
-    /// therefore the entity, not the field being replaced, so a concurrent
-    /// change to an unrelated field refuses the write too. The stored stamp is
-    /// re-read while the lock is held, leaving no window between the comparison
-    /// and the rename that publishes.
-    pub fn write_epic_expecting(
-        &self,
-        epic_id: &str,
-        epic: &EpicFile,
-        expect_updated: Option<Timestamp>,
-    ) -> Result<(), StoreError> {
-        self.write_epic_guarded(epic_id, epic, Force::Deny, expect_updated)
-    }
-
-    /// The one epic-write body every public epic write funnels into, so the
-    /// force policy and the precondition can never be applied by one path and
-    /// skipped by another.
-    fn write_epic_guarded(
-        &self,
-        epic_id: &str,
-        epic: &EpicFile,
-        force: Force,
-        expect_updated: Option<Timestamp>,
-    ) -> Result<(), StoreError> {
         let dir = self.epic_dir(epic_id);
         create_dir_all(&dir)?;
         let path = self.epic_path(epic_id);
-        self.atomic_write(
-            &path,
-            epic.to_text()?.as_bytes(),
-            force,
-            expect_updated.map(|expected| UpdatedPrecondition {
-                expected,
-                stored_stamp: epic_updated_stamp,
-            }),
-        )
+        self.atomic_write(&path, epic.to_text()?.as_bytes(), force)
     }
 
-    /// Render and write a node file atomically, creating its epic directory if
-    /// needed.
+    /// Render and write a whole node file atomically, creating its epic
+    /// directory if needed. As with an epic, this is a wholesale publish that
+    /// reads nothing; [`Store::modify_node`] is the read-modify-write path.
     pub fn write_node(
         &self,
         epic_id: &str,
@@ -313,7 +281,8 @@ impl Store {
         self.write_node_forced(epic_id, number, node, Force::Deny)
     }
 
-    /// As [`Store::write_node`], but clears a stale lock (the `--force` path).
+    /// As [`Store::write_node`], but clears a stale lock (the `--force` path),
+    /// and the one node-write body every public node write funnels into.
     pub fn write_node_forced(
         &self,
         epic_id: &str,
@@ -321,89 +290,164 @@ impl Store {
         node: &NodeFile,
         force: Force,
     ) -> Result<(), StoreError> {
-        self.write_node_guarded(epic_id, number, node, force, None)
-    }
-
-    /// The node twin of [`Store::write_epic_expecting`]: the write applies only
-    /// while the stored node's `updated` still equals `expect_updated`, and
-    /// `None` is exactly [`Store::write_node`].
-    pub fn write_node_expecting(
-        &self,
-        epic_id: &str,
-        number: u64,
-        node: &NodeFile,
-        expect_updated: Option<Timestamp>,
-    ) -> Result<(), StoreError> {
-        self.write_node_guarded(epic_id, number, node, Force::Deny, expect_updated)
-    }
-
-    /// The one node-write body every public node write funnels into.
-    fn write_node_guarded(
-        &self,
-        epic_id: &str,
-        number: u64,
-        node: &NodeFile,
-        force: Force,
-        expect_updated: Option<Timestamp>,
-    ) -> Result<(), StoreError> {
         let dir = self.epic_dir(epic_id);
         create_dir_all(&dir)?;
         let path = self.node_path(epic_id, number);
-        self.atomic_write(
-            &path,
-            node.to_text()?.as_bytes(),
-            force,
-            expect_updated.map(|expected| UpdatedPrecondition {
-                expected,
-                stored_stamp: node_updated_stamp,
-            }),
-        )
+        self.atomic_write(&path, node.to_text()?.as_bytes(), force)
+    }
+
+    /// Read an epic, let `change` modify it, and publish the result — with the
+    /// whole sequence bracketed by the advisory lock. The lock is taken first,
+    /// the store version verified under it, and only then is the epic read, so
+    /// no cooperating operation can publish to the target between the read
+    /// `change` sees and the rename that publishes its result. This is the path
+    /// every write that depends on what is stored takes; a caller that merges
+    /// into the stored epic therefore cannot discard a concurrent change.
+    ///
+    /// A modify never creates: an epic that is not there is refused with
+    /// [`StoreError::Conflict`], because publishing on top of nothing would
+    /// resurrect an entity from a read that no longer describes the store.
+    ///
+    /// `expect_updated` is the caller's optional precondition for the window it
+    /// owns and this lock cannot cover — the one between a surface reading an
+    /// entity, a human composing a replacement, and the edit arriving here. The
+    /// stamp is compared against the epic as *stored*, read under the lock, and
+    /// a mismatch refuses with [`StoreError::Conflict`] having published
+    /// nothing. Granularity is the entity, not the field: every write that
+    /// changes an entity's content bumps `updated` (the best-effort bump of the
+    /// next-number hint is the sole exception, and carries nothing a caller
+    /// composes), so an unrelated change to the same epic refuses the write too.
+    /// `None` names no precondition — last write wins.
+    ///
+    /// Returns the epic as published, together with whatever `change` produced.
+    pub fn modify_epic<T, E>(
+        &self,
+        epic_id: &str,
+        expect_updated: Option<Timestamp>,
+        change: impl FnOnce(&mut EpicFile) -> Result<T, E>,
+    ) -> Result<(EpicFile, T), E>
+    where
+        E: From<StoreError>,
+    {
+        self.modify_entity(&self.epic_path(epic_id), expect_updated, change)
+    }
+
+    /// The node twin of [`Store::modify_epic`], with the same bracketing, the
+    /// same refusal for a node that is not there, and the same precondition
+    /// semantics.
+    pub fn modify_node<T, E>(
+        &self,
+        epic_id: &str,
+        number: u64,
+        expect_updated: Option<Timestamp>,
+        change: impl FnOnce(&mut NodeFile) -> Result<T, E>,
+    ) -> Result<(NodeFile, T), E>
+    where
+        E: From<StoreError>,
+    {
+        self.modify_entity(&self.node_path(epic_id, number), expect_updated, change)
+    }
+
+    /// The one bracketed read-modify-write body, shared by both entity kinds so
+    /// the discipline cannot say different things about an epic and a node.
+    ///
+    /// The lock module fixes the ordering — lock, version gate, read, publish —
+    /// and this adds the entity layer on top: parse what is stored, evaluate the
+    /// caller's precondition against it, apply the change, and publish only what
+    /// the change actually changed. A change that leaves the entity as it found
+    /// it publishes nothing, so an operation that is a no-op on the stored state
+    /// does not rewrite the file.
+    fn modify_entity<F, T, E>(
+        &self,
+        path: &Path,
+        expect_updated: Option<Timestamp>,
+        change: impl FnOnce(&mut F) -> Result<T, E>,
+    ) -> Result<(F, T), E>
+    where
+        F: StoredEntity,
+        E: From<StoreError>,
+    {
+        let gate = self.version_gate();
+        let outcome = lock::rmw(
+            path,
+            &self.lock_config,
+            // A read-modify-write never clears a stale lock: an interrupted
+            // operation is an operator's call, as it is on every other write.
+            Force::Deny,
+            &gate,
+            |current| {
+                let Some(bytes) = current else {
+                    return Err(E::from(StoreError::Conflict {
+                        path: path.to_path_buf(),
+                    }));
+                };
+                // Bytes that are not text at all are a corrupt store, and
+                // surface as an I/O failure rather than a conflict.
+                let text = String::from_utf8(bytes).map_err(|_| {
+                    E::from(StoreError::Io {
+                        path: path.to_path_buf(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "stored file is not valid UTF-8 text",
+                        ),
+                    })
+                })?;
+                // Text that is not a parseable entity of this kind is refused
+                // rather than clobbered: nothing is published on top of contents
+                // that could not be inspected.
+                let stored = F::parse_text(&text).map_err(|e| E::from(StoreError::Model(e)))?;
+                if let Some(expected) = expect_updated {
+                    // The comparison uses the stamp as stored, read here under
+                    // the lock — never the one on the value being written.
+                    if stored.updated_stamp() != expected {
+                        return Err(E::from(StoreError::Conflict {
+                            path: path.to_path_buf(),
+                        }));
+                    }
+                }
+                // The entity as stored is kept beside the changed one, so the
+                // publish step can tell whether the change changed anything.
+                let mut modified = stored.clone();
+                let out = change(&mut modified)?;
+                Ok((stored, modified, out))
+            },
+            |(stored, modified, _)| {
+                // Publishing nothing is how an idempotent operation leaves a
+                // target alone: no rename, and the stored bytes keep whatever
+                // formatting they had.
+                if modified == stored {
+                    return Ok(None);
+                }
+                Ok(Some(
+                    modified
+                        .render_text()
+                        .map_err(|e| E::from(StoreError::Model(e)))?
+                        .into_bytes(),
+                ))
+            },
+        );
+        match outcome {
+            Ok((_, modified, out)) => Ok((modified, out)),
+            Err(RmwError::Lock(e)) => Err(E::from(StoreError::Lock(e))),
+            Err(RmwError::Version(refusal)) => Err(E::from(StoreError::Version(refusal))),
+            Err(RmwError::Op(e)) => Err(e),
+        }
     }
 
     /// Atomically write bytes to a store file under the advisory lock and the
-    /// store's version gate. The single shared path every file mutation routes
-    /// through, so the lock discipline cannot be sidestepped.
+    /// store's version gate. The single shared path every whole-file mutation
+    /// routes through, so the lock discipline cannot be sidestepped.
     ///
-    /// A precondition is evaluated against the target re-read *while the lock is
-    /// held*, so nothing can change between the comparison and the rename. A
-    /// refused write publishes nothing and releases the lock, so a caller can
-    /// retry or overwrite from an unchanged store.
-    fn atomic_write(
-        &self,
-        path: &Path,
-        bytes: &[u8],
-        force: Force,
-        precondition: Option<UpdatedPrecondition>,
-    ) -> Result<(), StoreError> {
+    /// Nothing is read here: this publishes bytes that do not depend on the
+    /// target's current contents. A mutation that does depend on them is a
+    /// read-modify-write and goes through [`Store::modify_entity`], which reads
+    /// under the same lock.
+    fn atomic_write(&self, path: &Path, bytes: &[u8], force: Force) -> Result<(), StoreError> {
         let gate = self.version_gate();
         let lock = lock::acquire(path, &self.lock_config, force)?;
         // Verify-after-lock: the store version is checked while the lock is
         // held, before publishing, so a store cannot change format underneath.
         gate.verify()?;
-        if let Some(precondition) = precondition {
-            let stored = match std::fs::read_to_string(path) {
-                Ok(text) => (precondition.stored_stamp)(&text),
-                // A target that is gone carries no stamp, so it cannot satisfy
-                // one: the entity the caller read no longer exists.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(source) => {
-                    return Err(StoreError::Io {
-                        path: path.to_path_buf(),
-                        source,
-                    })
-                }
-            };
-            // A target whose text cannot be parsed reads as no stamp, so a
-            // caller naming one is refused rather than clobbering a file whose
-            // contents could not be inspected. Bytes that are not text at all
-            // are a corrupt store rather than a conflict, and surface above as
-            // an I/O failure.
-            if stored != Some(precondition.expected) {
-                return Err(StoreError::Conflict {
-                    path: path.to_path_buf(),
-                });
-            }
-        }
         lock.commit(bytes)?;
         Ok(())
     }
@@ -558,9 +602,9 @@ impl Store {
         let dir = self.epic_asset_dir(epic_id);
         create_dir_all(&dir)?;
         let path = dir.join(name);
-        // Asset bytes carry no `updated` stamp, so a byte copy has no stored
-        // stamp a precondition could be compared against.
-        self.atomic_write(&path, bytes, Force::Deny, None)?;
+        // Asset bytes are opaque: a copy replaces them wholesale and never reads
+        // what is there, so it is a blind write rather than a modify.
+        self.atomic_write(&path, bytes, Force::Deny)?;
         Ok(path)
     }
 
@@ -576,7 +620,7 @@ impl Store {
         let dir = self.node_asset_dir(epic_id, number);
         create_dir_all(&dir)?;
         let path = dir.join(name);
-        self.atomic_write(&path, bytes, Force::Deny, None)?;
+        self.atomic_write(&path, bytes, Force::Deny)?;
         Ok(path)
     }
 
@@ -619,29 +663,41 @@ impl Store {
     }
 }
 
-/// A write's optional precondition, evaluated under the lock: the `updated`
-/// stamp the caller read, together with how to recover the stored stamp from the
-/// target's text (an epic and a node frontmatter parse differently).
-///
-/// Every write that changes an entity's content bumps `updated`, so a stored
-/// stamp still equal to the expected one means the entity has not changed since
-/// the caller read it.
-struct UpdatedPrecondition {
-    /// The stamp the caller read and expects to still find.
-    expected: Timestamp,
-    /// Reads the stored stamp out of the target's text; `None` when the text is
-    /// not a parseable file of that kind.
-    stored_stamp: fn(&str) -> Option<Timestamp>,
+/// What a bracketed read-modify-write needs of a stored entity: parse it from
+/// the target's text, render it back, and expose the `updated` stamp a write
+/// precondition is compared against. Implemented for both entity kinds so the
+/// bracketing body exists once and cannot drift between an epic and a node.
+trait StoredEntity: Sized + Clone + PartialEq {
+    /// Parse the target's text into the entity.
+    fn parse_text(text: &str) -> Result<Self, ModelError>;
+    /// Render the entity back to the target's text.
+    fn render_text(&self) -> Result<String, ModelError>;
+    /// The entity's `updated` stamp as stored.
+    fn updated_stamp(&self) -> Timestamp;
 }
 
-/// The `updated` stamp an epic file's text carries.
-fn epic_updated_stamp(text: &str) -> Option<Timestamp> {
-    EpicFile::parse(text).ok().map(|e| e.frontmatter.updated)
+impl StoredEntity for EpicFile {
+    fn parse_text(text: &str) -> Result<Self, ModelError> {
+        Self::parse(text)
+    }
+    fn render_text(&self) -> Result<String, ModelError> {
+        self.to_text()
+    }
+    fn updated_stamp(&self) -> Timestamp {
+        self.frontmatter.updated
+    }
 }
 
-/// The `updated` stamp a node file's text carries.
-fn node_updated_stamp(text: &str) -> Option<Timestamp> {
-    NodeFile::parse(text).ok().map(|n| n.frontmatter.updated)
+impl StoredEntity for NodeFile {
+    fn parse_text(text: &str) -> Result<Self, ModelError> {
+        Self::parse(text)
+    }
+    fn render_text(&self) -> Result<String, ModelError> {
+        self.to_text()
+    }
+    fn updated_stamp(&self) -> Timestamp {
+        self.frontmatter.updated
+    }
 }
 
 /// Where init placed the store, so a caller can report precisely.
@@ -883,36 +939,147 @@ mod tests {
         assert!(!written.exists());
     }
 
+    // -- the bracketed read-modify-write ------------------------------------
+
+    #[test]
+    fn a_modify_hands_the_change_the_stored_entity_and_publishes_the_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fast_store(dir.path());
+        let mut stored = epic();
+        stored.frontmatter.name = "as stored".into();
+        store.write_epic("my-epic", &stored).unwrap();
+
+        // The change is handed the epic as stored, and the returned epic is the
+        // one published.
+        let (published, seen) = store
+            .modify_epic("my-epic", None, |epic| {
+                let seen = epic.frontmatter.name.clone();
+                epic.frontmatter.name = "renamed".into();
+                Ok::<String, StoreError>(seen)
+            })
+            .unwrap();
+        assert_eq!(seen, "as stored");
+        assert_eq!(published.frontmatter.name, "renamed");
+        assert_eq!(
+            store.read_epic("my-epic").unwrap().frontmatter.name,
+            "renamed"
+        );
+    }
+
+    #[test]
+    fn a_modify_holds_the_lock_from_before_the_read_until_the_publish() {
+        // The window between the read the change sees and the rename that
+        // publishes it is closed: no other writer can hold the target's lock
+        // while the change is running, so nothing can land in between.
+        let dir = tempfile::tempdir().unwrap();
+        let store = fast_store(dir.path());
+        store.write_node("my-epic", 7, &node(7)).unwrap();
+        let path = store.node_path("my-epic", 7);
+
+        let (_published, competitor) = store
+            .modify_node("my-epic", 7, None, |n| {
+                n.body = "mine\n".into();
+                // A single non-blocking acquire attempt from inside the window.
+                Ok::<Option<lock::TempLock>, StoreError>(lock::try_acquire(&path).unwrap())
+            })
+            .unwrap();
+        assert!(
+            competitor.is_none(),
+            "the target's lock is held for the whole read-modify-write"
+        );
+        assert_eq!(store.read_node("my-epic", 7).unwrap().body, "mine\n");
+    }
+
+    #[test]
+    fn a_modify_never_creates_and_refuses_an_unparseable_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fast_store(dir.path());
+        // Give the epic dir a real file so the directory exists but the epic
+        // does not.
+        store.write_node("my-epic", 7, &node(7)).unwrap();
+
+        // Nothing stored to modify: refused, and no epic conjured into being.
+        let missing = store.modify_epic("my-epic", None, |epic| {
+            epic.frontmatter.name = "resurrected".into();
+            Ok::<(), StoreError>(())
+        });
+        assert!(matches!(missing, Err(StoreError::Conflict { .. })));
+        assert!(!store.epic_path("my-epic").exists());
+
+        // Contents that cannot be parsed are refused rather than clobbered, and
+        // the refusal leaves no lock debris behind for a retry to trip over.
+        std::fs::write(store.epic_path("my-epic"), b"not a store file").unwrap();
+        let unparseable = store.modify_epic("my-epic", None, |epic| {
+            epic.frontmatter.name = "clobbered".into();
+            Ok::<(), StoreError>(())
+        });
+        assert!(matches!(unparseable, Err(StoreError::Model(_))));
+        assert_eq!(
+            std::fs::read(store.epic_path("my-epic")).unwrap(),
+            b"not a store file"
+        );
+        assert!(!lock::temp_path(&store.epic_path("my-epic"))
+            .unwrap()
+            .exists());
+    }
+
+    #[test]
+    fn a_change_that_changes_nothing_publishes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fast_store(dir.path());
+        store.write_node("my-epic", 7, &node(7)).unwrap();
+        let path = store.node_path("my-epic", 7);
+        // Re-lay the same node with its frontmatter keys in another order: it
+        // parses to the very same entity, so a publish would be visible as the
+        // canonical rendering replacing this one.
+        let canonical = std::fs::read_to_string(&path).unwrap();
+        let reordered = canonical.replace("name: n\nsummary: s\n", "summary: s\nname: n\n");
+        assert_ne!(reordered, canonical, "the planted text must differ");
+        std::fs::write(&path, &reordered).unwrap();
+
+        store
+            .modify_node("my-epic", 7, None, |_| Ok::<(), StoreError>(()))
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            reordered,
+            "a change that leaves the entity as found must not rewrite the file"
+        );
+    }
+
     // -- the opt-in `updated` precondition ----------------------------------
 
     #[test]
-    fn an_epic_write_naming_the_stored_stamp_applies_and_a_stale_one_refuses() {
+    fn an_epic_modify_naming_the_stored_stamp_applies_and_a_stale_one_refuses() {
         let dir = tempfile::tempdir().unwrap();
         let store = fast_store(dir.path());
         store.write_epic("my-epic", &epic()).unwrap();
-        let read = store.read_epic("my-epic").unwrap();
-        let stamp = read.frontmatter.updated;
+        let stamp = store.read_epic("my-epic").unwrap().frontmatter.updated;
 
-        // The stored stamp still matches the one read, so the write applies.
-        let mut renamed = read.clone();
-        renamed.frontmatter.name = "renamed".into();
-        renamed.frontmatter.updated = "2024-06-01T00:00:00Z".parse().unwrap();
+        // The stored stamp still matches the one read, so the change applies.
+        // The stamp compared is the stored one, never the one being written.
         store
-            .write_epic_expecting("my-epic", &renamed, Some(stamp))
+            .modify_epic("my-epic", Some(stamp), |epic| {
+                epic.frontmatter.name = "renamed".into();
+                epic.frontmatter.updated = "2024-06-01T00:00:00Z".parse().unwrap();
+                Ok::<(), StoreError>(())
+            })
             .unwrap();
         assert_eq!(
             store.read_epic("my-epic").unwrap().frontmatter.name,
             "renamed"
         );
 
-        // That first write moved the stamp, so a second write still naming the
-        // original one is refused and publishes nothing.
-        let mut clobber = read.clone();
-        clobber.frontmatter.name = "clobbered".into();
-        assert!(matches!(
-            store.write_epic_expecting("my-epic", &clobber, Some(stamp)),
-            Err(StoreError::Conflict { .. })
-        ));
+        // That change moved the stamp, so one still naming the original is
+        // refused, and its change never runs.
+        let mut change_ran = false;
+        let refused = store.modify_epic("my-epic", Some(stamp), |epic| {
+            change_ran = true;
+            epic.frontmatter.name = "clobbered".into();
+            Ok::<(), StoreError>(())
+        });
+        assert!(matches!(refused, Err(StoreError::Conflict { .. })));
+        assert!(!change_ran, "a refused precondition runs no change");
         assert_eq!(
             store.read_epic("my-epic").unwrap().frontmatter.name,
             "renamed",
@@ -923,9 +1090,12 @@ mod tests {
             .unwrap()
             .exists());
 
-        // Naming no stamp keeps last-write-wins: the same write now applies.
+        // Naming no stamp keeps last-write-wins: the same change now applies.
         store
-            .write_epic_expecting("my-epic", &clobber, None)
+            .modify_epic("my-epic", None, |epic| {
+                epic.frontmatter.name = "clobbered".into();
+                Ok::<(), StoreError>(())
+            })
             .unwrap();
         assert_eq!(
             store.read_epic("my-epic").unwrap().frontmatter.name,
@@ -934,60 +1104,35 @@ mod tests {
     }
 
     #[test]
-    fn a_node_write_naming_the_stored_stamp_applies_and_a_stale_one_refuses() {
+    fn a_node_modify_naming_the_stored_stamp_applies_and_a_stale_one_refuses() {
         let dir = tempfile::tempdir().unwrap();
         let store = fast_store(dir.path());
         store.write_node("my-epic", 7, &node(7)).unwrap();
         let stamp = store.read_node("my-epic", 7).unwrap().frontmatter.updated;
 
-        let mut edited = node(7);
-        edited.body = "mine\n".into();
-        edited.frontmatter.updated = "2024-06-01T00:00:00Z".parse().unwrap();
         store
-            .write_node_expecting("my-epic", 7, &edited, Some(stamp))
+            .modify_node("my-epic", 7, Some(stamp), |n| {
+                n.body = "mine\n".into();
+                n.frontmatter.updated = "2024-06-01T00:00:00Z".parse().unwrap();
+                Ok::<(), StoreError>(())
+            })
             .unwrap();
         assert_eq!(store.read_node("my-epic", 7).unwrap().body, "mine\n");
 
-        let mut clobber = node(7);
-        clobber.body = "theirs\n".into();
-        assert!(matches!(
-            store.write_node_expecting("my-epic", 7, &clobber, Some(stamp)),
-            Err(StoreError::Conflict { .. })
-        ));
+        let refused = store.modify_node("my-epic", 7, Some(stamp), |n| {
+            n.body = "theirs\n".into();
+            Ok::<(), StoreError>(())
+        });
+        assert!(matches!(refused, Err(StoreError::Conflict { .. })));
         assert_eq!(store.read_node("my-epic", 7).unwrap().body, "mine\n");
 
         store
-            .write_node_expecting("my-epic", 7, &clobber, None)
+            .modify_node("my-epic", 7, None, |n| {
+                n.body = "theirs\n".into();
+                Ok::<(), StoreError>(())
+            })
             .unwrap();
         assert_eq!(store.read_node("my-epic", 7).unwrap().body, "theirs\n");
-    }
-
-    #[test]
-    fn a_precondition_refuses_a_target_that_is_gone_or_unparseable() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = fast_store(dir.path());
-        let stamp = ts();
-
-        // Nothing stored carries the stamp, so the entity the caller read is
-        // gone and the write is refused rather than re-creating it.
-        assert!(matches!(
-            store.write_epic_expecting("my-epic", &epic(), Some(stamp)),
-            Err(StoreError::Conflict { .. })
-        ));
-        assert!(!store.epic_path("my-epic").exists());
-
-        // A file whose stamp cannot be read is refused too, rather than
-        // clobbered on the strength of contents that could not be inspected.
-        store.write_epic("my-epic", &epic()).unwrap();
-        std::fs::write(store.epic_path("my-epic"), b"not a store file").unwrap();
-        assert!(matches!(
-            store.write_epic_expecting("my-epic", &epic(), Some(stamp)),
-            Err(StoreError::Conflict { .. })
-        ));
-        assert_eq!(
-            std::fs::read(store.epic_path("my-epic")).unwrap(),
-            b"not a store file"
-        );
     }
 
     #[test]

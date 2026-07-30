@@ -505,8 +505,12 @@ pub enum RmwError<E> {
 /// The ordering is fixed by this function's shape and cannot be reordered by a
 /// caller: (1) acquire the lock, (2) verify the store version under the lock,
 /// (3) only then read the target and let `transform` produce the new bytes,
-/// (4) atomically commit. The caller supplies a reader and a transform but can
-/// never read before the lock is held and the version verified.
+/// (4) atomically commit them. The caller supplies a reader and a transform but
+/// can never read before the lock is held and the version verified.
+///
+/// A `transform` that produces no bytes declines to publish: the lock is
+/// released and the target is left exactly as it was found. A read-modify-write
+/// that discovers there is nothing to change must not rewrite its target.
 ///
 /// `read` receives the current file contents as `None` when the target does
 /// not yet exist (a create), otherwise `Some(bytes)`.
@@ -520,7 +524,7 @@ pub fn rmw<T, E, R, X>(
 ) -> Result<T, RmwError<E>>
 where
     R: FnOnce(Option<Vec<u8>>) -> Result<T, E>,
-    X: FnOnce(&T) -> Result<Vec<u8>, E>,
+    X: FnOnce(&T) -> Result<Option<Vec<u8>>, E>,
 {
     let lock = acquire(target, config, force)?;
     // Verify-after-lock: the gate runs while the lock is held and before the
@@ -539,8 +543,12 @@ where
     };
 
     let value = read(current).map_err(RmwError::Op)?;
-    let new_bytes = transform(&value).map_err(RmwError::Op)?;
-    lock.commit(new_bytes.as_slice())?;
+    match transform(&value).map_err(RmwError::Op)? {
+        Some(new_bytes) => lock.commit(new_bytes.as_slice())?,
+        // Nothing to publish: release the lock without a rename, leaving the
+        // target's bytes exactly as they were read.
+        None => lock.abort()?,
+    }
     Ok(value)
 }
 
@@ -799,11 +807,40 @@ mod tests {
             |current| -> Result<String, std::convert::Infallible> {
                 Ok(String::from_utf8(current.unwrap()).unwrap())
             },
-            |value| Ok(format!("{value};count=2").into_bytes()),
+            |value| Ok(Some(format!("{value};count=2").into_bytes())),
         )
         .unwrap();
         assert_eq!(observed, "count=1");
         assert_eq!(fs::read(&target).unwrap(), b"count=1;count=2");
+    }
+
+    #[test]
+    fn rmw_declining_to_publish_leaves_the_target_and_releases_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("7.md");
+        fs::write(&target, b"as found").unwrap();
+        rmw(
+            &target,
+            &fast_config(),
+            Force::Deny,
+            &AlwaysOk,
+            |current| -> Result<(), std::convert::Infallible> {
+                assert_eq!(current.unwrap(), b"as found");
+                Ok(())
+            },
+            // A transform with nothing to change produces no bytes.
+            |_| Ok(None),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            b"as found",
+            "a declined transform must not rewrite the target"
+        );
+        assert!(
+            !temp_path(&target).unwrap().exists(),
+            "the lock is released even when nothing is published"
+        );
     }
 
     #[test]
@@ -819,7 +856,7 @@ mod tests {
                 assert!(current.is_none(), "a missing target reads as None");
                 Ok(())
             },
-            |_| Ok(b"created".to_vec()),
+            |_| Ok(Some(b"created".to_vec())),
         )
         .unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"created");
@@ -844,7 +881,7 @@ mod tests {
                 read_ran = true;
                 Ok(())
             },
-            |_| Ok(Vec::new()),
+            |_| Ok(Some(Vec::new())),
         );
         assert!(
             matches!(
@@ -879,7 +916,7 @@ mod tests {
                 read_ran = true;
                 Ok(())
             },
-            |_| Ok(Vec::new()),
+            |_| Ok(Some(Vec::new())),
         );
         assert!(matches!(
             result,

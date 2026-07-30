@@ -8,11 +8,13 @@
 //! typed [`OpError`]. No CLI types leak in here, so the same operations back
 //! the CLI today and any future surface unchanged.
 //!
-//! The invariant every mutation upholds: it goes through the store's atomic
-//! write, which brackets the write with the temp-file lock and the version
-//! gate. A read-modify-write reads the current file, applies the change to the
-//! typed model, then writes it back through that same guarded path — never a
-//! raw filesystem write.
+//! The invariant every mutation upholds: it goes through the store, which
+//! brackets it with the temp-file lock and the version gate — never a raw
+//! filesystem write. An operation that depends on what is stored goes further:
+//! it hands the change to the store's read-modify-write, so the lock is held
+//! from before the entity is read until the publish. Nothing can land in
+//! between, and a merge (a label added, a comment appended, a blocker removed)
+//! therefore merges into the entity as stored rather than into a stale copy.
 
 use jiff::Timestamp;
 
@@ -278,8 +280,12 @@ impl EpicEdits {
 
 /// Edit an epic's plain scalar fields. Bumps `updated` when anything changed.
 pub fn edit_epic(store: &Store, epic_id: &str, edits: EpicEdits) -> Result<EpicFile, OpError> {
-    let mut epic = read_epic(store, epic_id)?;
-    if !edits.is_empty() {
+    if edits.is_empty() {
+        // A stamp is a precondition, never a change: an edit with nothing to
+        // apply writes nothing and reports the epic as it stands.
+        return read_epic(store, epic_id);
+    }
+    let (epic, ()) = modify_epic(store, epic_id, edits.expect_updated, |epic| {
         if let Some(name) = edits.name {
             epic.frontmatter.name = name;
         }
@@ -290,8 +296,8 @@ pub fn edit_epic(store: &Store, epic_id: &str, edits: EpicEdits) -> Result<EpicF
             epic.body = body;
         }
         epic.frontmatter.updated = now();
-        store.write_epic_expecting(epic_id, &epic, edits.expect_updated)?;
-    }
+        Ok(())
+    })?;
     Ok(epic)
 }
 
@@ -325,13 +331,20 @@ impl NodeEdits {
 /// is in the same epic, exists, and would not make the node its own ancestor.
 /// Bumps `updated` when anything changed.
 pub fn edit_node(store: &Store, node_ref: &NodeRef, edits: NodeEdits) -> Result<NodeFile, OpError> {
-    let mut node = read_node(store, node_ref)?;
+    // "It is not there" is answered first, and about the node being edited
+    // rather than about a parent it names.
+    require_node(store, node_ref)?;
 
+    // A reparent is validated against the rest of the epic — other files — so it
+    // happens before this node's lock is taken.
     if let Some(parent) = &edits.parent {
         validate_reparent(store, node_ref, parent)?;
     }
 
-    if !edits.is_empty() {
+    if edits.is_empty() {
+        return read_node(store, node_ref);
+    }
+    let (node, ()) = modify_node(store, node_ref, edits.expect_updated, |node| {
         if let Some(name) = edits.name {
             node.frontmatter.name = name;
         }
@@ -345,13 +358,8 @@ pub fn edit_node(store: &Store, node_ref: &NodeRef, edits: NodeEdits) -> Result<
             node.body = body;
         }
         node.frontmatter.updated = now();
-        store.write_node_expecting(
-            &node_ref.epic_id,
-            node_ref.number,
-            &node,
-            edits.expect_updated,
-        )?;
-    }
+        Ok(())
+    })?;
     Ok(node)
 }
 
@@ -457,38 +465,32 @@ pub fn set_node_status(
     node_ref: &NodeRef,
     change: NodeStatusChange,
 ) -> Result<StatusOutcome, OpError> {
-    let mut node = read_node(store, node_ref)?;
+    require_node(store, node_ref)?;
     let mut cascaded_closed: Vec<u64> = Vec::new();
 
-    match change {
-        NodeStatusChange::ToDo => {
-            node.frontmatter.status = NodeState::ToDo;
-            // Leaving `blocked`/`closed` clears their reasons; the blocked-by
-            // dependency list is independent of status and left untouched.
-            node.frontmatter.block_reason = None;
-            node.frontmatter.close_reason = None;
-        }
-        NodeStatusChange::InProgress => {
-            node.frontmatter.status = NodeState::InProgress;
-            node.frontmatter.block_reason = None;
-            node.frontmatter.close_reason = None;
-        }
+    // The transition is decided once, here: what the state machine permits, and
+    // the three fields the new state leaves behind. Everything in this match that
+    // touches the store touches *other* nodes — a subtree's states, and the
+    // cascade that closes them — so it runs before this node's lock is taken:
+    // each cascade step locks its own target, and nesting them inside this node's
+    // lock would order the same locks two ways.
+    let (status, block_reason, close_reason) = match change {
+        // Leaving `blocked`/`closed` clears their reasons; the blocked-by
+        // dependency list is independent of status and left untouched.
+        NodeStatusChange::ToDo => (NodeState::ToDo, None, None),
+        NodeStatusChange::InProgress => (NodeState::InProgress, None, None),
         NodeStatusChange::Blocked { reason } => {
             // `blocked` is set only explicitly (this arm) and must carry a
             // non-blank reason. blocked-by is managed separately, never here.
             let has_reason = reason.as_deref().map(|r| !r.trim().is_empty()) == Some(true);
             validate_blocked(true, has_reason)?;
-            node.frontmatter.status = NodeState::Blocked;
-            node.frontmatter.block_reason = reason;
-            node.frontmatter.close_reason = None;
+            (NodeState::Blocked, reason, None)
         }
         NodeStatusChange::Done => {
             let descendants = descendants_of(store, node_ref)?;
             validate_done(&descendants)?;
-            node.frontmatter.status = NodeState::Done;
-            node.frontmatter.block_reason = None;
             // `done` is terminal but not `closed`; it never carries a reason.
-            node.frontmatter.close_reason = None;
+            (NodeState::Done, None, None)
         }
         NodeStatusChange::Closed { reason, cascade } => {
             let descendants = descendants_of(store, node_ref)?;
@@ -496,7 +498,7 @@ pub fn set_node_status(
             let plan = plan_close(&descendants, reason.as_deref(), cascade_sel)?;
             // Close the descendants first (ascending order, deadlock-free), so
             // a re-run after a partial failure still converges. Each is an
-            // independent guarded write.
+            // independent bracketed read-modify-write.
             if !plan.cascade_targets.is_empty() {
                 close_descendants(
                     store,
@@ -506,14 +508,17 @@ pub fn set_node_status(
                 )?;
                 cascaded_closed = plan.cascade_targets.clone();
             }
-            node.frontmatter.status = NodeState::Closed;
-            node.frontmatter.close_reason = reason;
-            node.frontmatter.block_reason = None;
+            (NodeState::Closed, None, reason)
         }
-    }
+    };
 
-    node.frontmatter.updated = now();
-    store.write_node(&node_ref.epic_id, node_ref.number, &node)?;
+    let (node, ()) = modify_node(store, node_ref, None, |node| {
+        node.frontmatter.status = status;
+        node.frontmatter.block_reason = block_reason;
+        node.frontmatter.close_reason = close_reason;
+        node.frontmatter.updated = now();
+        Ok(())
+    })?;
     Ok(StatusOutcome {
         node,
         cascaded_closed,
@@ -521,8 +526,11 @@ pub fn set_node_status(
 }
 
 /// Close each listed descendant, in the given (ascending) order, as an
-/// independent guarded write. Already-terminal descendants are skipped
-/// (idempotent). Stops at the first failure and reports partial progress.
+/// independent bracketed read-modify-write. Already-terminal descendants are
+/// left exactly as they are, and because the terminal test is made against the
+/// descendant read under its own lock, a descendant that another actor resolved
+/// meanwhile is not overwritten. Stops at the first failure and reports partial
+/// progress.
 fn close_descendants(
     store: &Store,
     epic_id: &str,
@@ -540,19 +548,20 @@ fn close_descendants(
             .copied()
             .find(|n| store.node_path(epic_id, *n) == path)
             .expect("cascade visits only the listed targets");
-        let mut child = store
-            .read_node(epic_id, number)
-            .map_err(|e| e.to_string())?;
-        // Idempotent: a descendant already terminal needs no rewrite.
-        if child.frontmatter.status.is_terminal() {
-            return Ok(());
-        }
-        child.frontmatter.status = NodeState::Closed;
-        child.frontmatter.close_reason = reason.clone();
-        child.frontmatter.block_reason = None;
-        child.frontmatter.updated = now();
         store
-            .write_node(epic_id, number, &child)
+            .modify_node(epic_id, number, None, |child| {
+                // Idempotent: a descendant already terminal needs no rewrite, so
+                // the change leaves it as found and nothing is published.
+                if child.frontmatter.status.is_terminal() {
+                    return Ok::<(), StoreError>(());
+                }
+                child.frontmatter.status = NodeState::Closed;
+                child.frontmatter.close_reason = reason.clone();
+                child.frontmatter.block_reason = None;
+                child.frontmatter.updated = now();
+                Ok(())
+            })
+            .map(|_| ())
             .map_err(|e| e.to_string())
     });
 
@@ -579,11 +588,12 @@ pub fn set_epic_closed(
     closed: bool,
     reason: Option<String>,
 ) -> Result<EpicFile, OpError> {
-    let mut epic = read_epic(store, epic_id)?;
-    epic.frontmatter.closed = closed;
-    epic.frontmatter.close_reason = if closed { reason } else { None };
-    epic.frontmatter.updated = now();
-    store.write_epic(epic_id, &epic)?;
+    let (epic, ()) = modify_epic(store, epic_id, None, |epic| {
+        epic.frontmatter.closed = closed;
+        epic.frontmatter.close_reason = if closed { reason } else { None };
+        epic.frontmatter.updated = now();
+        Ok(())
+    })?;
     Ok(epic)
 }
 
@@ -633,8 +643,10 @@ pub fn list_labels(store: &Store, target: &Target) -> Result<Vec<String>, OpErro
     })
 }
 
-/// Read a target's labels, transform them, write back (bumping `updated`), and
-/// return the new set. Shared by add/remove so both take the guarded path.
+/// Read a target's labels under its lock, transform them, publish and return the
+/// new set. Shared by add/remove so both take the bracketed path, which is what
+/// makes a merge a merge: the set transformed is the set as stored, so a label
+/// another actor added moments earlier survives.
 fn with_labels(
     store: &Store,
     target: &Target,
@@ -642,20 +654,20 @@ fn with_labels(
 ) -> Result<Vec<String>, OpError> {
     match target {
         Target::Epic(id) => {
-            let mut epic = read_epic(store, id)?;
-            let new = transform(&epic.frontmatter.labels);
-            epic.frontmatter.labels = new.clone();
-            epic.frontmatter.updated = now();
-            store.write_epic(id, &epic)?;
-            Ok(new)
+            let (epic, ()) = modify_epic(store, id, None, |epic| {
+                epic.frontmatter.labels = transform(&epic.frontmatter.labels);
+                epic.frontmatter.updated = now();
+                Ok(())
+            })?;
+            Ok(epic.frontmatter.labels)
         }
         Target::Node(r) => {
-            let mut node = read_node(store, r)?;
-            let new = transform(&node.frontmatter.labels);
-            node.frontmatter.labels = new.clone();
-            node.frontmatter.updated = now();
-            store.write_node(&r.epic_id, r.number, &node)?;
-            Ok(new)
+            let (node, ()) = modify_node(store, r, None, |node| {
+                node.frontmatter.labels = transform(&node.frontmatter.labels);
+                node.frontmatter.updated = now();
+                Ok(())
+            })?;
+            Ok(node.frontmatter.labels)
         }
     }
 }
@@ -751,20 +763,20 @@ pub fn list_blocked_by(store: &Store, node_ref: &NodeRef) -> Result<Vec<String>,
     Ok(read_node(store, node_ref)?.frontmatter.blocked_by)
 }
 
-/// Read a node's `blocked-by` list, transform it, write back (bumping
-/// `updated`), and return the new list. Shared by add/remove/set/clear so each
-/// takes the guarded path.
+/// Read a node's `blocked-by` list under its lock, transform it, publish and
+/// return the new list. Shared by add/remove/set/clear so each takes the
+/// bracketed path and transforms the list as stored.
 fn with_blocked_by(
     store: &Store,
     node_ref: &NodeRef,
     transform: impl FnOnce(&Vec<String>) -> Vec<String>,
 ) -> Result<Vec<String>, OpError> {
-    let mut node = read_node(store, node_ref)?;
-    let new = transform(&node.frontmatter.blocked_by);
-    node.frontmatter.blocked_by = new.clone();
-    node.frontmatter.updated = now();
-    store.write_node(&node_ref.epic_id, node_ref.number, &node)?;
-    Ok(new)
+    let (node, ()) = modify_node(store, node_ref, None, |node| {
+        node.frontmatter.blocked_by = transform(&node.frontmatter.blocked_by);
+        node.frontmatter.updated = now();
+        Ok(())
+    })?;
+    Ok(node.frontmatter.blocked_by)
 }
 
 // ---------------------------------------------------------------------------
@@ -787,20 +799,24 @@ pub fn take_claim(
     if identifier.is_empty() {
         return Err(OpError::EmptyClaimIdentifier);
     }
-    let mut node = read_node(store, node_ref)?;
-    let prior = node.frontmatter.claim.as_ref().map(|c| c.by.clone());
-    // The claim timestamp and the node's `updated` stamp share one instant, so
-    // "when it was claimed" never drifts from "when the file last changed".
-    let ts = now();
-    // by and at are always set together, so a claim never carries a holder
-    // without a timestamp.
-    node.frontmatter.claim = Some(Claim {
-        by: identifier.to_string(),
-        at: ts,
-    });
-    node.frontmatter.updated = ts;
-    store.write_node(&node_ref.epic_id, node_ref.number, &node)?;
-    Ok((node, prior))
+    // The holder reported as prior is the one stored when the claim was taken,
+    // read under the same lock that publishes the new one — so a reassignment
+    // never names a holder that had already been replaced.
+    modify_node(store, node_ref, None, |node| {
+        let prior = node.frontmatter.claim.as_ref().map(|c| c.by.clone());
+        // The claim timestamp and the node's `updated` stamp share one instant,
+        // so "when it was claimed" never drifts from "when the file last
+        // changed".
+        let ts = now();
+        // by and at are always set together, so a claim never carries a holder
+        // without a timestamp.
+        node.frontmatter.claim = Some(Claim {
+            by: identifier.to_string(),
+            at: ts,
+        });
+        node.frontmatter.updated = ts;
+        Ok(prior)
+    })
 }
 
 /// Release a node's claim, dropping the identifier and timestamp together.
@@ -812,11 +828,11 @@ pub fn release_claim(
     store: &Store,
     node_ref: &NodeRef,
 ) -> Result<(NodeFile, Option<String>), OpError> {
-    let mut node = read_node(store, node_ref)?;
-    let prior = node.frontmatter.claim.take().map(|c| c.by);
-    node.frontmatter.updated = now();
-    store.write_node(&node_ref.epic_id, node_ref.number, &node)?;
-    Ok((node, prior))
+    modify_node(store, node_ref, None, |node| {
+        let prior = node.frontmatter.claim.take().map(|c| c.by);
+        node.frontmatter.updated = now();
+        Ok(prior)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -943,10 +959,11 @@ pub fn list_comments(
     Ok(out)
 }
 
-/// Read a target's comment list, mutate it, write back (bumping `updated`), and
-/// return whatever the transform produced. Shared by add/edit/delete, so each
-/// takes the guarded path; `expect_updated` carries the caller's precondition
-/// (`None` = unconditional).
+/// Read a target's comment list under its lock, mutate it, publish, and return
+/// whatever the transform produced. Shared by add/edit/delete, so each takes the
+/// bracketed path; an append therefore lands beside a comment added moments
+/// earlier instead of replacing the list it was appended to. `expect_updated`
+/// carries the caller's precondition (`None` = unconditional).
 fn with_comments<T>(
     store: &Store,
     target: &Target,
@@ -955,17 +972,19 @@ fn with_comments<T>(
 ) -> Result<T, OpError> {
     match target {
         Target::Epic(id) => {
-            let mut epic = read_epic(store, id)?;
-            let out = transform(&mut epic.frontmatter.comments)?;
-            epic.frontmatter.updated = now();
-            store.write_epic_expecting(id, &epic, expect_updated)?;
+            let (_, out) = modify_epic(store, id, expect_updated, |epic| {
+                let out = transform(&mut epic.frontmatter.comments)?;
+                epic.frontmatter.updated = now();
+                Ok(out)
+            })?;
             Ok(out)
         }
         Target::Node(r) => {
-            let mut node = read_node(store, r)?;
-            let out = transform(&mut node.frontmatter.comments)?;
-            node.frontmatter.updated = now();
-            store.write_node_expecting(&r.epic_id, r.number, &node, expect_updated)?;
+            let (_, out) = modify_node(store, r, expect_updated, |node| {
+                let out = transform(&mut node.frontmatter.comments)?;
+                node.frontmatter.updated = now();
+                Ok(out)
+            })?;
             Ok(out)
         }
     }
@@ -993,24 +1012,31 @@ pub fn add_asset(
     };
     match target {
         Target::Epic(id) => {
-            let mut epic = read_epic(store, id)?;
-            // Reject a duplicate before landing bytes, so a refused add never
-            // touches the companion dir. `add` creates; `update` replaces.
-            if !insert_asset(&mut epic.frontmatter.assets, entry.clone()) {
-                return Err(OpError::AssetExists(name.to_string()));
-            }
-            store.copy_epic_asset(id, name, bytes)?;
-            epic.frontmatter.updated = now();
-            store.write_epic(id, &epic)?;
+            modify_epic(store, id, None, |epic| {
+                // Reject a duplicate before landing bytes, so a refused add never
+                // touches the companion dir. `add` creates; `update` replaces.
+                if !insert_asset(&mut epic.frontmatter.assets, entry.clone()) {
+                    return Err(OpError::AssetExists(name.to_string()));
+                }
+                // The bytes land before the index entry is published, so a crash
+                // leaves an orphan file rather than an index entry pointing at
+                // nothing. They land while the epic's lock is held: an entity's
+                // lock is only ever taken before its asset's, never the other
+                // way round, so the nesting cannot deadlock.
+                store.copy_epic_asset(id, name, bytes)?;
+                epic.frontmatter.updated = now();
+                Ok(())
+            })?;
         }
         Target::Node(r) => {
-            let mut node = read_node(store, r)?;
-            if !insert_asset(&mut node.frontmatter.assets, entry.clone()) {
-                return Err(OpError::AssetExists(name.to_string()));
-            }
-            store.copy_node_asset(&r.epic_id, r.number, name, bytes)?;
-            node.frontmatter.updated = now();
-            store.write_node(&r.epic_id, r.number, &node)?;
+            modify_node(store, r, None, |node| {
+                if !insert_asset(&mut node.frontmatter.assets, entry.clone()) {
+                    return Err(OpError::AssetExists(name.to_string()));
+                }
+                store.copy_node_asset(&r.epic_id, r.number, name, bytes)?;
+                node.frontmatter.updated = now();
+                Ok(())
+            })?;
         }
     }
     Ok(entry)
@@ -1021,22 +1047,24 @@ pub fn add_asset(
 pub fn delete_asset(store: &Store, target: &Target, name: &str) -> Result<Asset, OpError> {
     match target {
         Target::Epic(id) => {
-            let mut epic = read_epic(store, id)?;
-            let removed = remove_asset(&mut epic.frontmatter.assets, name)
-                .ok_or_else(|| OpError::NoSuchAsset(name.to_string()))?;
-            epic.frontmatter.updated = now();
-            store.write_epic(id, &epic)?;
+            let (_, removed) = modify_epic(store, id, None, |epic| {
+                let removed = remove_asset(&mut epic.frontmatter.assets, name)
+                    .ok_or_else(|| OpError::NoSuchAsset(name.to_string()))?;
+                epic.frontmatter.updated = now();
+                Ok(removed)
+            })?;
             // Bytes are removed after the index so a crash leaves an orphan
             // file, never a dangling index entry. A missing file is tolerated.
             let _ = store.remove_epic_asset(id, name);
             Ok(removed)
         }
         Target::Node(r) => {
-            let mut node = read_node(store, r)?;
-            let removed = remove_asset(&mut node.frontmatter.assets, name)
-                .ok_or_else(|| OpError::NoSuchAsset(name.to_string()))?;
-            node.frontmatter.updated = now();
-            store.write_node(&r.epic_id, r.number, &node)?;
+            let (_, removed) = modify_node(store, r, None, |node| {
+                let removed = remove_asset(&mut node.frontmatter.assets, name)
+                    .ok_or_else(|| OpError::NoSuchAsset(name.to_string()))?;
+                node.frontmatter.updated = now();
+                Ok(removed)
+            })?;
             let _ = store.remove_node_asset(&r.epic_id, r.number, name);
             Ok(removed)
         }
@@ -1078,43 +1106,46 @@ pub fn update_asset(
 ) -> Result<Asset, OpError> {
     match target {
         Target::Epic(id) => {
-            let mut epic = read_epic(store, id)?;
-            let entry = epic
-                .frontmatter
-                .assets
-                .iter_mut()
-                .find(|a| a.name == name)
-                .ok_or_else(|| OpError::NoSuchAsset(name.to_string()))?;
-            if let Some(desc) = description {
-                entry.description = desc;
-            }
-            let updated = entry.clone();
-            // Land replacement bytes first (an overwrite), then the guarded
-            // index write; the name is unchanged so no stale file is orphaned.
-            if let Some(bytes) = bytes {
-                store.copy_epic_asset(id, name, bytes)?;
-            }
-            epic.frontmatter.updated = now();
-            store.write_epic(id, &epic)?;
+            let (_, updated) = modify_epic(store, id, None, |epic| {
+                let entry = epic
+                    .frontmatter
+                    .assets
+                    .iter_mut()
+                    .find(|a| a.name == name)
+                    .ok_or_else(|| OpError::NoSuchAsset(name.to_string()))?;
+                if let Some(desc) = description {
+                    entry.description = desc;
+                }
+                let updated = entry.clone();
+                // Land replacement bytes first (an overwrite), then publish the
+                // index entry; the name is unchanged so no stale file is
+                // orphaned.
+                if let Some(bytes) = bytes {
+                    store.copy_epic_asset(id, name, bytes)?;
+                }
+                epic.frontmatter.updated = now();
+                Ok(updated)
+            })?;
             Ok(updated)
         }
         Target::Node(r) => {
-            let mut node = read_node(store, r)?;
-            let entry = node
-                .frontmatter
-                .assets
-                .iter_mut()
-                .find(|a| a.name == name)
-                .ok_or_else(|| OpError::NoSuchAsset(name.to_string()))?;
-            if let Some(desc) = description {
-                entry.description = desc;
-            }
-            let updated = entry.clone();
-            if let Some(bytes) = bytes {
-                store.copy_node_asset(&r.epic_id, r.number, name, bytes)?;
-            }
-            node.frontmatter.updated = now();
-            store.write_node(&r.epic_id, r.number, &node)?;
+            let (_, updated) = modify_node(store, r, None, |node| {
+                let entry = node
+                    .frontmatter
+                    .assets
+                    .iter_mut()
+                    .find(|a| a.name == name)
+                    .ok_or_else(|| OpError::NoSuchAsset(name.to_string()))?;
+                if let Some(desc) = description {
+                    entry.description = desc;
+                }
+                let updated = entry.clone();
+                if let Some(bytes) = bytes {
+                    store.copy_node_asset(&r.epic_id, r.number, name, bytes)?;
+                }
+                node.frontmatter.updated = now();
+                Ok(updated)
+            })?;
             Ok(updated)
         }
     }
@@ -1217,21 +1248,71 @@ pub fn descendants_of(store: &Store, node_ref: &NodeRef) -> Result<Vec<NodeStatu
 /// Read an epic, mapping a missing file to [`OpError::NoSuchEpic`] rather than a
 /// raw I/O error.
 pub fn read_epic(store: &Store, epic_id: &str) -> Result<EpicFile, OpError> {
-    if !store.epic_path(epic_id).is_file() {
-        return Err(OpError::NoSuchEpic(epic_id.to_string()));
-    }
+    require_epic(store, epic_id)?;
     Ok(store.read_epic(epic_id)?)
 }
 
 /// Read a node, mapping a missing file to [`OpError::NoSuchNode`].
 pub fn read_node(store: &Store, node_ref: &NodeRef) -> Result<NodeFile, OpError> {
+    require_node(store, node_ref)?;
+    Ok(store.read_node(&node_ref.epic_id, node_ref.number)?)
+}
+
+/// The epic-existence rule, stated once: addressing an epic that is not there is
+/// an operation-level answer, not an I/O message.
+fn require_epic(store: &Store, epic_id: &str) -> Result<(), OpError> {
+    if !store.epic_path(epic_id).is_file() {
+        return Err(OpError::NoSuchEpic(epic_id.to_string()));
+    }
+    Ok(())
+}
+
+/// The node twin of [`require_epic`].
+fn require_node(store: &Store, node_ref: &NodeRef) -> Result<(), OpError> {
     if !store
         .node_path(&node_ref.epic_id, node_ref.number)
         .is_file()
     {
         return Err(OpError::NoSuchNode(node_ref.clone()));
     }
-    Ok(store.read_node(&node_ref.epic_id, node_ref.number)?)
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// bracketed read-modify-write
+// ---------------------------------------------------------------------------
+
+// Every operation that depends on what is stored goes through one of these two,
+// so the lock is held from before the entity is read until the change is
+// published. What the change is handed is the entity as stored at that moment,
+// which is what makes an operation's merge safe and its precondition meaningful.
+//
+// Existence is checked before the lock so a caller addressing something that is
+// not there gets the operation-level answer rather than an I/O error against a
+// path it never named. Under the lock the store answers again: an entity that
+// vanished in between refuses the write rather than re-creating it from a read
+// that no longer describes the store.
+
+/// Read-modify-write an epic with the whole sequence under its lock.
+fn modify_epic<T>(
+    store: &Store,
+    epic_id: &str,
+    expect_updated: Option<Timestamp>,
+    change: impl FnOnce(&mut EpicFile) -> Result<T, OpError>,
+) -> Result<(EpicFile, T), OpError> {
+    require_epic(store, epic_id)?;
+    store.modify_epic(epic_id, expect_updated, change)
+}
+
+/// Read-modify-write a node with the whole sequence under its lock.
+fn modify_node<T>(
+    store: &Store,
+    node_ref: &NodeRef,
+    expect_updated: Option<Timestamp>,
+    change: impl FnOnce(&mut NodeFile) -> Result<T, OpError>,
+) -> Result<(NodeFile, T), OpError> {
+    require_node(store, node_ref)?;
+    store.modify_node(&node_ref.epic_id, node_ref.number, expect_updated, change)
 }
 
 /// The default force policy for CLI-driven writes: a stale lock fails fast so an
@@ -1250,6 +1331,27 @@ mod tests {
             retry_interval: Duration::from_millis(5),
         })
     }
+
+    /// Lock tunables for a test that holds a lock on purpose: the waiter must be
+    /// able to sit the hold out rather than declare it abandoned, so the
+    /// threshold is far longer than the hold and the retry interval stays short.
+    fn patient_config() -> LockConfig {
+        LockConfig {
+            stale_threshold: Duration::from_secs(5),
+            retry_interval: Duration::from_millis(5),
+        }
+    }
+
+    fn patient_store() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path()).with_lock_config(patient_config());
+        (dir, store)
+    }
+
+    /// How long a deliberately-held lock is held before the competing change is
+    /// published through it: long enough that the waiting operation is certainly
+    /// past the point where an unbracketed read would already have happened.
+    const HOLD: Duration = Duration::from_millis(50);
 
     fn seeded() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
@@ -1885,6 +1987,136 @@ mod tests {
         let reopened = set_epic_closed(&s, "e", false, None).unwrap();
         assert!(!reopened.frontmatter.closed);
         assert_eq!(reopened.frontmatter.close_reason, None);
+    }
+
+    // -- bracketing (the lock spans the read and the publish) --------------
+
+    #[test]
+    fn a_write_against_something_that_is_not_there_names_it_rather_than_a_path() {
+        // A write answers "it is not there" the same way a read does. Without
+        // the check ahead of the lock the caller would instead be told the
+        // target changed since it was read, naming a file path it never gave.
+        let (_d, s) = seeded();
+        create_epic(&s, new_epic("e")).unwrap();
+        let ghost = NodeRef::new("e", 99);
+
+        assert!(matches!(
+            add_labels(&s, &Target::Node(ghost.clone()), &["mine".into()]),
+            Err(OpError::NoSuchNode(ref r)) if *r == ghost
+        ));
+        assert!(matches!(
+            add_labels(&s, &Target::Epic("ghost".into()), &["mine".into()]),
+            Err(OpError::NoSuchEpic(_))
+        ));
+        // A reparent names the node being edited, not the parent it proposes:
+        // the edited node's absence is answered before the new parent is judged.
+        assert!(matches!(
+            edit_node(
+                &s,
+                &ghost,
+                NodeEdits {
+                    parent: Some(NodeRef::new("other", 1)),
+                    ..Default::default()
+                }
+            ),
+            Err(OpError::NoSuchNode(ref r)) if *r == ghost
+        ));
+        assert!(matches!(
+            edit_epic(
+                &s,
+                "ghost",
+                EpicEdits {
+                    name: Some("renamed".into()),
+                    ..Default::default()
+                }
+            ),
+            Err(OpError::NoSuchEpic(_))
+        ));
+    }
+
+    #[test]
+    fn a_label_add_merges_into_a_change_published_while_it_waited_for_the_lock() {
+        let (_d, s) = patient_store();
+        create_epic(&s, new_epic("e")).unwrap();
+        let n = create_node(&s, new_node("e", None)).unwrap();
+        let r = NodeRef::new("e", n.frontmatter.number);
+        let target = Target::Node(r.clone());
+
+        // Hold the node's lock: the add cannot get past acquire, and because the
+        // read is inside the bracket it cannot read the node either.
+        let held =
+            lock::acquire(&s.node_path("e", r.number), &patient_config(), Force::Deny).unwrap();
+
+        std::thread::scope(|scope| {
+            let adder = scope.spawn(|| add_labels(&s, &target, &["mine".into()]).unwrap());
+            std::thread::sleep(HOLD);
+            // Publish a competing label through the held lock, releasing it.
+            let mut theirs = s.read_node("e", r.number).unwrap();
+            theirs.frontmatter.labels.push("theirs".into());
+            held.commit(theirs.to_text().unwrap().as_bytes()).unwrap();
+            adder.join().unwrap();
+        });
+
+        // The label published while the add waited is in the set the add merged
+        // into: the add read the node only once it held the lock, so it could
+        // never have merged into a copy that predates that publish.
+        assert_eq!(
+            s.read_node("e", r.number).unwrap().frontmatter.labels,
+            vec!["theirs", "mine"]
+        );
+    }
+
+    #[test]
+    fn a_cascade_leaves_a_descendant_resolved_while_it_waited_exactly_as_it_is() {
+        // The idempotence test is made against the descendant read under its own
+        // lock, so a resolution that landed while the cascade waited is neither
+        // re-resolved nor republished.
+        let (_d, s) = patient_store();
+        create_epic(&s, new_epic("e")).unwrap();
+        let parent = create_node(&s, new_node("e", None)).unwrap();
+        let pr = NodeRef::new("e", parent.frontmatter.number);
+        let child = create_node(&s, new_node("e", Some(pr.clone()))).unwrap();
+        let cr = NodeRef::new("e", child.frontmatter.number);
+        let child_path = s.node_path("e", cr.number);
+
+        let held = lock::acquire(&child_path, &patient_config(), Force::Deny).unwrap();
+
+        let resolved_bytes = std::thread::scope(|scope| {
+            // The cascade plans against the still-open child, then waits on its
+            // lock.
+            let closer = scope.spawn(|| {
+                set_node_status(
+                    &s,
+                    &pr,
+                    NodeStatusChange::Closed {
+                        reason: Some("obsolete".into()),
+                        cascade: true,
+                    },
+                )
+                .unwrap()
+            });
+            std::thread::sleep(HOLD);
+            // Another actor resolves the child as done, through the held lock.
+            let mut resolved = s.read_node("e", cr.number).unwrap();
+            resolved.frontmatter.status = NodeState::Done;
+            let bytes = resolved.to_text().unwrap().into_bytes();
+            held.commit(&bytes).unwrap();
+            closer.join().unwrap();
+            bytes
+        });
+
+        let after = s.read_node("e", cr.number).unwrap();
+        assert_eq!(
+            after.frontmatter.status,
+            NodeState::Done,
+            "a descendant resolved under the cascade's nose keeps its own resolution"
+        );
+        assert_eq!(after.frontmatter.close_reason, None);
+        assert_eq!(
+            std::fs::read(&child_path).unwrap(),
+            resolved_bytes,
+            "a descendant needing no change must not be rewritten"
+        );
     }
 
     // -- labels ------------------------------------------------------------
