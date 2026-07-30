@@ -117,32 +117,29 @@ pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
 /// ignored rather than handed to the level underneath.
 ///
 /// The surface's shape is an input rather than something read off a key, because
-/// the reflex key means one thing on each shape: how many fields there are decides
-/// whether there is another to move to, and how many lines the focused field holds
-/// decides whether a line break is content.
+/// two keys mean different things by it: how many fields there are decides whether
+/// the field-motion keys have anywhere to go, and how many lines the focused field
+/// holds decides whether a line break is content. Neither decides how a surface is
+/// accepted — that is one key everywhere.
 fn surface_action(key: KeyEvent, shape: Shape) -> Option<Action> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     Some(match (key.code, ctrl) {
+        // The save key accepts every surface, whatever kind of field has focus and
+        // however many fields there are: the way to finish is one key, learned once.
         // Raw mode is already on, which clears `IXON`, so Ctrl-S arrives as a key
         // press instead of being eaten as flow control.
         (KeyCode::Char('s'), true) => Action::Accept,
-        // In a field that holds many lines the reflex key is content: a line break
-        // is what a reader means by it while writing prose, so accepting there is
-        // the save key's alone however many fields the surface has. Where the field
-        // holds one line the key finishes a one-field surface — there is no next
-        // field for it to move to — and moves on through a form, so the save key is
-        // the only way to accept one and pressing through the fields never submits
-        // it by arriving at the last.
-        (KeyCode::Enter, _) => match shape.lines {
-            Lines::Many => Action::Insert('\n'),
-            Lines::One => match shape.fields {
-                Fields::One => Action::Accept,
-                Fields::Several => Action::NextField,
-            },
-        },
-        // Field navigation, bound where there is another field to reach and nowhere
-        // else: a key that did nothing on a one-field surface would be a key taught
-        // for nothing.
+        // The reflex key is a line break, which is content in a field that holds
+        // many lines and in no other, so anywhere else it is unbound: it neither
+        // accepts nor moves, and a reader learns one meaning for it instead of a
+        // rule with cases. Ignoring it says nothing, deliberately — the hint strip
+        // already carries the save key, and a notice covers the whole strip for as
+        // long as it is up, so teaching the save key would hide the hint that
+        // teaches it along with the field and editor hints beside it.
+        (KeyCode::Enter, _) if matches!(shape.lines, Lines::Many) => Action::Insert('\n'),
+        // Field motion, and the only keys that move between fields. Bound where
+        // there is another field to reach and nowhere else: a key that did nothing
+        // on a one-field surface would be a key taught for nothing.
         (KeyCode::Tab, _) if matches!(shape.fields, Fields::Several) => Action::NextField,
         (KeyCode::BackTab, _) if matches!(shape.fields, Fields::Several) => Action::PreviousField,
         (KeyCode::Char('g'), true) => Action::ExternalEditor,
@@ -253,10 +250,9 @@ pub const HELP: &[(&str, &str)] = &[
         "move the cursor; ↑ / ↓ by line in a text area",
     ),
     ("g / G", "first / last row"),
-    (
-        "Enter / l / →",
-        "open the row (nothing if it has nothing below)",
-    ),
+    // Enter's two meanings, and it has no third: it is a line break where breaks
+    // are content, and nothing at all in a field that holds one line.
+    ("Enter / l / →", "open the row; a line break in a text area"),
     ("Backspace / h / ←", "leave the level"),
     ("Esc", "leave the level, a field, or editing mode"),
     ("Ctrl-D / Ctrl-U", "scroll the preview half a screen"),
@@ -276,14 +272,8 @@ pub const HELP: &[(&str, &str)] = &[
         "n / S / b",
         "editing mode: the name / the summary / the body",
     ),
-    (
-        "Ctrl-S / Enter",
-        "save; Enter unless it is a newline or the next field",
-    ),
-    (
-        "Tab / Shift-Tab",
-        "next / previous field; Enter moves forwards too",
-    ),
+    ("Ctrl-S", "save, whichever field you are in"),
+    ("Tab / Shift-Tab", "next / previous field"),
     ("Ctrl-G", "edit the open field in $EDITOR"),
     (
         "Ctrl-A / Ctrl-E",
@@ -411,6 +401,42 @@ mod tests {
                 })
             })
             .collect()
+    }
+
+    /// Every key press a terminal can deliver that this crate could plausibly
+    /// bind: each named code and each printable ASCII character, plain and with
+    /// the control modifier. A claim that *one* key does something is only worth
+    /// as much as the sweep proving no other does, and the keys that must not is
+    /// the list nobody thinks to write down.
+    fn every_key() -> Vec<KeyEvent> {
+        let codes = [
+            KeyCode::Enter,
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Esc,
+            KeyCode::Backspace,
+            KeyCode::Delete,
+            KeyCode::Insert,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+        ];
+        let mut keys: Vec<KeyEvent> = Vec::new();
+        for code in codes.into_iter().chain((1..=12).map(KeyCode::F)) {
+            keys.push(plain(code));
+            keys.push(KeyEvent::new(code, KeyModifiers::CONTROL));
+            keys.push(KeyEvent::new(code, KeyModifiers::SHIFT));
+        }
+        for c in ' '..='~' {
+            keys.push(plain(KeyCode::Char(c)));
+            keys.push(ctrl(c));
+        }
+        keys
     }
 
     /// Words for a dialog's answers, so a test about the letters is not also a
@@ -582,18 +608,47 @@ mod tests {
     }
 
     #[test]
-    fn a_one_field_surface_is_accepted_by_either_key_and_left_by_the_way_out() {
-        let one = one_line(Fields::One);
-        // Ctrl-S accepts anywhere; a one-field surface has no next field for the
-        // reflex key to move to, so it accepts too.
-        for key in [ctrl('s'), plain(KeyCode::Enter)] {
-            assert_eq!(action_for(key, one), Some(Action::Accept), "{key:?}");
+    fn the_keyboard_sweep_holds_the_keys_a_reader_would_reach_for() {
+        // The sweeps are worth exactly what they cover, and one that had lost the
+        // reflex key or the field keys would pass while saying nothing about the
+        // keys this map used to give a second meaning to.
+        let sweep = every_key();
+        for key in [
+            plain(KeyCode::Enter),
+            key_named("Tab"),
+            key_named("Shift-Tab"),
+            ctrl('s'),
+            plain(KeyCode::Esc),
+        ] {
+            assert!(sweep.contains(&key), "{key:?} is not swept");
         }
-        // And no field to move to means no key that moves: a bound key that could
-        // only land where it started is a key taught for nothing.
-        for key in [key_named("Tab"), key_named("Shift-Tab")] {
-            assert_eq!(action_for(key, one), None, "{key:?}");
+    }
+
+    #[test]
+    fn the_save_key_accepts_every_shape_of_surface_and_no_other_key_accepts_any() {
+        // One key finishes a surface — one field or many, whatever kind of field the
+        // keyboard is in — so a reader learns the way to finish once instead of a
+        // rule with cases. The sweep is the point: the keys that must not accept
+        // include the ones a reader would reach for, and naming them is exactly the
+        // list an author forgets.
+        for mode in surface_modes() {
+            assert_eq!(
+                action_for(ctrl('s'), mode),
+                Some(Action::Accept),
+                "{mode:?}"
+            );
+            for key in every_key().into_iter().filter(|key| *key != ctrl('s')) {
+                assert_ne!(
+                    action_for(key, mode),
+                    Some(Action::Accept),
+                    "{key:?} accepts in {mode:?}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn a_surface_is_left_and_handed_to_the_editor_by_the_same_keys_on_every_shape() {
         for mode in surface_modes() {
             // The way out, and its alias: inside a mode Ctrl-C is exactly Esc.
             for key in [plain(KeyCode::Esc), ctrl('c')] {
@@ -608,44 +663,60 @@ mod tests {
                 Some(Action::ExternalEditor),
                 "{mode:?}"
             );
-            // Saving is the one way to accept that every shape shares.
-            assert_eq!(
-                action_for(ctrl('s'), mode),
-                Some(Action::Accept),
-                "{mode:?}"
-            );
         }
     }
 
     #[test]
-    fn a_surface_with_several_fields_is_navigated_and_the_reflex_key_moves_rather_than_accepts() {
-        let several = one_line(Fields::Several);
-        // The reflex key means what the shape says, which is why the shape reaches
-        // this map at all: on a form it moves on, so pressing through the fields
-        // never submits one, and the save key stays the only way to accept.
-        assert_eq!(
-            action_for(plain(KeyCode::Enter), several),
-            Some(Action::NextField)
-        );
-        assert_eq!(
-            action_for(plain(KeyCode::Enter), one_line(Fields::One)),
-            Some(Action::Accept),
-            "the reflex key means the same thing on both counts"
-        );
-        // Forwards and backwards, by the keys a form is navigated with everywhere.
-        assert_eq!(
-            action_for(key_named("Tab"), several),
-            Some(Action::NextField)
-        );
-        assert_eq!(
-            action_for(key_named("Shift-Tab"), several),
-            Some(Action::PreviousField)
-        );
-        // The navigation keys are the surface's alone: while browsing they are not
-        // bound at all, so nothing moves a field cursor that does not exist.
+    fn the_field_keys_move_between_fields_wherever_there_is_a_field_to_reach() {
+        // Whatever kind of field the keyboard is in: the count decides whether there
+        // is anywhere to go, and the kind never does — a form holding a text area is
+        // navigated exactly like one that does not.
+        for lines in Lines::ALL.iter().copied() {
+            let several = Mode::Surface(Shape {
+                fields: Fields::Several,
+                lines,
+            });
+            assert_eq!(
+                action_for(key_named("Tab"), several),
+                Some(Action::NextField),
+                "{lines:?}"
+            );
+            assert_eq!(
+                action_for(key_named("Shift-Tab"), several),
+                Some(Action::PreviousField),
+                "{lines:?}"
+            );
+            // And no field to move to means no key that moves: a bound key that
+            // could only land where it started is a key taught for nothing.
+            let one = Mode::Surface(Shape {
+                fields: Fields::One,
+                lines,
+            });
+            for key in [key_named("Tab"), key_named("Shift-Tab")] {
+                assert_eq!(action_for(key, one), None, "{key:?} in {one:?}");
+            }
+        }
+        // The field keys are the surface's alone: while browsing they are not bound
+        // at all, so nothing moves a field cursor that does not exist.
         for mode in [Mode::Browse, Mode::Editing] {
             for key in [key_named("Tab"), key_named("Shift-Tab")] {
                 assert_eq!(action_for(key, mode), None, "{key:?} in {mode:?}");
+            }
+        }
+        // And they are the only keys that move: no other key on the board reaches
+        // another field, so a reader who has learned these two has learned all of it.
+        for mode in surface_modes() {
+            for key in every_key()
+                .into_iter()
+                .filter(|key| !matches!(key.code, KeyCode::Tab | KeyCode::BackTab))
+            {
+                assert!(
+                    !matches!(
+                        action_for(key, mode),
+                        Some(Action::NextField) | Some(Action::PreviousField)
+                    ),
+                    "{key:?} moves between fields in {mode:?}"
+                );
             }
         }
     }
@@ -701,22 +772,22 @@ mod tests {
     }
 
     #[test]
-    fn in_a_field_that_holds_many_lines_the_reflex_key_is_a_newline_and_only_the_save_key_accepts()
-    {
-        // The kind outranks the count, which is why both reach this map: a body
-        // buffer is one field, and the shape that accepts a one-field surface by
-        // reflex would submit a paragraph break as a finished body.
+    fn the_reflex_key_is_a_line_break_where_breaks_are_content_and_is_ignored_elsewhere() {
+        // One meaning, and the field's kind is the whole of what decides whether it
+        // applies: a break is what a reader means by the key while writing prose.
         for mode in text_areas() {
             assert_eq!(
                 action_for(plain(KeyCode::Enter), mode),
                 Some(Action::Insert('\n')),
                 "{mode:?}"
             );
-            assert_eq!(
-                action_for(ctrl('s'), mode),
-                Some(Action::Accept),
-                "{mode:?}"
-            );
+        }
+        // Anywhere else it is bound to nothing at all, at either field count: it
+        // neither finishes a surface nor moves the keyboard, because a key that did
+        // one of those here and a break there is a key with cases to remember.
+        for fields in Fields::ALL.iter().copied() {
+            let mode = one_line(fields);
+            assert_eq!(action_for(plain(KeyCode::Enter), mode), None, "{mode:?}");
         }
     }
 

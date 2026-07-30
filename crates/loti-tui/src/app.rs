@@ -756,8 +756,9 @@ impl Surface {
 
     /// Its shape, to the precision a key's meaning turns on: how many fields it
     /// holds, and how many lines the focused one holds. This is the whole of what
-    /// the key map is told about a surface, so the map decides what the reflex key
-    /// means rather than the surface deciding it after the fact.
+    /// the key map is told about a surface, so the map decides which keys have
+    /// somewhere to go and which of them writes a line break, rather than the
+    /// surface deciding it after the fact.
     ///
     /// Recomputed on every ask rather than captured when the surface opens: the
     /// focus moves and a field may come and go, so a captured shape is a key map
@@ -779,10 +780,10 @@ impl Surface {
     /// Put the keyboard in the next or the previous field, wrapping round at
     /// either end.
     ///
-    /// Wrapping because the reflex key is field navigation on a surface with
-    /// several fields: navigation that stopped at the last field would leave that
-    /// key doing nothing there, and forwards alone would no longer reach every
-    /// field.
+    /// Wrapping because the forward key alone must reach every field: a walk that
+    /// stopped at the last one would leave that key dead there, and nothing about
+    /// arriving at the last field means anything — accepting is the save key's, so
+    /// the end of the fields is not the end of filling them in.
     fn move_focus(&mut self, forwards: bool) {
         let Some(last) = self.fields.len().checked_sub(1) else {
             return;
@@ -1007,9 +1008,10 @@ impl App {
             // it: while a field is being typed into, the mode's own letters are
             // characters.
             Some(Modal::Help) | None => match (&self.surface, self.editing.is_some()) {
-                // How many fields it holds travels with the mode, because the key
-                // map decides from it what the reflex key means and which keys move
-                // between fields.
+                // Its shape travels with the mode, because the key map decides from
+                // it which keys move between fields and which key writes a line
+                // break — never how the surface is accepted, which is one key
+                // wherever the reader is standing.
                 (Some(surface), _) => Mode::Surface(surface.shape()),
                 (None, true) => Mode::Editing,
                 (None, false) => Mode::Browse,
@@ -3261,9 +3263,9 @@ mod tests {
             ],
         );
 
-        // Forwards, and round from the last: the reflex key is field navigation on
-        // a surface with several fields, so a walk that stopped at the end would
-        // leave that key doing nothing there.
+        // Forwards, and round from the last: the forward key has to reach every
+        // field on its own, so a walk that stopped at the end would leave it dead
+        // there.
         for expected in [1, 2, 0, 1] {
             app.apply(Action::NextField).unwrap();
             assert_eq!(app.surface().map(Surface::focus), Some(expected));
@@ -3388,10 +3390,10 @@ mod tests {
         let (_fx, mut app) = app();
         open_the_label_surface(&mut app);
 
-        // The key map sends no break to a one-line field — the reflex key accepts
-        // there — but the field is what guarantees the value never holds one, so a
-        // break arriving by any route is dropped rather than stored. (The editor's
-        // door is pinned where the editor round-trip is.)
+        // The key map sends no break to a one-line field — the reflex key is bound
+        // to nothing there — but the field is what guarantees the value never holds
+        // one, so a break arriving by any route is dropped rather than stored. (The
+        // editor's door is pinned where the editor round-trip is.)
         type_into(&mut app, "one");
         app.apply(Action::Insert('\n')).unwrap();
         type_into(&mut app, "two");
@@ -3691,8 +3693,8 @@ mod tests {
         app.apply(Action::Edit(FreeForm::Body)).unwrap();
         assert_eq!(field_value(&app), fx.epic_body());
         // One field holding many lines, which is the whole of what the key map is
-        // told: it is what makes the reflex key a line break here and the save key
-        // the only way to accept.
+        // told: it is what makes the reflex key a line break here, while the save
+        // key accepts here exactly as it does everywhere else.
         assert_eq!(app.mode(), surface_mode(Fields::One, Lines::Many));
         // Nothing has been typed, so the way out has nothing to warn about: text
         // the store already held is not text the reader wrote.
@@ -3945,8 +3947,8 @@ mod tests {
                 };
                 assert_eq!(field_value(&app), held, "{field:?} on {reference}");
                 // One field holding one line, which is the whole of what the key map
-                // is told: the reflex key finishes a short field rather than putting
-                // a break in a value that may hold none.
+                // is told: a value that may hold no break is one the reflex key does
+                // not reach at all, and the save key is what finishes it.
                 assert_eq!(app.mode(), surface_mode(Fields::One, Lines::One));
                 // Nothing has been typed, so the way out asks nothing: text the
                 // store already held is not text the reader wrote.

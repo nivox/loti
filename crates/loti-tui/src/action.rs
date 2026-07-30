@@ -42,18 +42,16 @@ pub enum Mode {
 /// How many fields an open surface holds, to the precision a key's meaning turns
 /// on: whether there is another field to move to at all.
 ///
-/// Invariant: this reaches the key map, so the map decides what the reflex key
-/// means instead of guessing — it accepts a surface with one field, and moves to
-/// the next field on a surface with several, where accepting is the save key's
-/// alone. A key map that could not tell them apart would either submit a form
-/// half filled in or leave a one-field surface with no reflex way to finish.
+/// Invariant: this decides whether the field-motion keys are bound and hinted,
+/// and nothing else — accepting is the save key's on every surface, whatever it
+/// holds and however much of it, so a count can never be what submits a form or
+/// what fails to finish one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fields {
-    /// Exactly one, so there is nowhere to move: the field-navigation keys have
-    /// nothing to reach and are not bound.
+    /// Exactly one, so there is nowhere to move: the field-motion keys have
+    /// nothing to reach, are not bound, and are not taught.
     One,
-    /// More than one, so the fields are navigated and the reflex key moves
-    /// between them.
+    /// More than one, so the field-motion keys move between them.
     Several,
 }
 
@@ -96,12 +94,12 @@ impl Lines {
 /// An open surface as the key map is told it: how many fields it holds, and how
 /// many lines the field the keyboard is in holds.
 ///
-/// Invariant: the key map needs both halves, because the reflex key's meaning
-/// turns on both — it accepts a surface with one field, moves on through a form,
-/// and is a newline in a field that holds many lines however many fields there
-/// are, where accepting is the save key's alone. Neither half is enough by
-/// itself: a count alone would submit a body buffer on the reader's first
-/// paragraph break, and a kind alone would submit a form half filled in.
+/// Invariant: the two halves answer different keys and never the same one. The
+/// count decides whether the field-motion keys have anywhere to go; the kind
+/// decides whether the reflex key is a line break, which it is in a field holding
+/// many lines and nowhere else. Accepting is the save key's alone on every shape,
+/// so neither half takes part in that decision: one key means one thing wherever
+/// the reader is, rather than a rule with cases to remember.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Shape {
     /// How many fields the surface holds.
@@ -350,6 +348,10 @@ pub enum Action {
     /// Put the keyboard in the previous field of the open surface.
     PreviousField,
     /// Accept the open surface: write what its fields hold.
+    ///
+    /// One key carries this on every surface, whatever kind of field the keyboard
+    /// is in and however many fields there are, so the way to finish is learned
+    /// once rather than as a rule with cases.
     Accept,
     /// Hand the open field's content to the external editor and take the result
     /// back.
