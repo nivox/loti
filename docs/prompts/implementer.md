@@ -41,5 +41,10 @@ block*.
 Do not commit. Do not change ticket status. Do not run mutation testing — that
 is the reviewer's, and duplicating it has never changed a verdict.
 
+**Delete every temporary file you made.** The orchestrator commits the whole
+tree, so anything left behind ships as though you meant it. New source and test
+files are welcome; scratch is not. Check `git status --porcelain` before you
+report, and list every path you touched.
+
 If the record does not settle something you must choose, stop and report
 `DECISION NEEDED` rather than guessing, or ask the supervisor.

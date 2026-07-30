@@ -10,8 +10,12 @@ reviewer.
 The two working roles each have a handbook under `docs/handbooks/`. Read yours
 before you start: `implementing.md` covers shaping code so its boundaries are
 observable, which behaviour is pinned at which layer, and what to report;
-`reviewing.md` covers running mutations in a sandbox and judging whether the
-tests could ever have failed. The rules below bind regardless of which you are.
+`reviewing.md` covers running mutations and judging whether the tests could ever
+have failed. The rules below bind regardless of which you are.
+
+Only the orchestrator commits, and it commits the whole tree. Everything else
+follows from that: work on the ticket branch it opened, delete every temporary
+file you make, and leave behind exactly what should ship.
 
 `docs/prompts/` holds one prompt per role. An orchestrator is started on a loti
 reference with `orchestrator.md`, and spawns each subagent from `implementer.md`

@@ -6,6 +6,17 @@ time, delegating each to a fresh implementer and an independent reviewer.
 You are invoked with a loti reference — an epic id, or a node reference. That
 reference is your root, and it decides everything you are allowed to touch.
 
+You are also invoked **on a branch**. Whatever `git branch --show-current` says
+on your first cycle is your **target branch** — it may be `main`, it may be a
+branch for one epic. Record it then and never re-derive it: after a merge, or a
+cycle that ended somewhere unexpected, "the branch I am on" stops being the same
+question as "what I am integrating into". A detached HEAD is not a state to work
+from; stop and say so.
+
+You are given the target branch exactly as you are given the loti reference. You
+create ticket branches under it and delete them; you never create the target,
+switch to another one, or work on a second.
+
 ## Scope: the node you were given, and nothing beside it
 
 Your scope is the root plus every descendant, to any depth.
@@ -37,10 +48,27 @@ start on the root while anything under it is open.
 
 Repeat until a stop condition below is met.
 
-### 1. Choose
+### 1. Check the ground, then choose
 
-Re-read the tickets **every cycle**. State may have changed under you, and a
-ticket that was unblocked last cycle may not be now.
+Before anything else in a cycle, assert all three. Each failure means something
+from a previous cycle survived, and guessing which is how work gets stranded or
+overwritten.
+
+    git status --porcelain          # empty
+    git branch --show-current       # the target branch
+    git branch --list 'ticket/*'    # empty
+
+- **Not clean** — an untracked file or a stray modification. **Stop and ask the
+  human.** You cannot tell a crashed implementer's work from a reviewer's
+  leftover from environment noise, and each wants a different answer. Noise that
+  belongs to the machine rather than the project goes in `.git/info/exclude`,
+  which is the human's call to make once.
+- **Not on the target** — stop; you do not switch branches to recover.
+- **A leftover `ticket/*` branch** — a cycle died mid-flight. Stop and report it
+  rather than starting a second one on top.
+
+Then re-read the tickets. State may have changed under you, and a ticket that
+was unblocked last cycle may not be now.
 
     loti ticket list <root> --fields ref,status,labels,name,blocked-by
 
@@ -61,10 +89,11 @@ remain, and has every blocker terminal. Among candidates prefer, in order:
 settle. Leave those until last; if they are all that remain, stop and put them
 to the human.
 
-Then take it:
+Then take it, and open a branch for it:
 
     loti ticket status <ref> --in-progress
     loti ticket claim take <ref> --as orchestrator
+    git switch -c ticket/<epic>-<n>
 
 ### 2. Implement
 
@@ -77,16 +106,38 @@ in a prompt, replace the explanation with the command that reads it. A
 paraphrase written from memory is how a subagent ends up building the opposite
 of what was agreed.
 
-### 3. Review
+### 3. Commit provisionally, then review
 
-Read `docs/prompts/reviewer.md`, fill it in, spawn one reviewer with **fresh
-context**, and pass the implementer's report verbatim.
+The implementer's work is committed **before** a reviewer sees it, and it is the
+only moment where untracked files mean something:
 
-**Name the sandbox yourself, one name per ticket**, and give the same name to
-every round on that ticket. A reviewer has no memory to name itself after, so
-left to invent one it picks a fresh name each round and throws away the build
-cache the name exists to preserve — a cold build per round, and a
-multi-gigabyte directory left behind for each.
+    git status --porcelain            # untracked here = the implementer's new files
+    cargo fmt --all
+    cargo clippy --workspace --all-targets -- -D warnings
+    cargo test --workspace
+    git add -A && git commit
+
+Cross-check what is there against the implementer's reported file list before
+staging, and stop on anything it did not claim. `git add -A` and not a pathspec:
+an allowlist silently drops `Cargo.lock`, `.github/`, `flake.nix` and
+`AGENTS.md`, so a commit that adds a dependency does not build from a fresh
+clone while every gate passes.
+
+The commit is what makes the working tree safe to mutate, and it means nothing
+unreviewed can be lost. Then read `docs/prompts/reviewer.md`, fill it in, spawn
+one reviewer with **fresh context**, and pass the implementer's report verbatim.
+
+**When the reviewer returns — or dies — restore before you read anything:**
+
+    git checkout HEAD -- crates       # any mutation left behind
+    git rev-parse HEAD                # unchanged: only you commit
+    git branch --show-current         # still the ticket branch
+    git status --porcelain            # empty; untracked ⇒ stop and ask
+
+Unconditionally, including when the reviewer says it cleaned up. It matters most
+when the reviewer **crashed**, which is exactly when its own report is missing
+and a half-applied mutation is most likely. Never `git clean`: this checkout
+carries the tracker and the machine's own files, and `-x` would take both.
 
 ### 4. Repeat until the reviewer passes
 
@@ -98,23 +149,28 @@ On `FAIL`, judge each must-fix yourself before delegating:
   still wrong.
 - **Send it back** to a fresh implementer when it needs design, or spans files.
 
+Either way the fix is **a commit of its own** on the ticket branch, so the next
+reviewer can see the remediation by itself.
+
 **You never run a mutation.** Run the gates — they say the tree is committable.
-Whether a test could have failed is a reviewer's finding, made in a sandbox that
-enforces one mutation at a time against a known baseline; you have no such
-sandbox and no such habits, and evidence you produce for your own change is
-evidence from the party that wants the ticket closed. Fixing by hand and
-checking it yourself is how a fix ships still broken.
+Whether a test could have failed is a reviewer's finding, made one mutation at a
+time against a known baseline with a log that cannot be reconstructed after the
+fact; evidence you produce for your own change is evidence from the party that
+wants the ticket closed. Fixing by hand and checking it yourself is how a fix
+ships still broken.
 
 A remediation therefore ends one of two ways:
 
 - **Closed with no re-review** — but only when the reviewer supplied the fix *as
-  code*, proved it kills the named mutation in its own probe sandbox, and you
+  code*, proved it kills the named mutation on a held tree, and you
   applied **exactly that and nothing else**. Quote its proof in the resolution.
   If you retyped it, adapted it, chose where to put it, or changed anything else
   in the same pass, this does not apply.
 - **Re-reviewed, scoped** — fill `<PRIOR_ROUNDS>` in the reviewer prompt: what
   was already accepted, the previous round's mutation table, and the
-  remediation. Everything not on that table is judged by reading.
+  remediation. Because each round is its own commit, the reviewer reads the two
+  apart: `git diff <target>...HEAD` is the whole change, `git diff HEAD~1` is
+  just what you changed. Everything not on that table is judged by reading.
 
 Pick one. Doing both — self-checking *and* re-reviewing — pays twice and trusts
 the weaker of the two answers.
@@ -163,19 +219,20 @@ filed. Write it for someone reading in six months with no memory of today.
 
 Then:
 
-    cargo fmt --all
-    cargo clippy --workspace --all-targets -- -D warnings
-    cargo test --workspace
-    git add -u crates docs scripts && git commit
-    scripts/review-sandbox.sh discard <the sandbox name>
+    git switch <target branch>
+    git merge --squash ticket/<epic>-<n>
+    git commit
+    git branch -D ticket/<epic>-<n>
 
-The last one is not housekeeping. A reviewer's `clean` deliberately keeps the
-build directory so the next round starts warm, and by then there is no sandbox
-left to stand in to remove it — you are the only one who knows the rounds are
-over. Each is well over a gigabyte.
+The squash is what turns however many rounds it took into **one commit per
+ticket**. The message states the **why** and the invariant, never the what, and
+never a ticket id or spec section — see `AGENTS.md`.
 
-One commit per ticket. The message states the **why** and the invariant, never
-the what, and never a ticket id or spec section — see `AGENTS.md`.
+A squash that conflicts means the target moved under the ticket. That is a stop
+condition, not something to resolve creatively.
+
+End every cycle back on the target branch with a clean tree, so the next cycle's
+first check passes for the right reason.
 
 ## Stop
 

@@ -9,14 +9,26 @@
 
 ---
 
-Review the uncommitted working-tree changes in `/home/nivox/dev/loti` for
-`<TICKET>`.
+Review `<TICKET>` in `/home/nivox/dev/loti`. The change is committed on branch
+`ticket/<EPIC>-<N>`; the change under review is:
+
+    git diff <TARGET_BRANCH>...HEAD
 
 **Read `docs/handbooks/reviewing.md` and follow it.** It defines the three
-phases, the sandbox, what to mutate, how to triage a survivor, how to verify a
-removals ledger, and the verdict format. It is not optional.
+phases, how to run a mutation, what to mutate, how to triage a survivor, how to
+verify a removals ledger, and the verdict format. It is not optional.
 
-You are read-only on the repository.
+**You never commit, and you never push.** Only the orchestrator does. You mutate
+the working tree through `scripts/mutation-check.sh`, which restores it for you.
+
+**Delete every scratch file you make before you report.** The orchestrator
+restores tracked files, but nothing removes a file that was never tracked, and
+what is left behind is taken for part of the change.
+
+**Flag anything in the diff that looks committed by accident** — a scratch or
+debug file, an editor artifact, a stray binary, a credential, a change to a file
+the ticket has no business touching. Staging is wholesale, so the diff is where
+an accident becomes visible, and you are the one reading it.
 
 ## The implementer's report
 
@@ -34,15 +46,19 @@ Read each of these, **including the comments**:
 
 - Baseline at `HEAD`: `<N>` tests passing.
 
-- **Sandbox name: `<SANDBOX>`.** Use exactly this, and `<SANDBOX>-head` for a
-  `--from-head` baseline. Do not invent a name and do not mutate outside
-  `review-sandbox.sh`: the name is the build cache's key, and the log the script
-  writes **is** your mutation table. Finish with `clean`, never `clean --cache`.
+- **Target branch: `<TARGET_BRANCH>`.** Use the three-dot form
+  `git diff <TARGET_BRANCH>...HEAD` for the change under review, never the
+  two-dot form: if the target has moved on, two dots also reports *its* commits,
+  reversed, as though the implementer had made them.
+
+- **Do not mutate by hand.** `scripts/mutation-check.sh` refuses an unchanged
+  tree, refuses a tree carrying anything outside `crates/`, restores after every
+  answer, and writes the log that **is** your mutation table.
 
 - **Before you mutate anything**, build and report the phase-1 cross-check: every
   flagged judgement and every "Done when" bullet against the test that pins it.
   The empty rows are what to mutate. A claim with a test named for it and no
-  reason for doubt gets a line saying so, not a sandbox run.
+  reason for doubt gets a line saying so, not a mutation run.
 
 - **Rulings already made by the orchestrator.** Do not flag these as invented
   policy; judge only whether they are implemented faithfully:
@@ -75,7 +91,7 @@ Read each of these, **including the comments**:
 <PRIOR_MUTATION_TABLE>
 
 Re-run a row **only** if the remediation touched the code or the test it names.
-For every other row the expected answer is judgement by reading, and a sandbox
+For every other row the expected answer is judgement by reading, and a mutation
 run you cannot justify against this table is waste. Say which rows you re-ran
 and why.
 

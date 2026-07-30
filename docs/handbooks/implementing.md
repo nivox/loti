@@ -119,6 +119,21 @@ run mutation campaigns, do not report mutation tables. Duplicating it wastes the
 run and has never once changed a verdict. What you owe instead is the claims
 table below, which tells the reviewer exactly what to attack.
 
+## Leave behind exactly what should be committed
+
+You do not commit — the orchestrator does, and it stages **everything** in the
+tree, tracked and new alike. So what you leave is what ships.
+
+- **New files are welcome.** A new module or a new test file is committed like
+  any other change; you do not have to work around anything.
+- **Delete every temporary file you made.** A scratch fixture, a debug binary, a
+  notes file, a copy of something you were comparing against. Nothing
+  distinguishes them from work you meant to keep, so anything left behind is
+  committed as though you intended it.
+- The tree was clean when you started, so everything in it at the end is
+  attributable to you. Check with `git status --porcelain` before you report,
+  and list every path in your report so the orchestrator can cross-check.
+
 ## What to report
 
 - files changed
