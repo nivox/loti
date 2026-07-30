@@ -1714,6 +1714,69 @@ fn an_asset_deletion_asks_naming_the_asset_and_the_notice_names_it_once_it_is_go
 }
 
 #[test]
+fn a_level_opens_on_an_asset_whose_bytes_are_gone_and_the_row_says_so() {
+    let (_dir, store) = fixture();
+    let epic = Target::Epic("browser".into());
+    ops::add_asset(&store, &epic, "sketch.txt", None, b"sketch\n").unwrap();
+    ops::add_asset(&store, &epic, "diagram.png", None, b"\x89PNG\r\n").unwrap();
+    // Reached behind loti's back on purpose: no write path leaves an asset indexed
+    // without its bytes, and that is the store a reader opens the browser on.
+    std::fs::remove_file(store.epic_asset_dir("browser").join("diagram.png")).unwrap();
+
+    let mut app = App::new(store, Theme::with_color(false)).unwrap();
+    to_the_assets_row(&mut app);
+    app.apply(Action::Descend).unwrap(); // into the assets
+                                         // Onto the unreadable one, since the preview follows the cursor: what the
+                                         // reader is looking at is the row and the pane together.
+    app.apply(Action::CursorLast).unwrap();
+    let width = nav_pane_width(&app);
+    let (terminal, lines) = draw(&mut app);
+
+    // The level opened rather than the session ending, and it is the level that
+    // was asked for.
+    assert_eq!(lines[0].trim(), "epics › browser › assets");
+    // Bounded to the navigation pane: the preview pane shares every line and
+    // reports the same corruption in its own words.
+    let rows = nav_lines(&terminal, width);
+    let row = |needle: &str| {
+        rows.iter()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} is not on the level: {rows:#?}"))
+    };
+    // Colour is off here, so whatever tells the reader this row is broken has to
+    // be a word on the row itself.
+    assert!(
+        row("diagram.png").contains("unreadable"),
+        "{:?}",
+        row("diagram.png")
+    );
+    // The readable asset beside it still reads as itself, size and all: one
+    // unreadable member costs the level nothing else.
+    assert!(row("sketch.txt").contains(" B"), "{:?}", row("sketch.txt"));
+    assert!(
+        !row("sketch.txt").contains("unreadable"),
+        "{:?}",
+        row("sketch.txt")
+    );
+
+    // A row is one line, so the reason is the pane's to carry in full — and the
+    // pane the cursor is facing does carry it, for the same member. Bounded past
+    // the navigation pane, whose rows share these lines.
+    let pane: Vec<String> = lines
+        .iter()
+        .map(|l| l.chars().skip(usize::from(width)).collect())
+        .collect();
+    assert!(
+        pane.iter().any(|l| l.contains("diagram.png")),
+        "the pane is not showing the row the cursor is on: {pane:#?}"
+    );
+    assert!(
+        pane.iter().any(|l| l.contains("unavailable")),
+        "the pane says nothing about what could not be read: {pane:#?}"
+    );
+}
+
+#[test]
 fn the_assets_row_teaches_no_letter_and_names_the_command_that_attaches_one() {
     let (_dir, store) = fixture();
     let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();

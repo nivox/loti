@@ -737,6 +737,11 @@ fn row_line<'a>(
         }
         RowKind::Collection(_) | RowKind::Withdrawn => (" ", muted, muted),
         RowKind::Member => (" ", plain, plain),
+        // A member the store lists and the browser could not read. Its identifier
+        // is real and reads as one; what stands where its detail would go is the
+        // reason, in the notice colour, because it is a message rather than
+        // something the store holds. The row's own words say so with colour off.
+        RowKind::Unreadable => (" ", plain, Style::default().fg(theme.notice())),
     };
     let (id_style, count_style, name_style) = match emphasis {
         Emphasis::Cursor => (plain, plain, plain),

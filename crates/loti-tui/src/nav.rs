@@ -182,14 +182,25 @@ impl Nav {
     /// browser lands on the deepest level that still exists rather than
     /// resetting to the roster. A surviving level that has lost the row the
     /// cursor sat on falls back to the nearest position, never past the end.
-    pub fn reload<F, E>(&mut self, mut load: F) -> Result<(), E>
+    ///
+    /// Re-reading cannot fail the position: a level the store could not be read
+    /// for keeps the rows it has, because a failure to read is not evidence that
+    /// the level is gone — only an empty listing is. That is also what makes a
+    /// reload safe to run after a write has already committed: there is no outcome
+    /// here that could keep the reader from being told what the write did.
+    pub fn reload<F, E>(&mut self, mut load: F)
     where
         F: FnMut(&Level) -> Result<Vec<Row>, E>,
     {
         let mut kept = 0usize;
         for depth in 0..self.stack.len() {
             let level = self.stack[depth].level.clone();
-            let Ok(rows) = load(&level) else { break };
+            let Ok(rows) = load(&level) else {
+                // Keep this level as it stands, and stop: what is below it was
+                // read through rows this reload could not confirm.
+                kept = depth;
+                break;
+            };
             // A level below the roster only exists because a parent row had
             // children; if it now has none, the level itself is gone.
             if rows.is_empty() && depth > 0 {
@@ -208,7 +219,6 @@ impl Nav {
             kept = depth;
         }
         self.stack.truncate(kept + 1);
-        Ok(())
     }
 }
 
@@ -374,8 +384,7 @@ mod tests {
             // A new epic sorts ahead of "b" and would shift it by index.
             Level::Epics => Ok(vec![epic_row("a", 2), epic_row("aa", 0), epic_row("b", 0)]),
             other => load(other),
-        })
-        .unwrap();
+        });
         assert_eq!(
             nav.frame().current().map(|r| r.label.clone()),
             Some("b".to_string())
@@ -389,8 +398,7 @@ mod tests {
         nav.reload(|level| match level {
             Level::Epics => Ok(vec![epic_row("a", 2)]),
             other => load(other),
-        })
-        .unwrap();
+        });
         assert_eq!(nav.cursor(), 0);
         assert_eq!(nav.rows().len(), 1);
     }
@@ -407,9 +415,34 @@ mod tests {
             // level always keeps its collection rows.
             Level::Collection(..) => Ok(vec![]),
             other => load(other),
-        })
-        .unwrap();
+        });
         assert_eq!(nav.crumbs(), vec!["epics", "a"]);
+    }
+
+    #[test]
+    fn reload_keeps_a_level_it_could_not_re_read_rather_than_dropping_it() {
+        let mut nav = Nav::new(load(&Level::Epics).unwrap());
+        nav.descend(load).unwrap(); // epic "a"
+        nav.descend(load).unwrap(); // its `labels`
+        let before: Vec<String> = nav.rows().iter().map(|r| r.label.clone()).collect();
+
+        nav.reload(|level| match level {
+            // "I could not read it" is not the answer "it has no members": a
+            // failure is no evidence the level is gone, so dropping it — as an
+            // emptied level is dropped — would claim something the store did not
+            // say, and yank the reader up a level over a store it cannot read.
+            Level::Collection(..) => Err(()),
+            other => load(other),
+        });
+
+        assert_eq!(nav.crumbs(), vec!["epics", "a", "labels"]);
+        assert_eq!(
+            nav.rows()
+                .iter()
+                .map(|r| r.label.clone())
+                .collect::<Vec<_>>(),
+            before
+        );
     }
 
     #[test]

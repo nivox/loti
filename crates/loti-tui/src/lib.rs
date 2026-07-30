@@ -11,6 +11,25 @@
 //! The crate owns the terminal and nothing else. Store access lives in
 //! [`data`], the position in [`nav`], the state machine in [`app`], and drawing
 //! in [`ui`], so none of those needs a terminal to be exercised.
+//!
+//! # What ends a session
+//!
+//! A browser is most useful on a store that cannot be read in full, so **nothing
+//! the store does to a read ends a running session**. A member the store lists and
+//! the browser cannot read is a row that says so; a document that cannot be built
+//! says so in the preview pane; a level that cannot be listed at all leaves the
+//! reader where they were and reports why. A corrupt or partly-missing store is
+//! browsed, not exited.
+//!
+//! Two classes remain, and neither of them is the store's contents:
+//!
+//! * **Before the first frame** the browser refuses to open, saying why in
+//!   ordinary output: no store here, a format this binary cannot read, or an epic
+//!   roster that cannot be listed. There is no screen yet to report into, and
+//!   nothing to browse.
+//! * **The terminal itself** — drawing, reading input, giving the screen to an
+//!   external editor and taking it back. A browser that cannot use the terminal
+//!   cannot tell the reader anything, so it stops and lets the failure be printed.
 
 pub mod action;
 pub mod app;
@@ -290,6 +309,23 @@ fn failure_and_causes(error: &anyhow::Error) -> String {
         .join(": ")
 }
 
+/// Take an intent's outcome back to the reader, and say whether the session ends.
+///
+/// A store the browser cannot fully read is reported and browsed on: a level that
+/// could not be listed leaves the reader on the level they were already looking
+/// at, with a dialog naming what failed. This is the one place a failure could
+/// have ended the session, so it is the one place the rule is applied — see the
+/// crate documentation for the classes that do end one.
+fn intent_outcome(app: &mut App, outcome: Result<bool>) -> bool {
+    match outcome {
+        Ok(exit) => exit,
+        Err(e) => {
+            app.store_unreadable(failure_and_causes(&e));
+            false
+        }
+    }
+}
+
 /// Take an editor round-trip's outcome back to the surface it was called from.
 ///
 /// A failure to run an editor is reported to the reader rather than ending the
@@ -359,7 +395,8 @@ fn event_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
                 // The mode is an input to the mapping, so one key can be the way
                 // out of a mode here and the way out of the browser there.
                 if let Some(action) = keymap::action_for(key, app.mode()) {
-                    if app.apply(action)? {
+                    let outcome = app.apply(action);
+                    if intent_outcome(&mut app, outcome) {
                         return Ok(());
                     }
                 }
@@ -374,10 +411,12 @@ fn event_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
                 }
                 MouseEventKind::Up(MouseButton::Left) => app.release(),
                 MouseEventKind::ScrollDown => {
-                    app.apply(action::Action::CursorDown)?;
+                    let outcome = app.apply(action::Action::CursorDown);
+                    intent_outcome(&mut app, outcome);
                 }
                 MouseEventKind::ScrollUp => {
-                    app.apply(action::Action::CursorUp)?;
+                    let outcome = app.apply(action::Action::CursorUp);
+                    intent_outcome(&mut app, outcome);
                 }
                 _ => {}
             },
@@ -721,6 +760,42 @@ mod tests {
             assert!(refusal.contains("EDITOR"), "{refusal}");
             assert!(refusal.contains("VISUAL"), "{refusal}");
         }
+    }
+
+    #[test]
+    fn a_level_that_cannot_be_listed_is_reported_and_the_session_goes_on() {
+        // Driven through the loop's own wiring rather than through the state
+        // machine's method: this is the boundary an intent's failure used to leave
+        // the session by, so the claim is about what the boundary does with one.
+        let fx = data::fixture::Fixture::build();
+        let mut app = App::new(fx.store.clone(), Theme::with_color(false)).unwrap();
+        // The epic is on screen and its own file goes underneath the browser: its
+        // level can no longer be listed at all, which is the failure a row of its
+        // own cannot report.
+        fx.remove_the_epics_file();
+        // Derived from the seam, not from the boundary under test, so a message
+        // built from something else than the failure fails this.
+        let expected = failure_and_causes(
+            &data::rows(&fx.store, &data::Level::Epic(fx.epic.clone()))
+                .expect_err("the epic's own file is gone"),
+        );
+
+        let outcome = app.apply(Action::Descend);
+        assert!(
+            outcome.is_err(),
+            "the level listed without the epic's file: nothing here is being tested"
+        );
+        assert!(
+            !intent_outcome(&mut app, outcome),
+            "a store that cannot be read in full ended the session"
+        );
+
+        let Some(Modal::Dialog(dialog)) = app.modal() else {
+            panic!("nothing said why the level did not open: {:?}", app.modal())
+        };
+        assert_eq!(dialog.message(), expected);
+        // And the reader is left where they were, on the level that still lists.
+        assert_eq!(app.nav().crumbs(), vec!["epics"]);
     }
 
     #[test]

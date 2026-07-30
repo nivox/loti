@@ -60,6 +60,10 @@ const REQUIRED_TITLE: &str = " a required field is empty ";
 /// editor, so an editor that will not run is the browser's failure to report and
 /// not the store's.
 const EDITOR_TITLE: &str = " the editor could not run ";
+/// See [`CONFIRM_TITLE`]. A store this binary opened and then could not read a
+/// part of is reported and browsed on: the reader is told what could not be read,
+/// and keeps whatever was on screen.
+const UNREADABLE_TITLE: &str = " part of the store could not be read ";
 
 /// What a label field is called wherever it has to be named: on the surface that
 /// fills it in, and in the warning that says it is empty.
@@ -881,22 +885,28 @@ impl App {
     ///
     /// Ending the session is decided before any layer is consulted, because it is
     /// the one intent no layer may answer for itself: see [`App::quit`].
+    ///
+    /// The one failure this returns is a level that could not be listed at all.
+    /// It is not the session's end: the caller reports it through
+    /// [`App::store_unreadable`] and the browser goes on showing what it has. Every
+    /// other layer here is infallible, so no store failure can reach a caller
+    /// from a path that has already written something.
     pub fn apply(&mut self, action: Action) -> Result<bool> {
         if matches!(action, Action::Quit) {
             return Ok(self.quit());
         }
         if self.modal.is_some() {
-            self.apply_to_modal(action)?;
+            self.apply_to_modal(action);
             return Ok(false);
         }
         // An open surface is the layer under an overlay and above the mode that
         // opened it: every key belongs to the field while it is open.
         if self.surface.is_some() {
-            self.apply_to_surface(action)?;
+            self.apply_to_surface(action);
             return Ok(false);
         }
         if self.editing.is_some() {
-            self.apply_editing(action)?;
+            self.apply_editing(action);
             return Ok(false);
         }
 
@@ -987,7 +997,7 @@ impl App {
             Action::ResetSplit => self.set_nav_percent(DEFAULT_NAV_PERCENT),
             Action::ToggleZoom => self.zoomed = !self.zoomed,
 
-            Action::Reload => self.reload()?,
+            Action::Reload => self.reload(),
         }
         Ok(false)
     }
@@ -1027,13 +1037,13 @@ impl App {
     /// costly, and it must be answered rather than escaped past. Neither of them
     /// ends the session — that is decided before an overlay is consulted, so this
     /// cannot return an exit.
-    fn apply_to_modal(&mut self, action: Action) -> Result<()> {
+    fn apply_to_modal(&mut self, action: Action) {
         if matches!(self.modal, Some(Modal::Help)) {
             match action {
                 Action::ToggleHelp | Action::Unwind | Action::Ascend => self.modal = None,
                 _ => {}
             }
-            return Ok(());
+            return;
         }
         // A dialog admits its listed answers and nothing else: nothing underneath
         // it may move while it is open.
@@ -1041,13 +1051,12 @@ impl App {
             // The affirmative answer performs whatever the dialog carries, so no
             // one operation is named here and a further kind of question needs no
             // arm of its own.
-            Action::Delete => self.answer()?,
+            Action::Delete => self.answer(),
             // A refused write leaves the editing session standing: only a
             // successful write ends it, so dismissing lands back in the mode.
             Action::Unwind => self.dismiss(),
             _ => {}
         }
-        Ok(())
     }
 
     /// Get out of the open dialog, landing wherever it says the reader belongs.
@@ -1079,24 +1088,23 @@ impl App {
     /// session is one edit long, and the mode indicator going as the notice
     /// arrives is what reads as "that finished". The store is re-read with it,
     /// because the row just removed must not stay on screen.
-    fn answer(&mut self) -> Result<()> {
+    fn answer(&mut self) {
         // A dialog that only reports has a way out and no answer, so nothing it
         // was raised for can be performed: it stands until it is dismissed.
         let Some(Modal::Dialog(dialog)) = &self.modal else {
-            return Ok(());
+            return;
         };
         let Some(answer) = dialog.affirmative.clone() else {
-            return Ok(());
+            return;
         };
         self.modal = None;
         match answer.performs {
-            Performs::Write { write, done } => self.commit(&write, done)?,
+            Performs::Write { write, done } => self.commit(&write, done),
             // Nothing reaches the store, and the mode stays on its frozen row: the
             // way out unwinds one layer at a time, and the surface is the layer
             // that was asked about.
             Performs::Discard => self.surface = None,
         }
-        Ok(())
     }
 
     /// Write, and report what happened.
@@ -1105,12 +1113,17 @@ impl App {
     /// what it did. A refused one keeps everything: the surface stays open with its
     /// text, so the reader can fix it or carry it out through the external editor —
     /// only a successful write ends the session.
-    fn commit(&mut self, write: &data::Write, done: String) -> Result<()> {
+    ///
+    /// Invariant: nothing after the store has taken the write may fail. The change
+    /// is already committed by then, so a failure that skipped the notice — or
+    /// ended the session — would leave the reader believing nothing happened; the
+    /// re-read that follows it cannot fail for exactly that reason.
+    fn commit(&mut self, write: &data::Write, done: String) {
         match data::perform(&self.store, write) {
             Ok(()) => {
                 self.surface = None;
                 self.editing = None;
-                self.reload()?;
+                self.reload();
                 self.flash(done);
             }
             // The store's own words, so the browser and the CLI teach the same
@@ -1118,7 +1131,6 @@ impl App {
             // store rule gains a nuance.
             Err(e) => self.modal = Some(Modal::Dialog(Box::new(Dialog::refusal(e.to_string())))),
         }
-        Ok(())
     }
 
     /// Carry out an intent while a surface is open.
@@ -1127,7 +1139,7 @@ impl App {
     /// external editor, help, and the way out. There is no unknown-key notice here
     /// — in a field an unbound key is simply not a character, and the mode's notice
     /// belongs to the layer where letters are actions.
-    fn apply_to_surface(&mut self, action: Action) -> Result<()> {
+    fn apply_to_surface(&mut self, action: Action) {
         match action {
             // The text is the only copy of what the reader wrote, so the way out of
             // a buffer with typing in it asks first; an untouched one is not worth
@@ -1138,7 +1150,7 @@ impl App {
                 }
                 None => self.surface = None,
             },
-            Action::Accept => self.accept()?,
+            Action::Accept => self.accept(),
             Action::ExternalEditor => {
                 if let Some(surface) = &self.surface {
                     self.editor_handoff = Some(surface.fields[surface.focus].value.clone());
@@ -1162,7 +1174,6 @@ impl App {
                 }
             }
         }
-        Ok(())
     }
 
     /// Accept the open surface: check the store has something to be given, then
@@ -1172,17 +1183,17 @@ impl App {
     /// is the store's judgement and its refusal is shown verbatim — it is the
     /// browser refusing to send a field the reader never filled in, and saying
     /// which field that is rather than which rule was broken.
-    fn accept(&mut self) -> Result<()> {
+    fn accept(&mut self) {
         let Some(surface) = &self.surface else {
-            return Ok(());
+            return;
         };
         if let Some(index) = surface.unfilled() {
             let dialog = Dialog::required(surface.fields[index].label, index);
             self.modal = Some(Modal::Dialog(Box::new(dialog)));
-            return Ok(());
+            return;
         }
         let (write, done) = surface.write();
-        self.commit(&write, done)
+        self.commit(&write, done);
     }
 
     /// The text an external editor has been asked to take, clearing the request.
@@ -1232,7 +1243,7 @@ impl App {
     /// Quitting never reaches this layer: it is answered for every layer at once,
     /// and the mode holds text the store has not been given, so it is refused
     /// while the mode is on whatever is layered over it. See [`App::quit`].
-    fn apply_editing(&mut self, action: Action) -> Result<()> {
+    fn apply_editing(&mut self, action: Action) {
         match action {
             Action::Unwind => self.editing = None,
             Action::ToggleHelp => self.modal = Some(Modal::Help),
@@ -1240,7 +1251,7 @@ impl App {
             // the natural move when the preview looks stale before committing to
             // an edit.
             Action::Reload => {
-                self.reload()?;
+                self.reload();
                 // The reload may have ended the mode already, because it found
                 // the store may no longer be written. The row is beside the
                 // point then, and the notice that said so must not be replaced
@@ -1272,7 +1283,6 @@ impl App {
                 None => self.flash(NOT_AN_EDITING_ACTION),
             },
         }
-        Ok(())
     }
 
     /// Re-read every level from the store, and ask again whether it may be
@@ -1284,15 +1294,39 @@ impl App {
     /// reached once. A reload that finds it entered ends the editing session,
     /// because nothing the mode could do is offered any more, and says so once —
     /// the state slot then carries the condition for as long as it holds.
-    fn reload(&mut self) -> Result<()> {
+    ///
+    /// Re-reading cannot fail: a level the store could not be read for keeps the
+    /// rows it has. That is what makes this safe to run straight after a write has
+    /// committed — no outcome of it can stand between the write and the notice
+    /// that tells the reader what was written.
+    fn reload(&mut self) {
         let store = &self.store;
-        self.nav.reload(|level| data::rows(store, level))?;
+        self.nav.reload(|level| data::rows(store, level));
         self.read_only = data::read_only(&self.store);
         if self.read_only.is_some() && self.editing.is_some() {
             self.editing = None;
             self.flash(EDITING_STOPPED_READ_ONLY);
         }
-        Ok(())
+    }
+
+    /// Report a part of the store that could not be read, keeping the session.
+    ///
+    /// A browser is most useful on a store that is not entirely readable, so
+    /// nothing the store does to a read ends a session: what could not be read is
+    /// reported and whatever was already on screen stays there. A dialog rather
+    /// than the transient notice channel, because corruption is a thing the reader
+    /// has to act on, and it carries the whole failure chain — the outermost words
+    /// name what was attempted and the cause under them is the part that can be
+    /// acted on.
+    pub fn store_unreadable(&mut self, message: String) {
+        self.modal = Some(Modal::Dialog(Box::new(Dialog::report(
+            UNREADABLE_TITLE,
+            message,
+            Dismissal {
+                word: "dismiss",
+                performs: None,
+            },
+        ))));
     }
 
     /// Set the divider, clamped so neither pane can be resized away.

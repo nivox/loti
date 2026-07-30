@@ -174,6 +174,15 @@ pub enum RowKind {
     /// store retains it — so the row says so in a word as well as in colour,
     /// because colour alone carries nothing in this crate.
     Withdrawn,
+    /// A member the store lists but whose own data could not be read: an asset
+    /// whose bytes are gone, a blocker naming a ticket that is not there.
+    ///
+    /// The row stands where the member does, because a store the reader cannot
+    /// fully read is exactly when a browser is most useful: the corruption is
+    /// reported on the row rather than taking the whole level down with it. Its
+    /// name carries the reason in a word as well as in colour, for the same reason
+    /// a withdrawn comment does.
+    Unreadable,
 }
 
 /// One row of the navigation pane.
@@ -491,31 +500,43 @@ fn member_rows(store: &Store, container: &Container, kind: Collection) -> Result
             };
             for reference in ops::list_blocked_by(store, node)? {
                 let blocker = NodeRef::parse(&reference)?;
-                let blocking = ops::read_node(store, &blocker)?;
-                out.push(Row {
-                    // A blocker may live in another epic, so it carries the whole
-                    // reference rather than the bare number a sibling would.
-                    label: reference,
-                    selection: Selection::Blocker(container.clone(), blocker),
-                    // A blocker reads as a work row, glyph and all, because what
-                    // it points at is work.
-                    kind: RowKind::Work(blocking.frontmatter.status.wire_name().to_string()),
-                    name: blocking.frontmatter.name,
-                    children: 0,
+                // A blocker may live in another epic, so the row carries the whole
+                // reference rather than the bare number a sibling would.
+                let selection = Selection::Blocker(container.clone(), blocker.clone());
+                out.push(match ops::read_node(store, &blocker) {
+                    Ok(blocking) => Row {
+                        label: reference,
+                        selection,
+                        // A blocker reads as a work row, glyph and all, because
+                        // what it points at is work.
+                        kind: RowKind::Work(blocking.frontmatter.status.wire_name().to_string()),
+                        name: blocking.frontmatter.name,
+                        children: 0,
+                    },
+                    // An entry naming a ticket the store has not got is a
+                    // dependency the reader has to see to remove — so the row
+                    // stays, and says so.
+                    Err(e) => unreadable(selection, reference, &e),
                 });
             }
         }
         Collection::Assets => {
             for asset in ops::list_assets(store, &target)? {
-                let size = asset_size(store, container, &asset.name)?;
-                out.push(Row {
-                    selection: Selection::Asset(container.clone(), asset.name.clone()),
-                    kind: RowKind::Member,
-                    label: asset.name,
-                    // A description can be long, so it is left to the preview;
-                    // the size is what makes a row worth scanning.
-                    name: human_size(size),
-                    children: 0,
+                let selection = Selection::Asset(container.clone(), asset.name.clone());
+                out.push(match asset_size(store, container, &asset.name) {
+                    Ok(size) => Row {
+                        selection,
+                        kind: RowKind::Member,
+                        label: asset.name,
+                        // A description can be long, so it is left to the preview;
+                        // the size is what makes a row worth scanning.
+                        name: human_size(size),
+                        children: 0,
+                    },
+                    // The index promises bytes the store has not got. The row
+                    // keeps the asset it names, so the reader can still take the
+                    // dangling entry off.
+                    Err(e) => unreadable(selection, asset.name, &e),
                 });
             }
         }
@@ -525,14 +546,41 @@ fn member_rows(store: &Store, container: &Container, kind: Collection) -> Result
 
 /// An asset's size, from the file's own metadata rather than by reading it: a
 /// level of assets must not pull every payload into memory to draw its rows.
+///
+/// The refusal names the corruption and not the asset, because the row that shows
+/// it names the asset in its own identifier column.
 fn asset_size(store: &Store, container: &Container, name: &str) -> Result<u64> {
     let path = match container {
         Container::Epic(id) => store.epic_asset_dir(id).join(name),
         Container::Node(r) => store.node_asset_dir(&r.epic_id, r.number).join(name),
     };
     Ok(std::fs::metadata(path)
-        .with_context(|| format!("asset {name} is indexed but its bytes are missing"))?
+        .context("indexed, but its bytes are missing")?
         .len())
+}
+
+/// The word a row unreadable for any reason leads with, so one word covers every
+/// corruption a member can carry rather than a reader learning one per kind.
+const UNREADABLE: &str = "unreadable";
+
+/// A member the store lists but whose own data could not be read.
+///
+/// The level still opens and the row still points at the member, so the reader
+/// sees what the store claims to hold and can still act on the entry — a dangling
+/// index entry is a thing to delete, which takes a row to stand on.
+///
+/// The reason is the failure's own outermost words, not a browser paraphrase, and
+/// the fixed word leads because a row is read with colour off as often as with it
+/// on. A row is one line, so the pane the cursor faces carries the failure in
+/// full: it reports the same corruption for the same member.
+fn unreadable(selection: Selection, label: String, failure: &impl std::fmt::Display) -> Row {
+    Row {
+        selection,
+        kind: RowKind::Unreadable,
+        label,
+        name: format!("{UNREADABLE} · {failure}"),
+        children: 0,
+    }
 }
 
 /// An asset's bytes as text a pane can render: valid UTF-8 carrying no control
@@ -1211,6 +1259,30 @@ pub(crate) mod fixture {
             std::fs::remove_file(self.store.epic_path(&self.epic)).unwrap();
         }
 
+        /// Take an epic asset's bytes away, leaving the index entry that promises
+        /// them, by name.
+        ///
+        /// Reached behind the operation layer on purpose: no write path leaves a
+        /// store in this shape, and it is the shape a browser has to survive — an
+        /// asset that is indexed and whose payload is not there.
+        pub(crate) fn strip_an_assets_bytes(&self, name: &str) {
+            std::fs::remove_file(self.store.epic_asset_dir(&self.epic).join(name)).unwrap();
+        }
+
+        /// Take the blocking ticket's own file away, leaving the dependency entry
+        /// that names it.
+        ///
+        /// Behind the operation layer for the same reason as a stripped payload:
+        /// loti has no operation that removes a ticket, so a dependency on a ticket
+        /// that is not in the store only exists in a store something else damaged.
+        pub(crate) fn remove_the_blockers_file(&self) {
+            std::fs::remove_file(
+                self.store
+                    .node_path(&self.blocker.epic_id, self.blocker.number),
+            )
+            .unwrap();
+        }
+
         /// Take every label off the epic, as a concurrent writer would.
         ///
         /// This is the shortest way to make a level the browser is standing on
@@ -1633,6 +1705,87 @@ mod tests {
         // the preview's business, but a size is what makes a level scannable.
         assert_eq!(row.name, human_size(2048));
         assert!(!row.name.is_empty() && !row.label.is_empty());
+    }
+
+    #[test]
+    fn an_asset_whose_bytes_are_missing_is_listed_and_its_own_row_says_so() {
+        let fx = Fixture::build();
+        let container = Container::Epic(fx.epic.clone());
+        let broken = fx.another_asset();
+        fx.strip_an_assets_bytes(&broken);
+
+        let listed = rows(
+            &fx.store,
+            &Level::Collection(container.clone(), Collection::Assets),
+        )
+        .expect("a payload the browser cannot read must not fail the level");
+        // Every asset the store lists is a row, the unreadable one included: the
+        // level opens on a store that cannot be read in full, which is exactly
+        // when a browser is worth having.
+        assert_eq!(
+            listed.iter().map(|r| r.label.clone()).collect::<Vec<_>>(),
+            fx.epic_assets()
+        );
+
+        let row = listed
+            .iter()
+            .find(|r| r.label == broken)
+            .expect("the dangling entry keeps its own row");
+        assert_eq!(row.kind, RowKind::Unreadable);
+        // In words, not in colour alone, and the reason with them: a size is what
+        // stands here normally, so "unreadable" has to be readable as the reason
+        // this row has none.
+        assert!(row.name.starts_with(UNREADABLE), "{:?}", row.name);
+        assert!(row.name.contains("bytes"), "{:?}", row.name);
+        // And it still points at the asset, so the reader can stand on the
+        // dangling entry and take it off.
+        assert_eq!(row.selection, Selection::Asset(container, broken.clone()));
+
+        // One unreadable member is one row: the asset beside it reads as it did.
+        let intact = listed
+            .iter()
+            .find(|r| r.label != broken)
+            .expect("the fixture's own asset");
+        assert_eq!(intact.kind, RowKind::Member);
+        assert!(!intact.name.contains(UNREADABLE), "{:?}", intact.name);
+    }
+
+    #[test]
+    fn a_blocker_naming_a_ticket_that_is_gone_is_listed_and_its_own_row_says_so() {
+        let fx = Fixture::build();
+        let container = Container::Node(fx.node.clone());
+        fx.remove_the_blockers_file();
+
+        let listed = rows(
+            &fx.store,
+            &Level::Collection(container.clone(), Collection::BlockedBy),
+        )
+        .expect("a dependency the browser cannot read must not fail the level");
+        assert_eq!(
+            listed.iter().map(|r| r.label.clone()).collect::<Vec<_>>(),
+            fx.node_blockers()
+        );
+
+        let row = &listed[0];
+        assert_eq!(row.kind, RowKind::Unreadable);
+        assert!(row.name.starts_with(UNREADABLE), "{:?}", row.name);
+        // The store's own sentence about what is missing, not a browser paraphrase
+        // of it: the same rule reaches the reader here as from the command line.
+        assert!(
+            row.name.contains(
+                &ops::read_node(&fx.store, &fx.blocker)
+                    .expect_err("the ticket is gone")
+                    .to_string()
+            ),
+            "{:?}",
+            row.name
+        );
+        // A dependency on a ticket that is not there is a thing to remove, which
+        // takes a row that still names the entry.
+        assert_eq!(
+            row.selection,
+            Selection::Blocker(container, fx.blocker.clone())
+        );
     }
 
     #[test]
