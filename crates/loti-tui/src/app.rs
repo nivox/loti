@@ -1859,7 +1859,7 @@ mod tests {
     /// Put the cursor on the first work row. Every epic and node level leads with
     /// its collection rows, so reaching a ticket means walking past them.
     fn to_work_row(app: &mut App) {
-        to_row(app, |kind| matches!(kind, RowKind::Work(_)));
+        to_row(app, |kind| matches!(kind, RowKind::Work { .. }));
     }
 
     /// Walk back out to the epic roster, so a test that has been somewhere already

@@ -837,7 +837,7 @@ fn row_line<'a>(
     let disabled = muted.add_modifier(Modifier::DIM);
     let plain = Style::default();
     let (glyph_cell, id_style, name_style) = match &row.kind {
-        RowKind::Work(status) => {
+        RowKind::Work { status, .. } => {
             // Only an epic, a node or a blocker is ever work, and the last two
             // are nodes: an epic's states are its own.
             let color = match &row.selection {
@@ -1043,7 +1043,7 @@ mod tests {
         for row in mixed_level() {
             let line = row_line(&row, theme, 2, 3, 40, Emphasis::Plain);
             let cell = line.spans[0].content.to_string();
-            let is_work = matches!(row.kind, RowKind::Work(_));
+            let is_work = matches!(row.kind, RowKind::Work { .. });
             assert_eq!(
                 cell != " ",
                 is_work,

@@ -162,9 +162,20 @@ impl Selection {
 /// What a row stands for, which is what decides how it reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowKind {
-    /// An epic or a node, carrying its state's wire name. Only a work row has a
-    /// state, so a filled glyph column is itself the signal that a row is work.
-    Work(String),
+    /// An epic or a node, carrying its state's wire name and who holds its
+    /// claim. Only a work row has a state, so a filled glyph column is itself the
+    /// signal that a row is work — and only a work row can be claimed, which is
+    /// why the holder is here rather than on every row.
+    Work {
+        /// The state's wire name.
+        status: String,
+        /// Who holds the single-holder claim on what the row points at; absent
+        /// exactly when it is unclaimed. Only the holder travels, never when the
+        /// claim was taken: that belongs to the document in the preview.
+        ///
+        /// Invariant: a claim is node-only, so an epic's row never carries one.
+        claimed_by: Option<String>,
+    },
     /// A collection of the level's container. It is structure rather than work,
     /// and has no state to invent a glyph for.
     Collection(Collection),
@@ -364,7 +375,12 @@ pub fn rows(store: &Store, level: &Level) -> Result<Vec<Row>> {
                 let children = read::epic_children(store, &epic.id)?.len();
                 out.push(Row {
                     selection: Selection::Epic(epic.id.clone()),
-                    kind: RowKind::Work(epic.status),
+                    kind: RowKind::Work {
+                        status: epic.status,
+                        // An epic carries no claim at all — a claim is taken on a
+                        // unit of work — so the roster never marks a row.
+                        claimed_by: None,
+                    },
                     label: epic.id,
                     name: epic.name,
                     children,
@@ -390,6 +406,9 @@ pub fn rows(store: &Store, level: &Level) -> Result<Vec<Row>> {
 
 /// Turn a core children listing into rows, resolving each child's own child
 /// count so the level can be drawn without a second pass.
+///
+/// The holder comes off the listing rather than from a read per child: a node can
+/// have many children, so one call answers for all of them.
 fn child_rows(store: &Store, children: Vec<render::ChildRow>) -> Result<Vec<Row>> {
     let mut out = Vec::new();
     for child in children {
@@ -398,7 +417,10 @@ fn child_rows(store: &Store, children: Vec<render::ChildRow>) -> Result<Vec<Row>
         out.push(Row {
             label: node_ref.number.to_string(),
             selection: Selection::Node(node_ref),
-            kind: RowKind::Work(child.status),
+            kind: RowKind::Work {
+                status: child.status,
+                claimed_by: child.claimed_by,
+            },
             name: child.name,
             children: grandchildren,
         });
@@ -508,8 +530,15 @@ fn member_rows(store: &Store, container: &Container, kind: Collection) -> Result
                         label: reference,
                         selection,
                         // A blocker reads as a work row, glyph and all, because
-                        // what it points at is work.
-                        kind: RowKind::Work(blocking.frontmatter.status.wire_name().to_string()),
+                        // what it points at is work. The status, the name and the
+                        // holder are three fields of this one read: a dependency
+                        // list is a short curated list the browser reads entry by
+                        // entry to draw at all, so the holder costs nothing beyond
+                        // the read the row already pays for.
+                        kind: RowKind::Work {
+                            status: blocking.frontmatter.status.wire_name().to_string(),
+                            claimed_by: blocking.frontmatter.claim.map(|claim| claim.by),
+                        },
                         name: blocking.frontmatter.name,
                         children: 0,
                     },
@@ -1581,6 +1610,24 @@ pub(crate) mod fixture {
             .unwrap();
         }
 
+        /// Take a claim on one node, as another writer does, and answer with the
+        /// holder it was taken by.
+        ///
+        /// The holder is the fixture's to spell, not a test's: a test asserts the
+        /// row carries the holder the store holds, so a literal in the test would
+        /// pass a row that carried some other writer's identifier.
+        pub(crate) fn claim(&self, node: &NodeRef) -> String {
+            let holder = "agent:builder".to_string();
+            ops::take_claim(&self.store, node, &holder).unwrap();
+            holder
+        }
+
+        /// Release a node's claim, as the holder does when the work is handed on:
+        /// a row must not keep a holder the store no longer records.
+        pub(crate) fn release(&self, node: &NodeRef) {
+            ops::release_claim(&self.store, node).unwrap();
+        }
+
         /// Take every label off the epic, as a concurrent writer would.
         ///
         /// This is the shortest way to make a level the browser is standing on
@@ -1650,7 +1697,10 @@ pub(crate) mod fixture {
     pub(crate) fn epic_row(id: &str, children: usize) -> Row {
         Row {
             selection: Selection::Epic(id.to_string()),
-            kind: RowKind::Work("open".to_string()),
+            kind: RowKind::Work {
+                status: "open".to_string(),
+                claimed_by: None,
+            },
             label: id.to_string(),
             name: format!("the {id} epic"),
             children,
@@ -1661,7 +1711,10 @@ pub(crate) mod fixture {
     pub(crate) fn node_row(epic: &str, number: u64, children: usize) -> Row {
         Row {
             selection: Selection::Node(NodeRef::new(epic, number)),
-            kind: RowKind::Work("to-do".to_string()),
+            kind: RowKind::Work {
+                status: "to-do".to_string(),
+                claimed_by: None,
+            },
             label: number.to_string(),
             name: format!("ticket {number}"),
             children,
@@ -1719,7 +1772,7 @@ mod tests {
     /// level leads with.
     fn work_rows(rows: &[Row]) -> Vec<Row> {
         rows.iter()
-            .filter(|r| matches!(r.kind, RowKind::Work(_)))
+            .filter(|r| matches!(r.kind, RowKind::Work { .. }))
             .cloned()
             .collect()
     }
@@ -1820,7 +1873,7 @@ mod tests {
         // The collections come first, so the work rows are the tail.
         assert!(level[..3]
             .iter()
-            .all(|r| !matches!(r.kind, RowKind::Work(_))));
+            .all(|r| !matches!(r.kind, RowKind::Work { .. })));
 
         let node = store
             .read_node(&fx.node.epic_id, fx.node.number)
@@ -1946,13 +1999,100 @@ mod tests {
                 // The entry belongs to the blocked node and the document to the
                 // blocking one, so both travel with the row.
                 selection: Selection::Blocker(Container::Node(fx.node.clone()), fx.blocker.clone()),
-                kind: RowKind::Work(stored.status.wire_name().to_string()),
+                kind: RowKind::Work {
+                    status: stored.status.wire_name().to_string(),
+                    claimed_by: stored.claim.map(|claim| claim.by),
+                },
                 // A blocker may live in another epic, so a bare number would not
                 // address it.
                 label: fx.blocker.to_string(),
                 name: stored.name,
                 children: 0,
             }]
+        );
+    }
+
+    /// Who the work rows of a level report as their claim holders, in row order.
+    ///
+    /// Only a work row can carry a claim, so a level's holders are read off the
+    /// work rows alone rather than defaulted to absent for every other kind.
+    fn holders(rows: &[Row]) -> Vec<Option<String>> {
+        rows.iter()
+            .filter_map(|r| match &r.kind {
+                RowKind::Work { claimed_by, .. } => Some(claimed_by.clone()),
+                RowKind::Collection(_)
+                | RowKind::Member
+                | RowKind::Withdrawn
+                | RowKind::Unreadable => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_blocker_row_carries_the_holder_from_the_read_it_already_does() {
+        let fx = Fixture::build();
+        let holder = fx.claim(&fx.blocker);
+        let level = Level::Collection(Container::Node(fx.node.clone()), Collection::BlockedBy);
+
+        let claimed = rows(&fx.store, &level).unwrap();
+        let stored = fx
+            .store
+            .read_node(&fx.blocker.epic_id, fx.blocker.number)
+            .unwrap()
+            .frontmatter;
+        // The status, the name and the holder are three fields of one read, so
+        // all three are asserted together: a holder that arrived by displacing
+        // one of the other two is not the row the reader is promised.
+        assert_eq!(
+            claimed[0].kind,
+            RowKind::Work {
+                status: stored.status.wire_name().to_string(),
+                claimed_by: Some(holder),
+            }
+        );
+        assert_eq!(claimed[0].name, stored.name);
+
+        // A row is built from the store every time the level is listed, so a
+        // released claim cannot leave a holder behind on it.
+        fx.release(&fx.blocker);
+        assert_eq!(holders(&rows(&fx.store, &level).unwrap()), vec![None]);
+    }
+
+    #[test]
+    fn a_navigation_row_carries_the_holder_of_the_node_it_points_at() {
+        let fx = Fixture::build();
+        let holder = fx.claim(&fx.node);
+
+        // The epic's level holds both tickets, so one listing shows a claimed row
+        // and an unclaimed one: a level of one row cannot tell a holder taken
+        // from the right node from one taken from any node.
+        let tickets = work_rows(&rows(&fx.store, &Level::Epic(fx.epic.clone())).unwrap());
+        assert_eq!(
+            tickets
+                .iter()
+                .map(|r| r.selection.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Selection::Node(fx.node.clone()),
+                Selection::Node(fx.blocker.clone())
+            ]
+        );
+        assert_eq!(holders(&tickets), vec![Some(holder), None]);
+    }
+
+    #[test]
+    fn the_roster_carries_no_holder_however_its_epics_nodes_are_claimed() {
+        let fx = Fixture::build();
+        // Claim every node of the epic: a claim is taken on a unit of work, and an
+        // epic is not one, so no roster row may report a holder whatever is held
+        // beneath it.
+        for node in [&fx.node, &fx.subnode, &fx.blocker] {
+            fx.claim(node);
+        }
+
+        assert_eq!(
+            holders(&rows(&fx.store, &Level::Epics).unwrap()),
+            vec![None]
         );
     }
 

@@ -96,7 +96,7 @@ fn to_work_row(app: &mut App) {
         .nav()
         .rows()
         .iter()
-        .position(|r| matches!(r.kind, RowKind::Work(_)))
+        .position(|r| matches!(r.kind, RowKind::Work { .. }))
         .expect("the level has a work row");
     app.apply(Action::CursorFirst).unwrap();
     for _ in 0..index {
