@@ -9,6 +9,7 @@
 use anyhow::{Context, Result};
 use jiff::Timestamp;
 use loti_core::domain::NodeRef;
+use loti_core::lock::VersionRefusal;
 use loti_core::ops::{self, CommentView, Target};
 use loti_core::read;
 use loti_core::render;
@@ -239,6 +240,87 @@ impl Level {
             Level::Node(r) => Some(Selection::Node(r.clone())),
             Level::Collection(c, kind) => Some(Selection::Collection(c.clone(), *kind)),
         }
+    }
+}
+
+/// Why this binary may read a store but not write it.
+///
+/// Read-only is a state of the store, never an option of the browser's: the
+/// store's own format gate decides it, so there is no flag and no mode to
+/// choose. A store enters and leaves the state under a running browser — an
+/// agent may migrate it at any time — so this is a question to ask again rather
+/// than a verdict to record once.
+///
+/// One variant per reason the gate refuses a mutation for, because the remedy
+/// differs by reason: an unmigrated store is the reader's to fix, a migration in
+/// flight is somebody else's and clears on its own, and a format newer than the
+/// binary needs a newer loti.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadOnly {
+    /// The store's format is older than this binary's: readable, and writable
+    /// only once it has been migrated.
+    NeedsMigration,
+    /// A migration is in flight, or died holding the marker that says so: the
+    /// store is read-only for everyone but the migrator until it commits.
+    MigrationInProgress,
+    /// The store's format is newer than this binary understands, so nothing may
+    /// be written to it by this binary at all.
+    NeedsNewerLoti,
+    /// The recorded format version cannot be parsed, so no rule about the store
+    /// can be applied and nothing may be written.
+    VersionUnreadable,
+}
+
+impl ReadOnly {
+    /// Every reason a store may be read and not written, so a surface that has
+    /// to cover them all — one marker each — cannot then miss one.
+    pub const ALL: &'static [ReadOnly] = &[
+        ReadOnly::NeedsMigration,
+        ReadOnly::MigrationInProgress,
+        ReadOnly::NeedsNewerLoti,
+        ReadOnly::VersionUnreadable,
+    ];
+
+    /// The store's own words for this refusal, so a reader is told why in the
+    /// sentence the command line tells them — the remedy included, which only
+    /// the store knows.
+    pub fn refusal(self) -> String {
+        self.gate_refusal().to_string()
+    }
+
+    /// The gate's refusal this state stands for. One mapping, read in both
+    /// directions, so a state and the words that explain it cannot come to mean
+    /// different things.
+    fn gate_refusal(self) -> VersionRefusal {
+        match self {
+            ReadOnly::NeedsMigration => VersionRefusal::NeedsMigration,
+            ReadOnly::MigrationInProgress => VersionRefusal::MigrationInProgress,
+            ReadOnly::NeedsNewerLoti => VersionRefusal::StoreTooNew,
+            ReadOnly::VersionUnreadable => VersionRefusal::Unreadable,
+        }
+    }
+}
+
+/// Ask the store whether it may be written, and why not where it may not.
+///
+/// The store is the only thing that can answer, and it is asked before any write
+/// is offered rather than after one has failed: only actions the browser
+/// believes it can perform are ever offered, and a store awaiting migration
+/// would otherwise offer every action on every row and refuse at the last
+/// keystroke.
+///
+/// The answer is a snapshot and never a licence: the store's recorded version
+/// can change between this question and a write, so a write still verifies the
+/// gate for itself. Exhaustive over the gate's refusals, so a reason this does
+/// not know is a compile error rather than a store the browser treats as
+/// writable.
+pub fn read_only(store: &Store) -> Option<ReadOnly> {
+    match store.verify_mutable() {
+        Ok(()) => None,
+        Err(VersionRefusal::NeedsMigration) => Some(ReadOnly::NeedsMigration),
+        Err(VersionRefusal::MigrationInProgress) => Some(ReadOnly::MigrationInProgress),
+        Err(VersionRefusal::StoreTooNew) => Some(ReadOnly::NeedsNewerLoti),
+        Err(VersionRefusal::Unreadable) => Some(ReadOnly::VersionUnreadable),
     }
 }
 
@@ -891,10 +973,42 @@ fn asset_document(store: &Store, container: &Container, name: &str) -> Result<St
 /// holds for test code too — a fixture module of its own would break it.
 #[cfg(test)]
 pub(crate) mod fixture {
+    use loti_core::meta::{self, Meta};
     use loti_core::ops::{self, NewEpic, NewNode, Target};
     use loti_core::Actor;
 
     use super::*;
+
+    /// Record the format version that leaves `store` in the read-only state
+    /// `state` names, returning whether this binary's own version can express it
+    /// — there is no major below the lowest one, so an unmigrated store is out
+    /// of reach for a binary at the first major.
+    ///
+    /// Written to the store's metadata rather than reached by running a
+    /// migration, because the states a surface has to show are the ones a store
+    /// is *left* in: a migration that completes leaves nothing to see.
+    pub(crate) fn turn_read_only(store: &Store, state: ReadOnly) -> bool {
+        let (major, minor) = loti_core::FORMAT_VERSION;
+        let recorded = match state {
+            ReadOnly::NeedsMigration => match major.checked_sub(1) {
+                Some(older) => Meta::clean(older, minor),
+                None => return false,
+            },
+            ReadOnly::MigrationInProgress => Meta::migrating(major, minor),
+            ReadOnly::NeedsNewerLoti => Meta::clean(major + 1, minor),
+            ReadOnly::VersionUnreadable => Meta {
+                format_version: "not-a-version".to_string(),
+            },
+        };
+        meta::write(store.root(), &recorded).unwrap();
+        true
+    }
+
+    /// Record this binary's own format version, as a migration that commits
+    /// leaves it: read-only is a state a store leaves as well as enters.
+    pub(crate) fn turn_writable(store: &Store) {
+        meta::write(store.root(), &Meta::current()).unwrap();
+    }
 
     /// A store built for one test, with the references into it that a test needs
     /// to name a target.
@@ -2153,5 +2267,73 @@ mod tests {
         // the existence refusal, with no path in it at all.
         assert_eq!(err, format!("node {r} does not exist"));
         assert!(!err.contains(".md"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn a_store_this_binary_may_write_is_not_read_only() {
+        let fx = Fixture::build();
+        assert_eq!(read_only(&fx.store), None);
+    }
+
+    #[test]
+    fn every_reason_the_gate_refuses_a_mutation_for_is_listed() {
+        // The list is what every surface that needs one marker per reason walks, so
+        // a reason missing from it is a reason with no marker, no width reserved and
+        // no test coverage — none of which fails on its own. The exhaustive match is
+        // what makes leaving one out a compile error rather than a silent gap; the
+        // length is what stops a variant being listed twice in place of the missing
+        // one.
+        for state in ReadOnly::ALL.iter().copied() {
+            match state {
+                ReadOnly::NeedsMigration
+                | ReadOnly::MigrationInProgress
+                | ReadOnly::NeedsNewerLoti
+                | ReadOnly::VersionUnreadable => {}
+            }
+        }
+        assert_eq!(ReadOnly::ALL.len(), 4);
+    }
+
+    #[test]
+    fn every_read_only_state_is_the_stores_own_verdict_worded_in_its_own_refusal() {
+        let fx = Fixture::build();
+        for state in ReadOnly::ALL.iter().copied() {
+            if !fixture::turn_read_only(&fx.store, state) {
+                // Out of reach for this binary's version; the state is still
+                // covered by the marker and the wording it is drawn with.
+                continue;
+            }
+            assert_eq!(read_only(&fx.store), Some(state), "{state:?}");
+            // The words the reader is told why in are the gate's own, so the
+            // browser and the command line teach one rule in one sentence — and
+            // the state that carries them is the state the gate named, never the
+            // neighbouring one.
+            let refused = fx
+                .store
+                .verify_mutable()
+                .expect_err("the gate refuses this version")
+                .to_string();
+            assert_eq!(state.refusal(), refused, "{state:?}");
+        }
+
+        // And a migration that commits takes the state away again: read-only is
+        // entered and left under a running browser, not settled at startup.
+        fixture::turn_writable(&fx.store);
+        assert_eq!(read_only(&fx.store), None);
+    }
+
+    #[test]
+    fn no_two_read_only_states_are_explained_by_the_same_refusal() {
+        // The gate's reasons and these states are one mapping: two states sharing
+        // a refusal would be a reason the browser could not tell apart, and a
+        // marker naming the wrong remedy.
+        let mut worded: Vec<String> = ReadOnly::ALL
+            .iter()
+            .copied()
+            .map(ReadOnly::refusal)
+            .collect();
+        worded.sort();
+        worded.dedup();
+        assert_eq!(worded.len(), ReadOnly::ALL.len());
     }
 }

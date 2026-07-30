@@ -6,12 +6,13 @@
 //! upstream release into a test failure without telling us anything about loti.
 
 use loti_core::domain::NodeRef;
+use loti_core::meta::{self, Meta};
 use loti_core::ops::{self, NewEpic, NewNode, Target};
 use loti_core::store::{self, Store};
 use loti_core::Actor;
 use loti_tui::action::{Action, Answers};
 use loti_tui::app::{App, Modal};
-use loti_tui::data::RowKind;
+use loti_tui::data::{ReadOnly, RowKind};
 use loti_tui::theme::Theme;
 use loti_tui::ui;
 use ratatui::backend::TestBackend;
@@ -387,6 +388,211 @@ fn editing_mode_names_itself_on_the_breadcrumb_line_and_stops_when_it_is_left() 
     app.apply(Action::Unwind).unwrap();
     let (_t, browsing) = draw(&mut app);
     assert!(!browsing[0].contains("EDITING"), "{:?}", browsing[0]);
+}
+
+/// Put the store into the read-only state `state` names, by recording the format
+/// version that reaches it: an unmigrated store, a migration in flight, a format
+/// newer than this binary, or a version nothing can parse. Returns whether this
+/// binary's own version can express it — there is no major below the first one,
+/// so an unmigrated store is out of reach for a binary at major zero.
+///
+/// Written to the store's metadata rather than reached by running a migration,
+/// because the states the browser has to show are the ones a store is *left* in:
+/// a migration that commits leaves nothing to see.
+fn turn_read_only(store: &Store, state: ReadOnly) -> bool {
+    let (major, minor) = loti_core::FORMAT_VERSION;
+    let recorded = match state {
+        ReadOnly::NeedsMigration => match major.checked_sub(1) {
+            Some(older) => Meta::clean(older, minor),
+            None => return false,
+        },
+        ReadOnly::MigrationInProgress => Meta::migrating(major, minor),
+        ReadOnly::NeedsNewerLoti => Meta::clean(major + 1, minor),
+        ReadOnly::VersionUnreadable => Meta {
+            format_version: "not-a-version".to_string(),
+        },
+    };
+    meta::write(store.root(), &recorded).unwrap();
+    true
+}
+
+/// The breadcrumb line split into the path and the state slot's marker, or `None`
+/// for a line with no marker on it.
+///
+/// The marker's own decoration is what tells the two apart: no crumb carries it,
+/// and the marker holds the right-hand end of the line.
+fn crumbs_and_marker(line: &str) -> (String, Option<String>) {
+    match line.find("\u{2500}\u{2500}") {
+        Some(at) => (
+            line[..at].trim_end().to_string(),
+            Some(line[at..].to_string()),
+        ),
+        None => (line.trim_end().to_string(), None),
+    }
+}
+
+/// The column the last painted cell of the top line sits in. Read from the raw
+/// buffer, because the lines a test reads are trimmed: a centred marker would end
+/// with the same characters and read as right-aligned.
+fn last_painted_column(terminal: &Terminal<TestBackend>) -> u16 {
+    let buffer = terminal.backend().buffer();
+    (0..buffer.area.width)
+        .filter(|x| buffer[(*x, 0)].symbol() != " ")
+        .max()
+        .expect("the line is not blank")
+}
+
+#[test]
+fn a_store_that_may_not_be_written_names_the_state_in_words_in_the_slot() {
+    let (_dir, store) = fixture();
+    assert!(turn_read_only(&store, ReadOnly::MigrationInProgress));
+    // Colour disabled: the state has to be readable from the words alone, since a
+    // state only a hue announced would be invisible to a reader who turned colour
+    // off.
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    let (terminal, lines) = draw(&mut app);
+
+    let (crumbs, marker) = crumbs_and_marker(&lines[0]);
+    let marker = marker.expect("the state slot carries a marker");
+    assert!(marker.contains("READ-ONLY"), "{marker:?}");
+    // The reason as well as the state, so the remedy is discoverable: this one is
+    // somebody else's migration and clears on its own.
+    assert!(marker.contains("MIGRATION IN PROGRESS"), "{marker:?}");
+    // The path keeps the left-hand end and the marker the right, so the two never
+    // compete for the same columns.
+    assert_eq!(crumbs.trim(), "epics");
+    assert_eq!(
+        last_painted_column(&terminal),
+        terminal.backend().buffer().area.width - 1,
+        "the marker has to reach the right-hand end of the line"
+    );
+
+    // And the very same line with colour on: what says the store may not be
+    // written is the word, and the colour is decoration over it.
+    let mut coloured = App::new(store, Theme::with_color(true)).unwrap();
+    let (_t, in_colour) = draw(&mut coloured);
+    assert_eq!(in_colour[0], lines[0]);
+}
+
+#[test]
+fn every_read_only_state_names_its_own_reason_in_the_slot() {
+    let (_dir, store) = fixture();
+    let mut markers: Vec<String> = Vec::new();
+    for state in ReadOnly::ALL.iter().copied() {
+        if !turn_read_only(&store, state) {
+            continue;
+        }
+        let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+        assert_eq!(app.read_only(), Some(state));
+        let (_t, lines) = draw(&mut app);
+        let marker = crumbs_and_marker(&lines[0])
+            .1
+            .unwrap_or_else(|| panic!("{state:?} drew no marker: {:?}", lines[0]));
+        assert!(marker.contains("READ-ONLY"), "{state:?}: {marker:?}");
+        markers.push(marker);
+    }
+    // Each state's own words, because the remedy differs by state: one is the
+    // reader's to run, one is somebody else's to finish, and one needs a newer
+    // loti. A marker two states shared would name the wrong remedy on one of them.
+    let distinct = {
+        let mut seen = markers.clone();
+        seen.sort();
+        seen.dedup();
+        seen
+    };
+    assert_eq!(distinct.len(), markers.len(), "{markers:#?}");
+}
+
+#[test]
+fn the_state_slot_is_as_wide_as_the_widest_marker_the_session_could_show() {
+    // Deep enough, and narrow enough, that the path is elided: the width the slot
+    // takes is only observable in what the path has left.
+    let elided = |state: ReadOnly, store: &Store| -> (String, String) {
+        let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+        app.apply(Action::Descend).unwrap(); // into the epic
+        to_work_row(&mut app);
+        app.apply(Action::Descend).unwrap(); // into the ticket
+        let (terminal, lines) = draw_at(&mut app, 60, 16);
+        let (crumbs, marker) = crumbs_and_marker(&lines[0]);
+        assert_eq!(
+            last_painted_column(&terminal),
+            59,
+            "{state:?} did not reach the right-hand end of the line"
+        );
+        (crumbs, marker.expect("the state slot carries a marker"))
+    };
+
+    let (_dir, store) = fixture();
+    assert!(turn_read_only(&store, ReadOnly::MigrationInProgress));
+    let (widest_crumbs, widest) = elided(ReadOnly::MigrationInProgress, &store);
+    assert!(turn_read_only(&store, ReadOnly::NeedsNewerLoti));
+    let (crumbs, shorter) = elided(ReadOnly::NeedsNewerLoti, &store);
+
+    // Two markers of different widths, and the path they leave room for is the
+    // same one: the slot is sized for the widest marker the session could show
+    // rather than for the one in it, so a reason that changes under a reload does
+    // not shift the path the reader is reading.
+    assert!(
+        shorter.chars().count() < widest.chars().count(),
+        "{shorter:?} / {widest:?}"
+    );
+    assert!(!crumbs.trim().is_empty(), "{crumbs:?}");
+    assert_eq!(crumbs, widest_crumbs);
+}
+
+#[test]
+fn the_marker_arrives_on_the_reload_that_finds_it_and_outlives_the_notice() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    app.apply(Action::EnterEditing).unwrap();
+    let (_t, editing) = draw(&mut app);
+    assert!(editing[0].contains("EDITING"), "{:?}", editing[0]);
+
+    // An agent can begin migrating the store while the browser is open, so the
+    // question is asked again on every reload and not settled at startup.
+    assert!(turn_read_only(&store, ReadOnly::MigrationInProgress));
+    app.apply(Action::Reload).unwrap();
+    let (_t, arrived) = draw(&mut app);
+    // The mode's marker goes as the store's arrives: the slot holds one of them,
+    // and the mode is not available under the other.
+    assert!(arrived[0].contains("READ-ONLY"), "{:?}", arrived[0]);
+    assert!(!arrived[0].contains("EDITING"), "{:?}", arrived[0]);
+    // The transition is reported once, on the strip's line, where everything
+    // transient is reported.
+    assert!(arrived[23].contains("editing stopped"), "{:?}", arrived[23]);
+
+    // The notice is transient and the condition is not: any keypress retires the
+    // notice, and the slot goes on saying the store may not be written.
+    app.clear_flash();
+    let (_t, later) = draw(&mut app);
+    assert!(later[0].contains("READ-ONLY"), "{:?}", later[0]);
+    assert!(
+        later[23].contains("q quit"),
+        "the strip is back: {:?}",
+        later[23]
+    );
+}
+
+#[test]
+fn the_editing_key_on_a_read_only_store_says_the_stores_own_words_on_the_strip() {
+    let (_dir, store) = fixture();
+    assert!(turn_read_only(&store, ReadOnly::MigrationInProgress));
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    app.apply(Action::EnterEditing).unwrap();
+    let (_t, lines) = draw(&mut app);
+
+    // Verbatim: the words the store refuses a write with, taken from the store
+    // itself rather than spelled out here — the remedy is a store rule, and a
+    // browser paraphrase of one goes stale.
+    let refusal = store
+        .verify_mutable()
+        .expect_err("a mid-migration store refuses every write")
+        .to_string();
+    assert!(lines[23].contains(&refusal), "{:?}", lines[23]);
+    // And the mode was not entered: its marker is nowhere, and the store's still
+    // holds the slot.
+    assert!(!lines[0].contains("EDITING"), "{:?}", lines[0]);
+    assert!(lines[0].contains("READ-ONLY"), "{:?}", lines[0]);
 }
 
 #[test]

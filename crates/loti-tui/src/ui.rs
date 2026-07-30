@@ -13,7 +13,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 use crate::app::{App, Modal, Surface};
-use crate::data::{Row, RowKind, Selection};
+use crate::data::{ReadOnly, Row, RowKind, Selection};
 use crate::keymap;
 use crate::theme::{glyph, Theme};
 
@@ -27,6 +27,61 @@ const STRUCTURE_RULE: &str = "─";
 /// word rather than a colour, because a mode that only a hue announced would be
 /// invisible with colour disabled.
 const EDITING_INDICATOR: &str = "── EDITING ──";
+
+/// What the same slot says while the store's own format gate will not let this
+/// binary write, one marker per reason.
+///
+/// It names the reason as well as the state, because the remedy differs by
+/// reason: an unmigrated store is the reader's to migrate, a migration in flight
+/// is somebody else's and clears on its own, a format newer than the binary
+/// needs a newer loti, and a version nothing can parse needs looking at. Words
+/// rather than a colour, like every other state this browser signals.
+fn read_only_indicator(reason: ReadOnly) -> &'static str {
+    match reason {
+        ReadOnly::NeedsMigration => "── MIGRATION NEEDED: READ-ONLY ──",
+        ReadOnly::MigrationInProgress => "── MIGRATION IN PROGRESS: READ-ONLY ──",
+        ReadOnly::NeedsNewerLoti => "── NEWER LOTI NEEDED: READ-ONLY ──",
+        ReadOnly::VersionUnreadable => "── VERSION UNREADABLE: READ-ONLY ──",
+    }
+}
+
+/// The marker the breadcrumb line's state slot carries, and the columns the slot
+/// itself takes.
+///
+/// The slot has two possible occupants and they are mutually exclusive: a store
+/// that may not be written can never be in editing mode, because the mode is not
+/// offered there and a reload that finds the store read-only leaves it. Where
+/// both somehow held, the store's word is the one drawn — it is the durable fact,
+/// and it is the one that says the mode is unavailable.
+///
+/// The slot is as wide as the widest marker **the session could show**, not as
+/// the marker being drawn: a reason that changes under a reload — a migration in
+/// flight abandoned, leaving a store to migrate — must not shift the path the
+/// reader is reading. It is deliberately not sized for every marker in the
+/// browser: the read-only markers are three times the mode's, and a store that
+/// may be written would then spend half of an eighty-column line reserving room
+/// for a marker it can never show.
+fn state_slot(app: &App) -> Option<(&'static str, usize)> {
+    match app.read_only() {
+        Some(reason) => Some((read_only_indicator(reason), widest_read_only_indicator())),
+        None => app
+            .editing_target()
+            .is_some()
+            .then(|| (EDITING_INDICATOR, EDITING_INDICATOR.chars().count())),
+    }
+}
+
+/// The columns the widest read-only marker needs. Taken over every reason rather
+/// than hardwired, so a marker reworded to be the longest one cannot quietly
+/// start overflowing the slot it is drawn in.
+fn widest_read_only_indicator() -> usize {
+    ReadOnly::ALL
+        .iter()
+        .copied()
+        .map(|reason| read_only_indicator(reason).chars().count())
+        .max()
+        .unwrap_or(0)
+}
 
 /// The bar drawn in the gutter of editing mode's frozen row. A shape, so the row
 /// being acted on is identifiable with colour disabled, where dimming the others
@@ -433,15 +488,13 @@ fn hint_strip(width: usize, hints: &[&str], essential_hints: &[&str]) -> String 
 
 fn draw_breadcrumb(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let crumbs = app.nav().crumbs();
-    // The mode is a fact about the whole session, so it holds the right-hand end
-    // of the line and the breadcrumb elides into what is left: a session-level
-    // fact must not be the thing a narrow terminal scrolls away. One column of
-    // gap, so a crumb can never run into the marker.
-    let indicator = app.editing_target().is_some();
-    let reserved = match indicator {
-        true => EDITING_INDICATOR.chars().count() + 1,
-        false => 0,
-    };
+    // The state of the session — the mode it is in, or the store refusing to be
+    // written — holds the right-hand end of the line and the breadcrumb elides
+    // into what is left: a session-level fact must not be the thing a narrow
+    // terminal scrolls away. One column of gap, so a crumb can never run into the
+    // marker.
+    let slot = state_slot(app);
+    let reserved = slot.map_or(0, |(_, width)| width + 1);
     let text = elide_left(
         &crumbs,
         area_text_width(area.width).saturating_sub(reserved),
@@ -470,12 +523,15 @@ fn draw_breadcrumb(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
         Paragraph::new(Line::from(spans)).alignment(Alignment::Left),
         area,
     );
-    if indicator {
-        // The mode's own colour, the one the navigation pane's border also takes,
-        // so the marker and the framed pane read as the same fact.
+    if let Some((marker, _)) = slot {
+        // The colour a notice takes, which the navigation pane's border takes
+        // while the mode is on too, so a marker and what else the state changed on
+        // screen read as one fact. Painted rather than relied on: the words are
+        // what carry the state, and the colour only keeps the marker from reading
+        // as the deepest crumb.
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                EDITING_INDICATOR,
+                marker,
                 Style::default()
                     .fg(theme.notice())
                     .add_modifier(Modifier::BOLD),
@@ -781,6 +837,21 @@ fn draw_help(f: &mut Frame, area: Rect, theme: Theme) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_state_slot_is_never_narrower_than_the_marker_drawn_in_it() {
+        // The slot's width is derived from the markers rather than hardwired, and
+        // this is what makes that derivation load-bearing: a slot narrower than the
+        // marker it holds does not fail to draw, it draws over the tail of the path
+        // beside it, so the reader loses a crumb with nothing saying they did.
+        for reason in ReadOnly::ALL.iter().copied() {
+            let marker = read_only_indicator(reason);
+            assert!(
+                marker.chars().count() <= widest_read_only_indicator(),
+                "{reason:?} is wider than the slot reserved for it: {marker:?}"
+            );
+        }
+    }
 
     #[test]
     fn a_breadcrumb_that_fits_is_left_whole() {

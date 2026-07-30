@@ -12,7 +12,7 @@ use loti_core::store::Store;
 use ratatui_markdown::viewer::MarkdownViewer;
 
 use crate::action::{Action, AnswerWords, Answers, EditingAction, Fields, Mode};
-use crate::data::{self, Collection, Container, Level, Selection};
+use crate::data::{self, Collection, Container, Level, ReadOnly, Selection};
 use crate::keymap;
 use crate::nav::Nav;
 use crate::theme::Theme;
@@ -37,6 +37,16 @@ const FLASH_LIFETIME: Duration = Duration::from_secs(5);
 /// because a notice covers the whole hint strip — the essential pair with it —
 /// for as long as it is up.
 const NOT_AN_EDITING_ACTION: &str = "not an editing action — Esc to leave";
+
+/// What a reload that finds the store may no longer be written says, on the one
+/// reload that finds it.
+///
+/// It reports the transition and nothing more: the condition itself is durable,
+/// so it is named in the breadcrumb's state slot for as long as it holds, and a
+/// notice repeated on every later reload would say a thing the screen is already
+/// saying. No way out is named because there is nothing left to get out of — the
+/// editing session ended with the store's writability.
+const EDITING_STOPPED_READ_ONLY: &str = "the store can no longer be written — editing stopped";
 
 /// The title a question about the frozen row carries. Fixed, so what a dialog is
 /// stays legible when its text is the store's own and no browser word introduces
@@ -606,6 +616,14 @@ pub struct App {
     /// The live notice, if any. One at a time: the strip it draws over holds a
     /// single line, so there is nothing a queue could show.
     flash: Option<Flash>,
+    /// Why the store may not be written, or `None` while it may be.
+    ///
+    /// Invariant: this is the store's own answer, asked at startup and again on
+    /// every reload — never a launch-time verdict, because an agent can migrate
+    /// a store while the browser is open, and never a flag, because read-only is
+    /// a state of the store and not an option of the browser's. While it holds,
+    /// no editing action is offered and the state slot names it.
+    read_only: Option<ReadOnly>,
     /// The row editing mode was entered on, for as long as the mode is on.
     ///
     /// Invariant: while this is `Some` the selection is frozen — neither the
@@ -630,6 +648,9 @@ impl App {
     /// Open the browser on a store, positioned at the epic roster.
     pub fn new(store: Store, theme: Theme) -> Result<Self> {
         let rows = data::rows(&store, &Level::Epics)?;
+        // Asked before the first frame, beside the readability check the store
+        // was opened with: a session that cannot write must not offer to.
+        let read_only = data::read_only(&store);
         Ok(Self {
             store,
             nav: Nav::new(rows),
@@ -647,6 +668,7 @@ impl App {
             // The opening frame is owed: the browser paints before any input.
             redraw: true,
             flash: None,
+            read_only,
             editing: None,
             surface: None,
             editor_handoff: None,
@@ -681,6 +703,11 @@ impl App {
     /// The row editing mode is acting on, or `None` while browsing.
     pub fn editing_target(&self) -> Option<&Selection> {
         self.editing.as_ref()
+    }
+
+    /// Why the store may not be written, or `None` while it may be.
+    pub fn read_only(&self) -> Option<ReadOnly> {
+        self.read_only
     }
 
     /// The open editing surface, if any.
@@ -755,6 +782,17 @@ impl App {
     /// is about to go. The notice names it for the same reason — by the time it
     /// is read the row is gone.
     fn offer(&self, action: EditingAction) -> Option<Offer> {
+        // A store the format gate will not let this binary write offers no row
+        // anything, the rows that would only signpost the command line included:
+        // what is offered is what the browser believes it can perform, and the
+        // store has already said it cannot. Decided here rather than beside the
+        // key or the hint, because this is the whole of what a letter does on a
+        // row: one answer decides what the letter performs and whether it is
+        // hinted, so the two cannot come to disagree about a store that refuses
+        // every write.
+        if self.read_only.is_some() {
+            return None;
+        }
         let target = self.editing.as_ref()?;
         match action {
             EditingAction::Add => match target {
@@ -911,11 +949,20 @@ impl App {
             | Action::NextField
             | Action::PreviousField => {}
 
-            Action::EnterEditing => match self.nav.frame().current() {
-                Some(row) => self.editing = Some(row.selection.clone()),
-                // The roster of an empty store is the browser's one screen with
-                // no selection, and the mode acts on a row.
-                None => self.flash("nothing to edit: this store has no epics"),
+            Action::EnterEditing => match self.read_only {
+                // A mode whose every action is unavailable is not entered at
+                // all: the key is as unknown as any other action the browser
+                // cannot perform. The store's own words say why, because the
+                // remedy is a store rule and a browser paraphrase of one goes
+                // stale — and the state slot goes on saying the condition long
+                // after this notice has gone.
+                Some(reason) => self.flash(reason.refusal()),
+                None => match self.nav.frame().current() {
+                    Some(row) => self.editing = Some(row.selection.clone()),
+                    // The roster of an empty store is the browser's one screen
+                    // with no selection, and the mode acts on a row.
+                    None => self.flash("nothing to edit: this store has no epics"),
+                },
             },
 
             Action::PreviewHalfDown => self.preview.viewer.scroll_down(self.half_page()),
@@ -1159,13 +1206,21 @@ impl App {
             // an edit.
             Action::Reload => {
                 self.reload()?;
-                let target = self.nav.frame().current().map(|row| &row.selection);
-                if target != self.editing.as_ref() {
-                    // The mode acts on one row, so a row that is gone ends it.
-                    // Where the cursor lands instead is the ordinary reload
-                    // fallback's business: the mode invents no second recovery.
-                    self.editing = None;
-                    self.flash("the row you were editing is gone");
+                // The reload may have ended the mode already, because it found
+                // the store may no longer be written. The row is beside the
+                // point then, and the notice that said so must not be replaced
+                // by one about a row: the reader's next question is about the
+                // store, not about where the cursor went.
+                if self.editing.is_some() {
+                    let target = self.nav.frame().current().map(|row| &row.selection);
+                    if target != self.editing.as_ref() {
+                        // The mode acts on one row, so a row that is gone ends
+                        // it. Where the cursor lands instead is the ordinary
+                        // reload fallback's business: the mode invents no second
+                        // recovery.
+                        self.editing = None;
+                        self.flash("the row you were editing is gone");
+                    }
                 }
             }
             // Everything else is an editing action or nothing. A letter is listed
@@ -1185,10 +1240,24 @@ impl App {
         Ok(())
     }
 
-    /// Re-read every level from the store.
+    /// Re-read every level from the store, and ask again whether it may be
+    /// written.
+    ///
+    /// The writability question belongs here rather than at startup: an agent can
+    /// migrate a store, or begin migrating one, while the browser is open, so
+    /// read-only is a state a session enters and leaves rather than a verdict
+    /// reached once. A reload that finds it entered ends the editing session,
+    /// because nothing the mode could do is offered any more, and says so once —
+    /// the state slot then carries the condition for as long as it holds.
     fn reload(&mut self) -> Result<()> {
         let store = &self.store;
-        self.nav.reload(|level| data::rows(store, level))
+        self.nav.reload(|level| data::rows(store, level))?;
+        self.read_only = data::read_only(&self.store);
+        if self.read_only.is_some() && self.editing.is_some() {
+            self.editing = None;
+            self.flash(EDITING_STOPPED_READ_ONLY);
+        }
+        Ok(())
     }
 
     /// Set the divider, clamped so neither pane can be resized away.
@@ -1982,6 +2051,160 @@ mod tests {
         assert!(notice.contains("gone"), "{notice:?}");
         // The browser's own reload fallback took over: no second recovery story.
         assert_eq!(app.nav().crumbs(), vec!["epics", "feature"]);
+    }
+
+    /// Put the fixture's store into a read-only state and tell the browser what a
+    /// reload would tell it, without reloading.
+    ///
+    /// The state is normally reached by a reload, and that path has tests of its
+    /// own; this is for the frozen row a reload would have taken away with the
+    /// mode, which the offer table has to decide on anyway.
+    fn turn_read_only_behind_the_browser(fx: &Fixture, app: &mut App) {
+        let state = ReadOnly::MigrationInProgress;
+        assert!(crate::data::fixture::turn_read_only(&fx.store, state));
+        app.read_only = data::read_only(&fx.store);
+        assert_eq!(app.read_only(), Some(state));
+    }
+
+    #[test]
+    fn a_store_that_may_not_be_written_is_not_a_store_the_mode_is_entered_on() {
+        let fx = Fixture::build();
+        let state = ReadOnly::MigrationInProgress;
+        assert!(crate::data::fixture::turn_read_only(&fx.store, state));
+        // Asked at startup, alongside the readability check the store was opened
+        // with: a session that cannot write must not offer to.
+        let mut app = App::new(fx.store.clone(), Theme::with_color(false)).unwrap();
+        assert_eq!(app.read_only(), Some(state));
+
+        app.apply(Action::EnterEditing).unwrap();
+        // Every action the mode could offer is unavailable, so the mode itself is
+        // not entered: the key is as unknown as any other action the browser
+        // cannot perform, and saying nothing would read as a broken key.
+        assert_eq!(app.editing_target(), None);
+        assert_eq!(app.mode(), Mode::Browse);
+        // In the store's own words, remedy included: the browser must not
+        // paraphrase a store rule, and only the store knows what fixes this.
+        assert_eq!(app.flash_message(), Some(state.refusal().as_str()));
+        assert!(app.editing_hints().is_empty());
+    }
+
+    #[test]
+    fn the_store_is_asked_again_on_every_reload_and_the_mode_ends_where_it_says_no() {
+        let (fx, mut app) = app();
+        assert_eq!(app.read_only(), None, "the fixture store is writable");
+        to_the_labels_row(&mut app);
+        app.apply(Action::EnterEditing).unwrap();
+        assert!(app.editing_target().is_some());
+
+        // An agent can migrate a store, or begin migrating one, while the browser
+        // is open, so read-only is a state a session enters mid-flight rather than
+        // a verdict reached at startup.
+        let state = ReadOnly::MigrationInProgress;
+        assert!(crate::data::fixture::turn_read_only(&fx.store, state));
+        app.apply(Action::Reload).unwrap();
+        assert_eq!(app.read_only(), Some(state));
+        // Nothing the mode could do is offered any more, so the mode goes rather
+        // than standing over a row with no action on it — and it says so.
+        assert_eq!(app.editing_target(), None);
+        assert_eq!(app.flash_message(), Some(EDITING_STOPPED_READ_ONLY));
+
+        // Said once: the notice reports the transition, and the condition outlives
+        // it — the state slot is what carries a durable fact.
+        app.clear_flash();
+        app.apply(Action::Reload).unwrap();
+        assert_eq!(app.read_only(), Some(state));
+        assert_eq!(app.flash_message(), None);
+
+        // And the mode stays unavailable for as long as the state holds.
+        app.apply(Action::EnterEditing).unwrap();
+        assert_eq!(app.editing_target(), None);
+        assert_eq!(app.flash_message(), Some(state.refusal().as_str()));
+
+        // A migration that commits takes the state away again: it is a state a
+        // session leaves as well as enters, so the browser cannot settle it once.
+        crate::data::fixture::turn_writable(&fx.store);
+        app.clear_flash();
+        app.apply(Action::Reload).unwrap();
+        assert_eq!(app.read_only(), None);
+        app.apply(Action::EnterEditing).unwrap();
+        assert!(
+            app.editing_target().is_some(),
+            "the mode is available again"
+        );
+        assert!(!app.editing_hints().is_empty(), "and so are its actions");
+    }
+
+    #[test]
+    fn a_reload_that_finds_the_state_while_browsing_marks_it_and_says_nothing() {
+        let (fx, mut app) = app();
+        let state = ReadOnly::MigrationInProgress;
+        assert!(crate::data::fixture::turn_read_only(&fx.store, state));
+        app.apply(Action::Reload).unwrap();
+
+        // Nothing was interrupted and nothing was refused, so there is nothing for
+        // the transient channel to report: the condition belongs in the state slot,
+        // which carries it for as long as it holds.
+        assert_eq!(app.read_only(), Some(state));
+        assert_eq!(app.flash_message(), None);
+    }
+
+    #[test]
+    fn the_store_refusing_to_be_written_is_what_a_reload_reports_and_not_the_row() {
+        let (fx, mut app) = app();
+        to_a_label_row(&mut app);
+        app.apply(Action::EnterEditing).unwrap();
+
+        // Both at once: the frozen row goes and the store stops being writable.
+        // The reader's next question is about the store, not about where the
+        // cursor went, and the strip holds one line.
+        fx.strip_the_epics_labels();
+        assert!(crate::data::fixture::turn_read_only(
+            &fx.store,
+            ReadOnly::MigrationInProgress
+        ));
+        app.apply(Action::Reload).unwrap();
+        assert_eq!(app.editing_target(), None);
+        assert_eq!(app.flash_message(), Some(EDITING_STOPPED_READ_ONLY));
+    }
+
+    #[test]
+    fn a_frozen_row_offers_nothing_once_the_store_may_not_be_written() {
+        let (fx, mut app) = app();
+        let before = fx.epic_labels();
+        to_a_label_row(&mut app);
+        app.apply(Action::EnterEditing).unwrap();
+        assert_eq!(app.editing_hints(), vec![hint_for(EditingAction::Delete)]);
+
+        // The offer table is the whole of what a letter does on a row, so the
+        // state that offers nothing is decided there and not beside each key: a
+        // mode that outlived the reload which turned the store read-only offers
+        // nothing rather than half of what it did.
+        turn_read_only_behind_the_browser(&fx, &mut app);
+        assert!(app.editing_hints().is_empty());
+        hints_and_keys_agree(&mut app);
+        assert_eq!(fx.epic_labels(), before, "a letter wrote something");
+    }
+
+    #[test]
+    fn a_row_that_only_signposts_the_command_line_is_silent_on_a_read_only_store() {
+        let (fx, mut app) = app();
+        to_the_assets_row(&mut app);
+        app.apply(Action::EnterEditing).unwrap();
+        app.apply(Action::Add).unwrap();
+        let signpost = app
+            .flash_message()
+            .expect("the row names the command that does the job")
+            .to_string();
+        assert!(signpost.starts_with("loti "), "{signpost:?}");
+
+        // Not even the signpost survives: a store that may not be written offers
+        // no action at all, and a message about how to add one to it would send the
+        // reader at a command the store would refuse too.
+        turn_read_only_behind_the_browser(&fx, &mut app);
+        app.clear_flash();
+        app.apply(Action::Add).unwrap();
+        assert_eq!(app.flash_message(), Some(NOT_AN_EDITING_ACTION));
+        assert!(app.editing_hints().is_empty());
     }
 
     #[test]
