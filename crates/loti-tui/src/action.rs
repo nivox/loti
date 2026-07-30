@@ -19,6 +19,14 @@ pub enum Mode {
     Browse,
     /// Editing mode, with the selection frozen on one row.
     Editing,
+    /// A destructive question is open. It is answered by the same letter that
+    /// asks for a deletion, so no key a hurried reader presses by reflex can be
+    /// what destroys something: the way out answers it safely, and the key that
+    /// normally means "yes, go on" is bound to nothing here at all.
+    Confirm,
+    /// A dialog with nothing at stake is open — it reports rather than asks — so
+    /// it is dismissed rather than answered.
+    Acknowledge,
 }
 
 /// A resolved user intent.
@@ -67,6 +75,10 @@ pub enum Action {
     Reload,
     /// Enter editing mode on the highlighted row.
     EnterEditing,
+    /// Delete the row editing mode is acting on, which asks first. On the
+    /// confirmation that asks, the same intent is the confirming answer: one
+    /// letter answers everything destructive, so it is learned once.
+    Delete,
     /// Toggle the key-binding overlay.
     ToggleHelp,
     /// Leave the browser.

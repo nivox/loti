@@ -16,6 +16,12 @@ use crate::action::{Action, Mode};
 
 /// The intent a key press carries in a mode, or `None` if it is not bound there.
 pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
+    // A dialog answers for itself: only the answers it lists are bound while it
+    // is open, so nothing underneath it can be moved, reloaded or quit by a key
+    // pressed at a question.
+    if matches!(mode, Mode::Confirm | Mode::Acknowledge) {
+        return dialog_action(key, mode);
+    }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     Some(match (key.code, ctrl) {
         // Quitting. `q` is the way out of the browser and no mode borrows it.
@@ -28,7 +34,9 @@ pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
         // direction for a key a habit presses.
         (KeyCode::Char('c'), true) => match mode {
             Mode::Browse => Action::Quit,
-            Mode::Editing => Action::Unwind,
+            // A dialog's own answers are settled before this table is reached, so
+            // only browsing and editing arrive here.
+            Mode::Editing | Mode::Confirm | Mode::Acknowledge => Action::Unwind,
         },
 
         // Preview paging. Bound before the plain motions so Ctrl-D/Ctrl-U are
@@ -62,11 +70,34 @@ pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
         (KeyCode::Char('='), false) => Action::ResetSplit,
         (KeyCode::Char('z'), false) => Action::ToggleZoom,
 
+        // The letters of editing mode's action-selection layer, bound inside the
+        // mode only: browse mode is where a reader's fingers rest, and a letter
+        // that removed something from there would be one stray keystroke away
+        // from a write.
+        (KeyCode::Char('d'), false) if matches!(mode, Mode::Editing) => Action::Delete,
+
         // Session.
         (KeyCode::Char('e'), false) => Action::EnterEditing,
         (KeyCode::Char('r'), false) => Action::Reload,
         (KeyCode::Char('?'), false) => Action::ToggleHelp,
 
+        _ => return None,
+    })
+}
+
+/// The answers a dialog admits, which are exactly the answers it lists.
+///
+/// `d` answers anything destructive and `Esc` is the one answer that is never
+/// destructive, here as everywhere else. On a destructive question `Enter` is
+/// bound to nothing at all: a reader arrives at one in a hurry, so a reflex press
+/// must not be the thing that destroys something. Where nothing is at stake
+/// `Enter` dismisses alongside `Esc`, because a second key is then kindness.
+fn dialog_action(key: KeyEvent, mode: Mode) -> Option<Action> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    Some(match (key.code, ctrl) {
+        (KeyCode::Char('d'), false) if matches!(mode, Mode::Confirm) => Action::Delete,
+        (KeyCode::Enter, _) if matches!(mode, Mode::Acknowledge) => Action::Unwind,
+        (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => Action::Unwind,
         _ => return None,
     })
 }
@@ -88,6 +119,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("< / > / =", "narrow / widen / reset the panes"),
     ("z", "preview fills the width; mouse released"),
     ("e", "editing mode, on the highlighted row"),
+    ("d", "editing mode: remove the label, with a confirmation"),
     ("r", "re-read the store"),
     ("?", "these keys"),
     ("q", "quit"),
@@ -115,12 +147,21 @@ pub const FOOTER_HINTS: &[&str] = &[
 /// inside the application.
 pub const FOOTER_ESSENTIAL: &[&str] = &["q quit", "? keys"];
 
-/// The droppable hints of editing mode: the actions the frozen row offers, in
-/// this map's own order rather than reordered per row.
+/// The droppable hints of editing mode: one per editing action, in this map's
+/// own order rather than reordered per row, so a letter keeps its relative place
+/// from row to row instead of moving with what a row happens to offer.
 ///
-/// Empty while the mode carries no action at all: an action slice adds its own
-/// hint here, so the strip only ever lists what the row can really do.
-pub const FOOTER_HINTS_EDITING: &[&str] = &[];
+/// Each hint travels with the intent it names, because the strip lists the subset
+/// the frozen row offers and only the state machine knows which that is.
+pub const FOOTER_HINTS_EDITING: &[(Action, &str)] = &[(Action::Delete, "d remove")];
+
+/// The answers a destructive question lists, in the order it lists them. A dialog
+/// says how to answer it, so the way out of one never depends on the hint strip a
+/// notice or a narrow terminal may have taken.
+pub const DIALOG_ANSWERS_CONFIRM: &[&str] = &["d remove", "Esc cancel"];
+
+/// The answers a dialog that only reports lists; see [`DIALOG_ANSWERS_CONFIRM`].
+pub const DIALOG_ANSWERS_ACKNOWLEDGE: &[&str] = &["Esc / Enter dismiss"];
 
 /// Editing mode's essential pair. Neither browse hint applies — `q` does not quit
 /// while the mode is on, and the way out of the mode is not the way out of a
@@ -221,12 +262,102 @@ mod tests {
 
     #[test]
     fn unbound_keys_are_ignored() {
-        // A mode chooses which intent a bound key carries, never whether it is
-        // bound at all: an unbound key is unbound in every mode, so no mode can
-        // smuggle in a binding of its own.
-        for mode in [Mode::Browse, Mode::Editing] {
+        // A key no mode binds is ignored in every mode, dialogs included: there
+        // is no layer that quietly gives a spare letter a meaning of its own.
+        for mode in [
+            Mode::Browse,
+            Mode::Editing,
+            Mode::Confirm,
+            Mode::Acknowledge,
+        ] {
             assert_eq!(action_for(plain(KeyCode::Char('x')), mode), None);
             assert_eq!(action_for(plain(KeyCode::F(5)), mode), None);
+        }
+    }
+
+    #[test]
+    fn an_editing_letter_is_bound_inside_the_mode_only() {
+        // Browse mode is where a reader's fingers rest, so a letter that removes
+        // something must not be one stray keystroke away from a write there.
+        assert_eq!(
+            action_for(plain(KeyCode::Char('d')), Mode::Editing),
+            Some(Action::Delete)
+        );
+        assert_eq!(action_for(plain(KeyCode::Char('d')), Mode::Browse), None);
+        // And the shifted-out variant keeps its own meaning in both: the letter
+        // did not take a modifier combination with it.
+        for mode in [Mode::Browse, Mode::Editing] {
+            assert_eq!(action_for(ctrl('d'), mode), Some(Action::PreviewHalfDown));
+        }
+    }
+
+    #[test]
+    fn the_destructive_answer_is_the_same_letter_and_never_the_reflex_key() {
+        // The letter that asks for a deletion is the letter that answers for it.
+        assert_eq!(
+            action_for(plain(KeyCode::Char('d')), Mode::Confirm),
+            action_for(plain(KeyCode::Char('d')), Mode::Editing)
+        );
+        // A reader arrives at a destructive question in a hurry: `Enter` is bound
+        // to nothing at all there, so a reflex press cannot be what destroys.
+        assert_eq!(action_for(plain(KeyCode::Enter), Mode::Confirm), None);
+        // `Esc` is the answer that is never destructive, anywhere.
+        assert_eq!(
+            action_for(plain(KeyCode::Esc), Mode::Confirm),
+            Some(Action::Unwind)
+        );
+        assert_eq!(action_for(ctrl('c'), Mode::Confirm), Some(Action::Unwind));
+    }
+
+    #[test]
+    fn a_dialog_that_only_reports_is_dismissed_by_either_key() {
+        // Nothing is at stake, so a second key is kindness.
+        for code in [KeyCode::Esc, KeyCode::Enter] {
+            assert_eq!(
+                action_for(plain(code), Mode::Acknowledge),
+                Some(Action::Unwind)
+            );
+        }
+        // And nothing else: neither answer destroys anything, so there is no
+        // destructive answer to offer.
+        assert_eq!(
+            action_for(plain(KeyCode::Char('d')), Mode::Acknowledge),
+            None
+        );
+    }
+
+    #[test]
+    fn a_dialog_binds_nothing_that_reaches_past_it() {
+        // A question is critical by construction — the flash carries everything
+        // that is not — so no key pressed at one may move, reload or end the
+        // session underneath it.
+        for mode in [Mode::Confirm, Mode::Acknowledge] {
+            for code in [
+                KeyCode::Char('q'),
+                KeyCode::Char('j'),
+                KeyCode::Char('k'),
+                KeyCode::Char('r'),
+                KeyCode::Char('e'),
+                KeyCode::Char('z'),
+                KeyCode::Char('?'),
+                KeyCode::Backspace,
+            ] {
+                assert_eq!(action_for(plain(code), mode), None, "{code:?} in {mode:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_editing_hint_names_an_intent_the_mode_can_carry() {
+        for (action, hint) in FOOTER_HINTS_EDITING {
+            // The hint's own letter has to be the letter bound to that intent, or
+            // the strip would teach a key the mode does not answer.
+            let letter = hint.chars().next().expect("a hint leads with its key");
+            assert_eq!(
+                action_for(plain(KeyCode::Char(letter)), Mode::Editing),
+                Some(*action),
+                "{hint:?}"
+            );
         }
     }
 }

@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use crate::app::App;
+use crate::app::{App, Modal};
 use crate::data::{Row, RowKind, Selection};
 use crate::keymap;
 use crate::theme::{glyph, Theme};
@@ -32,6 +32,17 @@ const EDITING_INDICATOR: &str = "── EDITING ──";
 /// being acted on is identifiable with colour disabled, where dimming the others
 /// carries nothing.
 const GUTTER_BAR: &str = "▌";
+
+/// The titles the two dialogs carry. Fixed, so what a dialog is stays legible
+/// when its text is the store's own and no browser word introduces it.
+const CONFIRM_TITLE: &str = " confirm ";
+/// See [`CONFIRM_TITLE`].
+const REFUSAL_TITLE: &str = " the store refused the change ";
+
+/// How wide a dialog wants to be. Fixed rather than sized to its content: a
+/// refusal can be a paragraph, and a float as wide as the terminal would stop
+/// reading as something laid over the screen.
+const DIALOG_WIDTH: u16 = 60;
 
 /// Draw one frame.
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -80,8 +91,181 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         chunks[2],
     );
 
-    if app.modal().is_some() {
-        draw_help(f, f.area(), theme);
+    match app.modal() {
+        Some(Modal::Help) => draw_help(f, f.area(), theme),
+        Some(Modal::Confirm(question)) => draw_dialog(
+            f,
+            theme,
+            CONFIRM_TITLE,
+            question,
+            keymap::DIALOG_ANSWERS_CONFIRM,
+        ),
+        Some(Modal::Refusal(message)) => draw_dialog(
+            f,
+            theme,
+            REFUSAL_TITLE,
+            message,
+            keymap::DIALOG_ANSWERS_ACKNOWLEDGE,
+        ),
+        None => {}
+    }
+}
+
+/// A dialog: centred on the whole terminal, above everything, and it never
+/// reflows what is underneath — the panes and the strip stay exactly where they
+/// were, merely covered.
+///
+/// Centred rather than anchored to whatever raised it, because a question that
+/// moves is harder to spot and the centre is the one position that never collides
+/// with the row or the buffer being asked about.
+///
+/// It lists its own answers, so the way out of it never depends on the hint strip
+/// — which a notice, or a narrow terminal, may have taken. Its text wraps inside
+/// the float, because a store refusal is as long as the store made it.
+fn draw_dialog(f: &mut Frame, theme: Theme, title: &str, message: &str, answers: &[&str]) {
+    let area = f.area();
+    let width = DIALOG_WIDTH.min(area.width);
+    let text_width = dialog_text_width(width);
+    let text = wrap(message, text_width);
+    // As tall as its text needs, and never taller than the terminal: a float that
+    // ran off the screen would take its own answers with it.
+    let popup = centred(area, width, text.len() as u16 + 4);
+    let lines = dialog_lines(
+        &text,
+        answers,
+        text_width,
+        popup.height.saturating_sub(2) as usize,
+        theme,
+    );
+    // Above everything: the cells underneath are cleared rather than blended, so
+    // no pane text shows through the float.
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                // The colour a transient notice takes: a dialog is the critical
+                // end of the same channel, and its title says which in words.
+                .border_style(Style::default().fg(theme.notice()))
+                .title(title),
+        ),
+        popup,
+    );
+}
+
+/// The columns a dialog's text may use: the float less its two borders and a
+/// column of padding either side.
+fn dialog_text_width(width: u16) -> usize {
+    (width.saturating_sub(4)).max(1) as usize
+}
+
+/// A dialog's interior, fitted to the lines the float has: the message, then a
+/// blank line and the answers, which are the last thing the eye lands on before
+/// it acts.
+///
+/// Ranked, because a terminal shorter than the message has to give something up:
+/// **the answers always survive** — a dialog listing no way to answer it seals the
+/// reader inside it — then as much of the message as is left, and the blank
+/// separator is the first thing surrendered.
+fn dialog_lines<'a>(
+    text: &[String],
+    answers: &[&str],
+    width: usize,
+    height: usize,
+    theme: Theme,
+) -> Vec<Line<'a>> {
+    let mut lines: Vec<Line> = Vec::new();
+    if height == 0 {
+        return lines;
+    }
+    let (text_height, separated) = match height - 1 {
+        remaining @ (0 | 1) => (remaining, false),
+        remaining => (remaining - 1, true),
+    };
+    lines.extend(
+        fit(text, text_height, width)
+            .into_iter()
+            .map(|line| Line::from(format!(" {line}"))),
+    );
+    if separated {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        format!(" {}", answers.join(keymap::HINT_SEPARATOR)),
+        Style::default().fg(theme.muted()),
+    )));
+    lines
+}
+
+/// As many of `text`'s lines as `height` allows, marking the cut when some are
+/// left out, so a message a short terminal shortened cannot be read as the whole
+/// of one.
+fn fit(text: &[String], height: usize, width: usize) -> Vec<String> {
+    if text.len() <= height {
+        return text.to_vec();
+    }
+    let mut kept = text[..height].to_vec();
+    if let Some(last) = kept.last_mut() {
+        let head: String = last.chars().take(width.saturating_sub(1)).collect();
+        *last = format!("{head}…");
+    }
+    kept
+}
+
+/// Break text into lines no wider than `width`, at spaces where there is one and
+/// mid-word only where a single word is wider than the float.
+///
+/// The browser wraps rather than clipping here because the text can be the
+/// store's own: a refusal naming several offending entities is long by nature,
+/// and a clipped rule teaches half a rule.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for paragraph in text.split('\n') {
+        let mut line = String::new();
+        for word in paragraph.split_whitespace() {
+            let mut word = word;
+            if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+                out.push(std::mem::take(&mut line));
+            }
+            // A word too long for a line of its own is cut across lines: leaving
+            // it whole would push it past the border. Every cut consumes at least
+            // one character, so a float narrower than a character terminates
+            // instead of breaking forever.
+            while word.chars().count() > width {
+                let (head, tail) = split_at_chars(word, width.max(1));
+                out.push(head.to_string());
+                word = tail;
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+        out.push(line);
+    }
+    out
+}
+
+/// Split at a character boundary `count` characters in, so a multi-byte character
+/// is never cut in half.
+fn split_at_chars(text: &str, count: usize) -> (&str, &str) {
+    let at = text
+        .char_indices()
+        .nth(count)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    text.split_at(at)
+}
+
+/// A float of this size, centred on `area` and never larger than it.
+fn centred(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
     }
 }
 
@@ -116,15 +300,15 @@ fn footer(app: &App, width: u16) -> Span<'static> {
             Style::default().fg(theme.notice()),
         ),
         None => {
+            // Editing mode's droppable hints are the actions the frozen row
+            // offers, which only the state machine knows; browse mode's are the
+            // same on every row.
             let (hints, essential) = match app.editing_target().is_some() {
-                true => (
-                    keymap::FOOTER_HINTS_EDITING,
-                    keymap::FOOTER_ESSENTIAL_EDITING,
-                ),
-                false => (keymap::FOOTER_HINTS, keymap::FOOTER_ESSENTIAL),
+                true => (app.editing_hints(), keymap::FOOTER_ESSENTIAL_EDITING),
+                false => (keymap::FOOTER_HINTS.to_vec(), keymap::FOOTER_ESSENTIAL),
             };
             Span::styled(
-                format!(" {}", hint_strip(columns, hints, essential)),
+                format!(" {}", hint_strip(columns, &hints, essential)),
                 Style::default().fg(theme.muted()),
             )
         }
@@ -482,12 +666,7 @@ fn help_width(available: u16) -> u16 {
 fn draw_help(f: &mut Frame, area: Rect, theme: Theme) {
     let width = help_width(area.width);
     let height = (keymap::HELP.len() as u16 + 2).min(area.height.saturating_sub(2));
-    let popup = Rect {
-        x: area.x + (area.width.saturating_sub(width)) / 2,
-        y: area.y + (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
+    let popup = centred(area, width, height);
     let key_width = help_key_width();
     let lines: Vec<Line> = keymap::HELP
         .iter()
@@ -677,12 +856,16 @@ mod tests {
     }
 
     /// Both strips a mode can ask for: the essential pair travels with the
-    /// droppable hints it is appended to.
-    fn strips() -> [(&'static [&'static str], &'static [&'static str]); 2] {
+    /// droppable hints it is appended to. Editing mode's are taken at their
+    /// widest — every action any row offers — since a row shows a subset.
+    fn strips() -> [(Vec<&'static str>, &'static [&'static str]); 2] {
         [
-            (keymap::FOOTER_HINTS, keymap::FOOTER_ESSENTIAL),
+            (keymap::FOOTER_HINTS.to_vec(), keymap::FOOTER_ESSENTIAL),
             (
-                keymap::FOOTER_HINTS_EDITING,
+                keymap::FOOTER_HINTS_EDITING
+                    .iter()
+                    .map(|(_, hint)| *hint)
+                    .collect(),
                 keymap::FOOTER_ESSENTIAL_EDITING,
             ),
         ]
@@ -694,7 +877,7 @@ mod tests {
             let pair = essential.join(keymap::HINT_SEPARATOR);
             let way_out = essential[0];
             for width in 1..120usize {
-                let strip = hint_strip(width, hints, essential);
+                let strip = hint_strip(width, &hints, essential);
                 assert!(strip.chars().count() <= width, "width {width}: {strip:?}");
                 if width >= pair.chars().count() {
                     // Wide enough for the pair: both are there, and the pair is
@@ -712,8 +895,8 @@ mod tests {
     #[test]
     fn a_wide_strip_carries_every_hint() {
         for (hints, essential) in strips() {
-            let strip = hint_strip(200, hints, essential);
-            for hint in hints.iter().chain(essential) {
+            let strip = hint_strip(200, &hints, essential);
+            for hint in hints.iter().chain(essential.iter()) {
                 assert!(strip.contains(hint), "{strip:?} is missing {hint:?}");
             }
         }
@@ -724,5 +907,89 @@ mod tests {
         assert_eq!(truncate("short", 10), "short");
         assert_eq!(truncate("a longer name", 6), "a lon…");
         assert_eq!(truncate("anything", 0), "");
+    }
+
+    #[test]
+    fn wrapped_text_stays_inside_the_float_and_keeps_the_stores_own_breaks() {
+        assert_eq!(wrap("one two three", 7), vec!["one two", "three"]);
+        // A word wider than the float is cut across lines rather than pushed past
+        // its border.
+        assert_eq!(
+            wrap("supercalifragilistic", 6),
+            vec!["superc", "alifra", "gilist", "ic"]
+        );
+        // A refusal's own line breaks are the store's paragraphs, so they survive.
+        assert_eq!(wrap("first\nsecond", 20), vec!["first", "second"]);
+        for width in 1..40usize {
+            for line in wrap(
+                "a refusal naming several offending descendants, at length",
+                width,
+            ) {
+                assert!(line.chars().count() <= width, "width {width}: {line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_dialog_too_tall_for_the_screen_gives_up_its_message_not_its_answers() {
+        let theme = Theme::with_color(false);
+        let text: Vec<String> = (0..6).map(|n| format!("line {n}")).collect();
+        let answers = ["Esc cancel"];
+        let rendered = |height: usize| -> Vec<String> {
+            dialog_lines(&text, &answers, 20, height, theme)
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|s| s.content.to_string())
+                        .collect::<String>()
+                })
+                .collect()
+        };
+
+        // Whatever the float has room for, the answers are on the last line of it:
+        // a dialog listing no way to answer it seals the reader inside it. What
+        // gives way instead is the message — and it says when it did, so half a
+        // rule cannot be read as the whole of one.
+        for height in 1..=text.len() + 2 {
+            let shown = rendered(height);
+            assert_eq!(shown.len(), height, "height {height}: {shown:?}");
+            assert!(
+                shown.last().unwrap().contains("Esc cancel"),
+                "height {height}: {shown:?}"
+            );
+            let message: Vec<&String> = shown.iter().filter(|l| l.contains("line")).collect();
+            if message.is_empty() {
+                // A float with room for one line spends it on the answers: there
+                // is no line left for the message, so none to mark either.
+                assert_eq!(height, 1, "{shown:?}");
+                continue;
+            }
+            assert_eq!(
+                message.len() == text.len(),
+                !shown.iter().any(|l| l.contains('…')),
+                "height {height}: {shown:?}"
+            );
+        }
+        // Room for nothing: a border with a stray line in it says less than none.
+        assert!(rendered(0).is_empty());
+    }
+
+    #[test]
+    fn a_float_is_centred_and_never_larger_than_the_screen() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+        let popup = centred(area, 60, 6);
+        assert_eq!((popup.x, popup.width), (10, 60));
+        assert_eq!((popup.y, popup.height), (9, 6));
+
+        // Bounded by the terminal rather than drawn off it, so a float always has
+        // its own borders — and its answers — on the screen.
+        let big = centred(area, 200, 100);
+        assert_eq!((big.x, big.y, big.width, big.height), (0, 0, 80, 24));
     }
 }

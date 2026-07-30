@@ -663,3 +663,301 @@ fn resizing_moves_the_divider_in_the_drawn_frame() {
     );
     assert_eq!(after[1].find("navigation").unwrap(), wide_at);
 }
+
+/// Stand on the first label of the epic's own labels level, which is where a
+/// removal is offered. An epic level leads with its collection rows, so `labels`
+/// is the row the cursor lands on.
+fn to_a_label_row(app: &mut App) {
+    app.apply(Action::Descend).unwrap(); // into the epic
+    app.apply(Action::CursorFirst).unwrap();
+    app.apply(Action::Descend).unwrap();
+}
+
+/// Every cell's symbol, row by row and untrimmed, so comparing two frames sees
+/// the columns a trimmed line would have dropped.
+fn cells(terminal: &Terminal<TestBackend>) -> Vec<Vec<String>> {
+    let buffer = terminal.backend().buffer();
+    (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect()
+        })
+        .collect()
+}
+
+/// The bounding box of every cell that differs between two frames, as
+/// `(x, y, width, height)`.
+///
+/// Everything outside it is identical by construction, which is how a float that
+/// reflows nothing is told from one that pushed the screen around.
+fn changed_box(before: &[Vec<String>], after: &[Vec<String>]) -> (usize, usize, usize, usize) {
+    let mut changed = Vec::new();
+    for (y, (row, was)) in after.iter().zip(before).enumerate() {
+        for (x, (cell, previously)) in row.iter().zip(was).enumerate() {
+            if cell != previously {
+                changed.push((x, y));
+            }
+        }
+    }
+    assert!(!changed.is_empty(), "the frame did not change at all");
+    let x0 = changed.iter().map(|(x, _)| *x).min().unwrap();
+    let x1 = changed.iter().map(|(x, _)| *x).max().unwrap();
+    let y0 = changed.iter().map(|(_, y)| *y).min().unwrap();
+    let y1 = changed.iter().map(|(_, y)| *y).max().unwrap();
+    (x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+}
+
+/// The lines of a frame bounded to a box, so a dialog's own text is read without
+/// the screen it is laid over.
+fn box_lines(
+    frame: &[Vec<String>],
+    (x, y, width, height): (usize, usize, usize, usize),
+) -> Vec<String> {
+    frame[y..y + height]
+        .iter()
+        .map(|row| row[x..x + width].concat())
+        .collect()
+}
+
+#[test]
+fn a_dialog_is_a_centred_float_that_covers_what_is_under_it_and_moves_nothing() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store, Theme::with_color(false)).unwrap();
+    to_a_label_row(&mut app);
+    app.apply(Action::EnterEditing).unwrap();
+    let (before, _) = draw(&mut app);
+    app.apply(Action::Delete).unwrap();
+    let (after, _) = draw(&mut app);
+
+    let (before, after) = (cells(&before), cells(&after));
+    let region @ (x, y, width, height) = changed_box(&before, &after);
+    let lines = box_lines(&after, region);
+    // The changed region is the float itself, not a coincidence of characters: it
+    // starts at the float's own corner and its text is the question.
+    assert_eq!(after[y][x], "\u{250c}", "{lines:#?}");
+    assert!(lines[1].contains("Remove label ui?"), "{lines:#?}");
+
+    // Centred on the whole terminal, on both axes, rather than anchored to the
+    // pane that raised it: a question that moves is harder to spot. The margins
+    // match to within the odd column or row a centre cannot split.
+    let (columns, rows) = (after[0].len(), after.len());
+    assert!(
+        x.abs_diff(columns - (x + width)) <= 1,
+        "not centred across: {region:?}"
+    );
+    assert!(
+        y.abs_diff(rows - (y + height)) <= 1,
+        "not centred down: {region:?}"
+    );
+
+    // Nothing underneath moved: every cell outside the float is what it was, the
+    // breadcrumb line, the hint strip and both pane frames included — which is
+    // what being strictly inside the terminal on all four sides proves, given
+    // that the region above bounds every cell that changed at all.
+    assert!(x > 0 && y > 0, "{region:?}");
+    assert!(x + width < columns && y + height < rows, "{region:?}");
+
+    // Above everything, not merely framed on top of it: the cells the float
+    // covers are cleared, so no pane text shows through beside its own.
+    for row in &lines[1..height - 1] {
+        let interior: String = row.chars().skip(1).take(width - 2).collect();
+        assert!(
+            interior.chars().all(|c| !"─│┌┐└┘├┤┬┴┼".contains(c)),
+            "the screen shows through the float: {row:?}"
+        );
+    }
+}
+
+#[test]
+fn a_destructive_question_lists_its_answers_and_never_the_reflex_key() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store, Theme::with_color(false)).unwrap();
+    to_a_label_row(&mut app);
+    app.apply(Action::EnterEditing).unwrap();
+    let (before, _) = draw(&mut app);
+    app.apply(Action::Delete).unwrap();
+    let (after, _) = draw(&mut app);
+
+    let (before, after) = (cells(&before), cells(&after));
+    let lines = box_lines(&after, changed_box(&before, &after));
+    // A dialog says how to answer it, so the way out never depends on the hint
+    // strip a notice or a narrow terminal may have taken.
+    for answer in loti_tui::keymap::DIALOG_ANSWERS_CONFIRM {
+        assert!(
+            lines.iter().any(|l| l.contains(answer)),
+            "{answer:?} is not listed: {lines:#?}"
+        );
+    }
+    // And the reflex key is listed nowhere, because it answers nothing here: a
+    // reader arrives at a destructive question in a hurry.
+    assert!(
+        !lines.iter().any(|l| l.contains("Enter")),
+        "the float offers the reflex key: {lines:#?}"
+    );
+}
+
+#[test]
+fn a_refusal_appears_in_a_dialog_carrying_the_stores_own_words() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    to_a_label_row(&mut app);
+    app.apply(Action::EnterEditing).unwrap();
+
+    // Only the store can judge a write, so the browser offers the action and
+    // shows what comes back: here the entity goes between offer and answer.
+    let (before, _) = draw(&mut app);
+    std::fs::remove_file(store.epic_path("browser")).unwrap();
+    app.apply(Action::Delete).unwrap();
+    app.apply(Action::Delete).unwrap();
+    let (after, lines) = draw(&mut app);
+
+    // Verbatim: the store's message as the store produced it, so the browser and
+    // the CLI teach the same rule in the same words. Taken from the operation
+    // itself rather than spelled out here, which is what a reworded refusal would
+    // pass.
+    let refusal = ops::remove_labels(&store, &Target::Epic("browser".into()), &["ui".to_string()])
+        .expect_err("the store refuses a label removal on a missing entity")
+        .to_string();
+    let float = box_lines(&cells(&after), changed_box(&cells(&before), &cells(&after)));
+    // The float's first text row is the message and nothing before it: a browser
+    // word introducing the store's own would be a second voice on the rule.
+    let first = float[1].trim_start_matches('\u{2502}').trim_start();
+    assert!(
+        first.starts_with(&refusal),
+        "{refusal:?} is not what the float leads with: {float:#?}"
+    );
+    // A fixed title says what the float is, since the text in it is not the
+    // browser's own and introduces itself with nothing.
+    assert!(float[0].contains("refused"), "{float:#?}");
+    // A failure is a dialog, never a transient notice: the strip is untouched.
+    assert!(lines[23].contains("Esc leave"), "{:?}", lines[23]);
+}
+
+#[test]
+fn a_long_question_wraps_inside_the_float_and_keeps_its_answers_on_screen() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join(".loti");
+    store::init(dir.path(), &root).unwrap();
+    let store = Store::at(&root);
+    ops::create_epic(
+        &store,
+        NewEpic {
+            epic_id: "browser".into(),
+            name: "The browser".into(),
+            summary: "s".into(),
+            labels: vec![],
+            body: String::new(),
+        },
+    )
+    .unwrap();
+    // A label as long as a sentence, because a store refusal can be a paragraph
+    // and both go through the same float.
+    let label = "a label whose name someone pasted a whole sentence into, \
+                 with a supercalifragilisticexpialidocious word in it";
+    ops::add_labels(
+        &store,
+        &Target::Epic("browser".into()),
+        &[label.to_string()],
+    )
+    .unwrap();
+
+    let mut app = App::new(store, Theme::with_color(false)).unwrap();
+    to_a_label_row(&mut app);
+    app.apply(Action::EnterEditing).unwrap();
+    let (asked, _) = draw_at(&mut app, 30, 16);
+    app.apply(Action::Delete).unwrap();
+
+    // Room for the whole question: it wraps across the float's lines and none of
+    // it is lost, so a reader is never asked about an object they can only half
+    // see — whatever length the store or the reader gave it.
+    let (roomy, _) = draw_at(&mut app, 30, 16);
+    let whole = box_lines(&cells(&roomy), changed_box(&cells(&asked), &cells(&roomy)));
+    assert!(
+        whole.iter().any(|l| l.contains("word in it?")),
+        "the question lost its tail: {whole:#?}"
+    );
+    assert!(
+        !whole.iter().any(|l| l.contains('\u{2026}')),
+        "nothing had to give way here: {whole:#?}"
+    );
+
+    // A terminal too short for the whole question, which is where the ranking
+    // shows: the answers survive and the message is what gives way.
+    let (width, height) = (30u16, 8u16);
+    let (terminal, lines) = draw_at(&mut app, width, height);
+    for line in &lines {
+        assert!(
+            line.chars().count() <= width as usize,
+            "a line ran past the terminal: {line:?}"
+        );
+    }
+    let float = box_lines(&cells(&terminal), (0, 0, width as usize, height as usize));
+    // Every row of the float is closed on both sides, so the text wrapped inside
+    // it rather than running over its border.
+    let framed: Vec<&String> = float
+        .iter()
+        .filter(|l| {
+            l.starts_with('\u{250c}') || l.starts_with('\u{2502}') || l.starts_with('\u{2514}')
+        })
+        .collect();
+    for row in &framed {
+        let last = row.trim_end().chars().last().unwrap();
+        assert!(
+            ['\u{2510}', '\u{2502}', '\u{2518}'].contains(&last),
+            "a float row is not closed: {row:?}"
+        );
+    }
+    // A dialog that listed no way to answer it would seal the reader inside it.
+    assert!(float.iter().any(|l| l.contains("Esc cancel")), "{float:#?}");
+    // And the message it had to shorten says so, so half a rule cannot be read as
+    // the whole of one.
+    assert!(float.iter().any(|l| l.contains('\u{2026}')), "{float:#?}");
+}
+
+#[test]
+fn the_strip_lists_the_removal_only_where_the_row_offers_it() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store, Theme::with_color(false)).unwrap();
+    to_a_label_row(&mut app);
+    app.apply(Action::EnterEditing).unwrap();
+    let (_t, on_a_label) = draw(&mut app);
+    assert!(on_a_label[23].contains("d remove"), "{:?}", on_a_label[23]);
+
+    // A ticket cannot be deleted at all, so the letter is listed nowhere on it:
+    // there is no dimmed, present-but-unavailable hint.
+    app.apply(Action::Unwind).unwrap();
+    app.apply(Action::Ascend).unwrap();
+    to_work_row(&mut app);
+    app.apply(Action::EnterEditing).unwrap();
+    let (_t, on_a_ticket) = draw(&mut app);
+    assert!(!on_a_ticket[23].contains("remove"), "{:?}", on_a_ticket[23]);
+    assert!(
+        on_a_ticket[23].contains("Esc leave"),
+        "{:?}",
+        on_a_ticket[23]
+    );
+}
+
+#[test]
+fn a_confirmed_removal_leaves_the_mode_and_names_the_label_on_the_strip() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store, Theme::with_color(false)).unwrap();
+    to_a_label_row(&mut app);
+    app.apply(Action::EnterEditing).unwrap();
+    app.apply(Action::Delete).unwrap();
+    app.apply(Action::Delete).unwrap();
+    let (_t, lines) = draw(&mut app);
+
+    // The mode indicator going and the notice arriving are one frame, which is
+    // what reads as "that finished".
+    assert!(!lines[0].contains("EDITING"), "{:?}", lines[0]);
+    assert!(lines[23].contains("label ui removed"), "{:?}", lines[23]);
+    // The store was re-read: the epic held one label, so its labels level no
+    // longer exists and the browser lands on the level above.
+    assert_eq!(lines[0].trim(), "epics › browser");
+    assert!(
+        !lines.iter().skip(1).any(|l| l.contains("Remove label")),
+        "the float outlived the write: {lines:#?}"
+    );
+}

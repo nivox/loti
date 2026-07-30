@@ -564,6 +564,30 @@ pub fn edit_target(store: &Store, selection: &Selection) -> Result<EditTarget> {
     })
 }
 
+/// Take one label off the container it sits on.
+///
+/// A label set has no rename, so a label is only ever removed: renaming one is
+/// remove-then-add, which is two edits and so two editing sessions.
+///
+/// A refusal is the store's own message and nothing else — no wrapping context,
+/// no reworded rule — because the browser shows it verbatim, so the browser and
+/// the CLI teach the same rule in the same words and neither can go stale when a
+/// store rule gains a nuance.
+///
+/// No stamp guards this write: a stamp is the precondition of a free-form
+/// replacement, and removing one member of a set cannot silently discard text
+/// someone else wrote.
+pub fn remove_label(store: &Store, selection: &Selection) -> Result<()> {
+    // Only a label row offers removal, so any other selection is a caller that
+    // has lost track of what its row points at.
+    let Selection::Label(container, label) = selection else {
+        anyhow::bail!("{} is not a label", selection.reference())
+    };
+    ops::remove_labels(store, &container.target(), std::slice::from_ref(label))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
+
 /// The preview body for a selection.
 ///
 /// For an epic or a node it is byte-for-byte the markdown `loti epic show` /
@@ -769,6 +793,23 @@ pub(crate) mod fixture {
         /// The epic as a selection, which is how a surface addresses it.
         pub(crate) fn epic_selection(&self) -> Selection {
             Selection::Epic(self.epic.clone())
+        }
+
+        /// The labels the epic carries, as the store holds them. A test asserts
+        /// against these rather than against a fixture constant, so a richer
+        /// fixture cannot turn a removal test into a false promise.
+        pub(crate) fn epic_labels(&self) -> Vec<String> {
+            ops::list_labels(&self.store, &Target::Epic(self.epic.clone())).unwrap()
+        }
+
+        /// Take the epic's own file away, as a concurrent writer that closed the
+        /// whole effort out would.
+        ///
+        /// The shortest way to make a write the browser has already offered fail
+        /// for a reason only the store can judge: every label operation reads the
+        /// entity first, so what comes back is the store's existence refusal.
+        pub(crate) fn remove_the_epics_file(&self) {
+            std::fs::remove_file(self.store.epic_path(&self.epic)).unwrap();
         }
 
         /// Take every label off the epic, as a concurrent writer would.
@@ -1351,6 +1392,29 @@ mod tests {
         assert_eq!(ago(8 * 86400), "1w ago");
         // A writer's clock ahead of ours is skew, not a comment from the future.
         assert_eq!(age(now + jiff::Span::new().hours(2), now), "just now");
+    }
+
+    #[test]
+    fn a_label_removal_takes_the_one_label_it_names_and_refuses_anything_else() {
+        let fx = Fixture::build();
+        let before = fx.epic_labels();
+        assert!(before.len() > 1, "the promise needs more than one label");
+
+        remove_label(
+            &fx.store,
+            &Selection::Label(Container::Epic(fx.epic.clone()), before[0].clone()),
+        )
+        .unwrap();
+        assert_eq!(fx.epic_labels(), before[1..].to_vec());
+
+        // Only a label row offers removal, so a selection that is not a label is a
+        // caller that has lost track of what its row points at — refused by name,
+        // and with nothing written on the way to refusing.
+        let err = remove_label(&fx.store, &fx.epic_selection())
+            .expect_err("an epic is not one of its own labels")
+            .to_string();
+        assert!(err.contains(&fx.epic), "{err}");
+        assert_eq!(fx.epic_labels(), before[1..].to_vec());
     }
 
     #[test]
