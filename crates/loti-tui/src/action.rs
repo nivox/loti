@@ -6,6 +6,8 @@
 //! [`crate::keymap`]; a rebinding touches the keymap alone. Nothing here knows
 //! about key codes, and nothing in the state machine matches on a key.
 
+use crate::data::FreeForm;
+
 /// Which set of bindings is live, because one key may carry a different intent
 /// in each mode.
 ///
@@ -211,19 +213,29 @@ pub enum EditingAction {
     Add,
     /// Delete what the frozen row names, behind a confirmation.
     Delete,
-    /// Edit the long-form text of what the frozen row names: an epic's or a
-    /// node's body.
-    Body,
+    /// Replace one whole field of what the frozen row names outright: an epic's or
+    /// a node's name, summary or body.
+    ///
+    /// One action carrying which field it edits rather than one action per field:
+    /// every one of them is read at the keypress, written under the stamp of that
+    /// read and asked about the same way on a conflict, so a further replaceable
+    /// field is a field here rather than another path through all of that.
+    Edit(FreeForm),
 }
 
 impl EditingAction {
     /// Every editing action, so a surface covering all of them cannot miss one.
     /// Its length is pinned by a test, because a variant left out here would be
     /// an action with no hint and no key.
+    /// In the key map's own order, which is the order the hint strip lists them
+    /// in: a letter keeps its relative place from row to row rather than moving
+    /// with what a row happens to offer.
     pub const ALL: &'static [EditingAction] = &[
         EditingAction::Add,
         EditingAction::Delete,
-        EditingAction::Body,
+        EditingAction::Edit(FreeForm::Name),
+        EditingAction::Edit(FreeForm::Summary),
+        EditingAction::Edit(FreeForm::Body),
     ];
 
     /// The intent a key carries for this action. The state machine reads an
@@ -232,7 +244,7 @@ impl EditingAction {
         match self {
             EditingAction::Add => Action::Add,
             EditingAction::Delete => Action::Delete,
-            EditingAction::Body => Action::Body,
+            EditingAction::Edit(field) => Action::Edit(field),
         }
     }
 
@@ -298,9 +310,9 @@ pub enum Action {
     /// answers everything destructive, so it is learned once — a label removed, a
     /// buffer thrown away.
     Delete,
-    /// Edit the body of what editing mode is acting on, which opens a buffer on
-    /// the text as the store holds it now.
-    Body,
+    /// Replace one whole field of what editing mode is acting on, which opens a
+    /// surface on that field's text as the store holds it now.
+    Edit(FreeForm),
     /// Write anyway, over a change that landed under the open buffer. The
     /// affirmative answer of the one question whose two answers both lose
     /// something, which is why it is not the destructive letter: what this throws
@@ -360,10 +372,22 @@ mod tests {
         // and the counts make leaving it out of the list a failure here.
         for action in EditingAction::ALL {
             match action {
-                EditingAction::Add | EditingAction::Delete | EditingAction::Body => {}
+                EditingAction::Add | EditingAction::Delete => {}
+                // Every replaceable field is an action of its own, so a field
+                // added without a key and a hint fails here rather than being an
+                // action no reader can reach.
+                EditingAction::Edit(field) => match field {
+                    FreeForm::Name | FreeForm::Summary | FreeForm::Body => {}
+                },
             }
         }
-        assert_eq!(EditingAction::ALL.len(), 3);
+        assert_eq!(EditingAction::ALL.len(), 2 + FreeForm::ALL.len());
+        for field in FreeForm::ALL {
+            assert!(
+                EditingAction::ALL.contains(&EditingAction::Edit(*field)),
+                "{field:?} is a field no editing action reaches"
+            );
+        }
         for answers in Answers::ALL {
             match answers {
                 Answers::Destructive | Answers::Conflict | Answers::Acknowledge => {}

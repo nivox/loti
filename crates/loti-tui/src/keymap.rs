@@ -13,6 +13,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::action::{Action, AnswerWords, Answers, EditingAction, Fields, Lines, Mode, Shape};
+use crate::data::FreeForm;
 
 /// The intent a key press carries in a mode, or `None` if it is not bound there.
 pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
@@ -82,7 +83,19 @@ pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
         // from a write.
         (KeyCode::Char('a'), false) if matches!(mode, Mode::Editing) => Action::Add,
         (KeyCode::Char('d'), false) if matches!(mode, Mode::Editing) => Action::Delete,
-        (KeyCode::Char('b'), false) if matches!(mode, Mode::Editing) => Action::Body,
+        // A letter names the kind of thing being edited: `b` the long-form text, `n`
+        // the name, `S` the summary. The summary takes the shifted key because the
+        // unshifted one belongs to the state a reader changes far more often, at the
+        // cost of two unrelated nouns sharing a letter.
+        (KeyCode::Char('b'), false) if matches!(mode, Mode::Editing) => {
+            Action::Edit(FreeForm::Body)
+        }
+        (KeyCode::Char('n'), false) if matches!(mode, Mode::Editing) => {
+            Action::Edit(FreeForm::Name)
+        }
+        (KeyCode::Char('S'), false) if matches!(mode, Mode::Editing) => {
+            Action::Edit(FreeForm::Summary)
+        }
 
         // Session. `F1` is a help key beside `?` everywhere, because inside a
         // field `?` is a literal character and a reader must not have to learn a
@@ -256,7 +269,13 @@ pub const HELP: &[(&str, &str)] = &[
     ("z", "preview fills the width; mouse released"),
     ("e", "editing mode, on the highlighted row"),
     ("a / d", "editing mode: add a member / remove it, confirmed"),
-    ("b", "editing mode: the body, as text in the preview pane"),
+    // Three keys on one row, because the list is as tall as the shortest terminal
+    // the browser supports and a row past that is clipped without saying so: the
+    // three replace a whole field between them and are read as one group.
+    (
+        "n / S / b",
+        "editing mode: the name / the summary / the body",
+    ),
     (
         "Ctrl-S / Enter",
         "save; Enter unless it is a newline or the next field",
@@ -306,7 +325,9 @@ pub const FOOTER_ESSENTIAL: &[&str] = &["q quit", "? keys"];
 pub const FOOTER_HINTS_EDITING: &[(EditingAction, &str)] = &[
     (EditingAction::Add, "a add"),
     (EditingAction::Delete, "d remove"),
-    (EditingAction::Body, "b body"),
+    (EditingAction::Edit(FreeForm::Name), "n name"),
+    (EditingAction::Edit(FreeForm::Summary), "S summary"),
+    (EditingAction::Edit(FreeForm::Body), "b body"),
 ];
 
 /// The droppable hints of an open surface, ranked rather than in key order: they
@@ -892,20 +913,50 @@ mod tests {
     }
 
     #[test]
-    fn the_body_letter_opens_the_long_form_text_inside_the_mode_only() {
-        // Browse mode is where a reader's fingers rest, so the letter that opens a
-        // buffer on stored text is bound inside the mode and nowhere else.
-        assert_eq!(
-            action_for(plain(KeyCode::Char('b')), Mode::Editing),
-            Some(Action::Body)
-        );
-        assert_eq!(action_for(plain(KeyCode::Char('b')), Mode::Browse), None);
-        // Inside a field it is a character, and the motion it is spelled with keeps
-        // its own meaning there.
+    fn each_letter_that_replaces_a_whole_field_is_bound_inside_the_mode_only() {
+        // Browse mode is where a reader's fingers rest, so a letter that opens a
+        // surface on stored text is bound inside the mode and nowhere else. The
+        // summary takes the shifted letter because the unshifted one belongs to the
+        // state a reader changes far more often: two unrelated nouns share a letter
+        // deliberately, and neither letter carries anything else in either mode.
+        for (letter, field) in [
+            ('n', FreeForm::Name),
+            ('S', FreeForm::Summary),
+            ('b', FreeForm::Body),
+        ] {
+            assert_eq!(
+                action_for(plain(KeyCode::Char(letter)), Mode::Editing),
+                Some(Action::Edit(field)),
+                "{letter:?}"
+            );
+            assert_eq!(
+                action_for(plain(KeyCode::Char(letter)), Mode::Browse),
+                None,
+                "{letter:?}"
+            );
+            // And inside a field each of them is a character rather than the action
+            // it carries one layer up.
+            for mode in surface_modes() {
+                assert_eq!(
+                    action_for(plain(KeyCode::Char(letter)), mode),
+                    Some(Action::Insert(letter)),
+                    "{letter:?} in {mode:?}"
+                );
+            }
+        }
+        // The motions the letters are spelled like keep their own meaning in a
+        // field: an editing letter never took a control combination with it.
         for mode in surface_modes() {
             assert_eq!(
                 action_for(ctrl('b'), mode),
                 Some(Action::MoveLeft),
+                "{mode:?}"
+            );
+        }
+        for mode in text_areas() {
+            assert_eq!(
+                action_for(ctrl('n'), mode),
+                Some(Action::MoveDown),
                 "{mode:?}"
             );
         }

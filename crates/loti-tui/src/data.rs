@@ -639,12 +639,73 @@ fn age(created: Timestamp, now: Timestamp) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stamp(pub Timestamp);
 
+/// One of the whole-field replacements: a field a reader rewrites outright
+/// rather than adding an entry to.
+///
+/// Invariant: these are exactly the writes that can silently discard text
+/// somebody else wrote, so they are exactly the writes that carry [`Stamp`] as a
+/// precondition — and they are carried out by one stamped write, so there is one
+/// conflict to answer however many fields a reader may replace. A further
+/// replaceable field is a variant here rather than a second write of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreeForm {
+    /// The one-line name.
+    Name,
+    /// The one-line summary of scope.
+    Summary,
+    /// The markdown body, as long as the reader writes it.
+    Body,
+}
+
+impl FreeForm {
+    /// Every field a reader may replace, so a surface that has to cover them all
+    /// — the keys each answers, and the hints each lists — cannot then miss one.
+    pub const ALL: &'static [FreeForm] = &[FreeForm::Name, FreeForm::Summary, FreeForm::Body];
+
+    /// What the field is called wherever the reader is shown it: the surface's
+    /// title, the field's own column, the warning about discarding it. The store's
+    /// own word for it, so the browser and the command line name one field one
+    /// thing.
+    pub fn noun(self) -> &'static str {
+        match self {
+            FreeForm::Name => "name",
+            FreeForm::Summary => "summary",
+            FreeForm::Body => "body",
+        }
+    }
+
+    /// What this field holds in an entity that has been read, so a surface opens
+    /// on the field it names rather than on whichever one a caller reached for.
+    pub fn of(self, target: &EditTarget) -> &str {
+        match self {
+            FreeForm::Name => &target.name,
+            FreeForm::Summary => &target.summary,
+            FreeForm::Body => &target.body,
+        }
+    }
+
+    /// This field as an edit set names it: exactly one of `(name, summary, body)`
+    /// is present, so a replacement can never carry a field it was not aimed at.
+    ///
+    /// One decision for both kinds of entity, because an epic's edit set and a
+    /// node's take the same three fields and a second mapping is a second thing to
+    /// keep in step.
+    fn edits(self, value: &str) -> (Option<String>, Option<String>, Option<String>) {
+        let value = Some(value.to_string());
+        match self {
+            FreeForm::Name => (value, None, None),
+            FreeForm::Summary => (None, value, None),
+            FreeForm::Body => (None, None, value),
+        }
+    }
+}
+
 /// One entity as an editing surface starts from it: the fields a surface can
 /// replace, plus the stamp they were read at.
 ///
-/// The fields are the free-form replacements — a whole `name`, `summary` or
-/// `body` — which are exactly the writes that can silently discard someone
-/// else's text, so they are the writes that carry [`Stamp`] as a precondition.
+/// The fields are the free-form replacements — see [`FreeForm`] — which are
+/// exactly the writes that can silently discard someone else's text, so they are
+/// the writes that carry [`Stamp`] as a precondition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditTarget {
     /// What was read, so a surface can name its target and write back to it.
@@ -733,16 +794,19 @@ pub enum Write {
     RemoveBlocker(Selection),
     /// Take one asset off the container it hangs on, index entry and bytes alike.
     DeleteAsset(Selection),
-    /// Replace the whole body of the epic or node the row names.
+    /// Replace one whole field of the epic or node the row names.
     ///
-    /// A whole-field replacement, so it is the one write here that can silently
-    /// discard text somebody else wrote — which is what the stamp is for.
-    SetBody {
-        /// The epic or node whose body is replaced.
+    /// The one write here that can silently discard text somebody else wrote —
+    /// which is what the stamp is for — and the only one, whichever field it
+    /// names: one write shape means one conflict for a reader to answer.
+    Replace {
+        /// The epic or node whose field is replaced.
         target: Selection,
-        /// The replacement, exactly as the reader left it: what makes a body
+        /// Which of its fields.
+        field: FreeForm,
+        /// The replacement, exactly as the reader left it: what makes a value
         /// acceptable is the store's rule, and the browser normalises none of it.
-        body: String,
+        value: String,
         /// The stamp the replaced text was read at, applied only while the entity
         /// still carries it. `None` names no precondition — last write wins — which
         /// is what a reader chooses by answering a conflict with overwrite, and
@@ -762,7 +826,7 @@ impl Write {
             | Write::AddBlocker(target, _)
             | Write::RemoveBlocker(target)
             | Write::DeleteAsset(target)
-            | Write::SetBody { target, .. } => target,
+            | Write::Replace { target, .. } => target,
         }
     }
 
@@ -774,9 +838,15 @@ impl Write {
     /// is the write itself.
     pub fn overwriting(&self) -> Write {
         match self {
-            Write::SetBody { target, body, .. } => Write::SetBody {
+            Write::Replace {
+                target,
+                field,
+                value,
+                ..
+            } => Write::Replace {
                 target: target.clone(),
-                body: body.clone(),
+                field: *field,
+                value: value.clone(),
                 expect: None,
             },
             other => other.clone(),
@@ -813,11 +883,12 @@ pub fn perform(store: &Store, write: &Write) -> Result<(), Refusal> {
         Write::AddBlocker(selection, reference) => add_blocker(store, selection, reference),
         Write::RemoveBlocker(selection) => remove_blocker(store, selection),
         Write::DeleteAsset(selection) => delete_asset(store, selection),
-        Write::SetBody {
+        Write::Replace {
             target,
-            body,
+            field,
+            value,
             expect,
-        } => set_body(store, target, body, *expect),
+        } => replace(store, target, *field, value, *expect),
     }
 }
 
@@ -845,30 +916,36 @@ fn misdirected(message: String) -> Refusal {
     Refusal::Rule(message)
 }
 
-/// Replace an epic's or a node's body with the text the reader left, applying
-/// only while the entity still carries the stamp that text was read at.
+/// Replace one whole field of an epic or a node with the text the reader left,
+/// applying only while the entity still carries the stamp that text was read at.
 ///
-/// This is the one write the browser makes that replaces a whole field, so it is
-/// the one that can discard text somebody else wrote: the stamp is the store's
+/// These are the writes the browser makes that replace a whole field, so they are
+/// the ones that can discard text somebody else wrote: the stamp is the store's
 /// precondition, checked under the lock, and a mismatch writes nothing. Whether
-/// the body is acceptable at all is the store's rule; the text is written exactly
+/// the value is acceptable at all is the store's rule; the text is written exactly
 /// as the reader left it, trailing newline and all, as the command line writes
 /// what it is given.
-fn set_body(
+///
+/// One path for every replaceable field, so a field cannot be given a conflict
+/// story of its own — nor be added without a precondition.
+fn replace(
     store: &Store,
     selection: &Selection,
-    body: &str,
+    field: FreeForm,
+    value: &str,
     expect: Option<Stamp>,
 ) -> Result<(), Refusal> {
     let expect_updated = expect.map(|stamp| stamp.0);
+    let (name, summary, body) = field.edits(value);
     match selection {
         Selection::Epic(id) => ops::edit_epic(
             store,
             id,
             ops::EpicEdits {
-                body: Some(body.to_string()),
+                name,
+                summary,
+                body,
                 expect_updated,
-                ..Default::default()
             },
         )
         .map(|_| ())
@@ -877,23 +954,26 @@ fn set_body(
             store,
             r,
             ops::NodeEdits {
-                body: Some(body.to_string()),
+                name,
+                summary,
+                body,
                 expect_updated,
                 ..Default::default()
             },
         )
         .map(|_| ())
         .map_err(refusal),
-        // Only an epic and a node have a body of their own, and only their rows
-        // offer the action, so any other selection is a caller that has lost track
-        // of what its row points at.
+        // Only an epic and a node have these fields of their own, and only their
+        // rows offer the action, so any other selection is a caller that has lost
+        // track of what its row points at.
         Selection::Collection(..)
         | Selection::Label(..)
         | Selection::Comment(..)
         | Selection::Asset(..)
         | Selection::Blocker(..) => Err(misdirected(format!(
-            "{} has no body of its own",
-            selection.reference()
+            "{} has no {} of its own",
+            selection.reference(),
+            field.noun()
         ))),
     }
 }
@@ -1301,11 +1381,36 @@ pub(crate) mod fixture {
             Selection::Epic(self.epic.clone())
         }
 
-        /// The epic's body as the store holds it, so a test about a buffer opened
-        /// on stored text asserts against the store rather than against a constant
-        /// that a richer fixture would leave behind.
+        /// The ticket as a selection, which is how a surface addresses it.
+        pub(crate) fn node_selection(&self) -> Selection {
+            Selection::Node(self.node.clone())
+        }
+
+        /// One replaceable field of an entity as the store holds it, read through
+        /// the seam an editing surface opens on — so a test about a surface asserts
+        /// against the store rather than against a constant that a richer fixture
+        /// would leave behind.
+        pub(crate) fn field(&self, selection: &Selection, field: FreeForm) -> String {
+            field
+                .of(&edit_target(&self.store, selection).expect("the entity can be read"))
+                .to_string()
+        }
+
+        /// One replaceable field of the epic; see [`Fixture::field`].
+        pub(crate) fn epic_field(&self, field: FreeForm) -> String {
+            self.field(&self.epic_selection(), field)
+        }
+
+        /// One replaceable field of the ticket, which is addressed differently from
+        /// the epic: a write aimed at the wrong one of the two looks right as long
+        /// as only epics are asserted on.
+        pub(crate) fn node_field(&self, field: FreeForm) -> String {
+            self.field(&self.node_selection(), field)
+        }
+
+        /// The epic's body as the store holds it; see [`Fixture::field`].
         pub(crate) fn epic_body(&self) -> String {
-            ops::read_epic(&self.store, &self.epic).unwrap().body
+            self.epic_field(FreeForm::Body)
         }
 
         /// Replace the epic's body behind the browser's back, as a concurrent
@@ -2651,9 +2756,10 @@ mod tests {
         let written = "# mine\n\nwith a blank line above, and no break after this";
         perform(
             &fx.store,
-            &Write::SetBody {
+            &Write::Replace {
                 target: fx.epic_selection(),
-                body: written.to_string(),
+                field: FreeForm::Body,
+                value: written.to_string(),
                 expect: Some(target.stamp),
             },
         )
@@ -2675,9 +2781,10 @@ mod tests {
         let stamp = edit_target(&fx.store, &node).unwrap().stamp;
         perform(
             &fx.store,
-            &Write::SetBody {
+            &Write::Replace {
                 target: node,
-                body: "the ticket's own\n".to_string(),
+                field: FreeForm::Body,
+                value: "the ticket's own\n".to_string(),
                 expect: Some(stamp),
             },
         )
@@ -2690,6 +2797,74 @@ mod tests {
     }
 
     #[test]
+    fn a_replacement_lands_in_the_field_it_names_and_leaves_the_others_as_they_were() {
+        let fx = Fixture::build();
+        // On an epic and on a node, because the two are addressed differently and
+        // carry the same three fields: a write that reached for the wrong field of
+        // the right entity, or the right field of the wrong kind, looks correct from
+        // any single case.
+        for target in [fx.epic_selection(), fx.node_selection()] {
+            for field in FreeForm::ALL.iter().copied() {
+                let read = edit_target(&fx.store, &target).unwrap();
+                let written = format!("the replacement {} of {target:?}", field.noun());
+                perform(
+                    &fx.store,
+                    &Write::Replace {
+                        target: target.clone(),
+                        field,
+                        value: written.clone(),
+                        expect: Some(read.stamp),
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{field:?} on {target:?}: {e:?}"));
+                // The field named, and the other two exactly as they were: a
+                // replacement that carried a neighbour along would be a save that
+                // quietly blanked something the reader never opened.
+                let after = edit_target(&fx.store, &target).unwrap();
+                for other in FreeForm::ALL.iter().copied() {
+                    let expected = match other == field {
+                        true => &written,
+                        false => other.of(&read),
+                    };
+                    assert_eq!(
+                        other.of(&after),
+                        expected,
+                        "replacing the {} of {target:?} wrote the {}",
+                        field.noun(),
+                        other.noun()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_two_replaceable_fields_are_named_the_same_word_or_read_off_the_same_value() {
+        let fx = Fixture::build();
+        // The noun is what every surface, notice and warning calls the field, and
+        // the value is what a surface opens on. Two fields sharing either would put
+        // one field's text under another's name — and write it back there.
+        let target = edit_target(&fx.store, &fx.epic_selection()).unwrap();
+        let mut nouns: Vec<&str> = FreeForm::ALL.iter().map(|f| f.noun()).collect();
+        nouns.sort_unstable();
+        nouns.dedup();
+        assert_eq!(nouns.len(), FreeForm::ALL.len());
+        let mut values: Vec<&str> = FreeForm::ALL.iter().map(|f| f.of(&target)).collect();
+        values.sort_unstable();
+        values.dedup();
+        assert_eq!(
+            values.len(),
+            FreeForm::ALL.len(),
+            "the fixture cannot tell the fields apart: {target:?}"
+        );
+        // And each of them is the value the store holds under that name, so the
+        // three are not merely distinct but the right way round.
+        assert_eq!(FreeForm::Name.of(&target), target.name);
+        assert_eq!(FreeForm::Summary.of(&target), target.summary);
+        assert_eq!(FreeForm::Body.of(&target), target.body);
+    }
+
+    #[test]
     fn a_body_write_naming_a_stamp_the_entity_has_moved_past_is_refused_as_a_conflict() {
         let fx = Fixture::build();
         let stamp = edit_target(&fx.store, &fx.epic_selection()).unwrap().stamp;
@@ -2699,9 +2874,10 @@ mod tests {
         fx.rewrite_the_epics_body("theirs\n");
         let refused = perform(
             &fx.store,
-            &Write::SetBody {
+            &Write::Replace {
                 target: fx.epic_selection(),
-                body: "mine\n".to_string(),
+                field: FreeForm::Body,
+                value: "mine\n".to_string(),
                 expect: Some(stamp),
             },
         )
@@ -2716,9 +2892,10 @@ mod tests {
         // is what a reader asks for by answering the question with overwrite.
         perform(
             &fx.store,
-            &Write::SetBody {
+            &Write::Replace {
                 target: fx.epic_selection(),
-                body: "mine\n".to_string(),
+                field: FreeForm::Body,
+                value: "mine\n".to_string(),
                 expect: Some(stamp),
             }
             .overwriting(),
@@ -2747,9 +2924,10 @@ mod tests {
         assert_eq!(
             perform(
                 &fx.store,
-                &Write::SetBody {
+                &Write::Replace {
                     target: fx.epic_selection(),
-                    body: "mine\n".to_string(),
+                    field: FreeForm::Body,
+                    value: "mine\n".to_string(),
                     expect: Some(stamp),
                 },
             ),
@@ -2759,7 +2937,7 @@ mod tests {
     }
 
     #[test]
-    fn only_an_epic_or_a_node_has_a_body_to_write() {
+    fn only_an_epic_or_a_node_has_a_field_to_replace() {
         let fx = Fixture::build();
         let before = fx.epic_body();
         // A collection and its members are edited by their own operations, so any
@@ -2776,19 +2954,25 @@ mod tests {
                 fx.epic_assets()[0].clone(),
             ),
         ] {
-            let err = refusal_words(
-                perform(
-                    &fx.store,
-                    &Write::SetBody {
-                        target: wrong.clone(),
-                        body: "nowhere\n".to_string(),
-                        expect: None,
-                    },
-                )
-                .expect_err("only an epic or a node has a body"),
-            );
-            assert!(err.contains(&fx.epic), "{wrong:?}: {err}");
-            assert_eq!(fx.epic_body(), before, "{wrong:?} wrote something");
+            // Every replaceable field, because each is refused for the same reason
+            // and each has to say which field the row does not have.
+            for field in FreeForm::ALL.iter().copied() {
+                let err = refusal_words(
+                    perform(
+                        &fx.store,
+                        &Write::Replace {
+                            target: wrong.clone(),
+                            field,
+                            value: "nowhere\n".to_string(),
+                            expect: None,
+                        },
+                    )
+                    .expect_err("only an epic or a node has these fields"),
+                );
+                assert!(err.contains(&fx.epic), "{wrong:?}: {err}");
+                assert!(err.contains(field.noun()), "{wrong:?}: {err}");
+                assert_eq!(fx.epic_body(), before, "{wrong:?} wrote something");
+            }
         }
     }
 
@@ -2796,9 +2980,10 @@ mod tests {
     fn every_write_says_what_it_is_aimed_at_and_only_a_stamped_one_drops_a_precondition() {
         let fx = Fixture::build();
         let stamp = edit_target(&fx.store, &fx.epic_selection()).unwrap().stamp;
-        let body = Write::SetBody {
+        let body = Write::Replace {
             target: fx.epic_selection(),
-            body: "mine\n".to_string(),
+            field: FreeForm::Body,
+            value: "mine\n".to_string(),
             expect: Some(stamp),
         };
         // Every write names the row it is aimed at, so a question raised about one
@@ -2816,16 +3001,27 @@ mod tests {
             // wrong entity with the reader's text.
             assert_eq!(write.overwriting().target(), write.target(), "{write:?}");
         }
-        // The stamped write loses its stamp, and a write that never carried one is
-        // unchanged: it cannot conflict, so there is nothing to drop.
-        assert_eq!(
-            body.overwriting(),
-            Write::SetBody {
+        // A stamped write loses its stamp and keeps everything else — which field,
+        // and the text the reader left — for every field it may name: dropping the
+        // precondition is the reader saying "write it anyway", not "write something
+        // else".
+        for field in FreeForm::ALL.iter().copied() {
+            let stamped = Write::Replace {
                 target: fx.epic_selection(),
-                body: "mine\n".to_string(),
-                expect: None,
-            }
-        );
+                field,
+                value: "mine\n".to_string(),
+                expect: Some(stamp),
+            };
+            assert_eq!(
+                stamped.overwriting(),
+                Write::Replace {
+                    target: fx.epic_selection(),
+                    field,
+                    value: "mine\n".to_string(),
+                    expect: None,
+                }
+            );
+        }
         let unstamped = Write::RemoveLabel(fx.epic_selection());
         assert_eq!(unstamped.overwriting(), unstamped);
     }

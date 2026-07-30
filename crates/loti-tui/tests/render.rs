@@ -12,7 +12,7 @@ use loti_core::store::{self, Store};
 use loti_core::Actor;
 use loti_tui::action::{Action, Answers};
 use loti_tui::app::{App, Modal};
-use loti_tui::data::{ReadOnly, RowKind, Selection};
+use loti_tui::data::{FreeForm, ReadOnly, RowKind, Selection};
 use loti_tui::theme::Theme;
 use loti_tui::ui;
 use ratatui::backend::TestBackend;
@@ -1635,7 +1635,7 @@ fn to_the_epic_row(app: &mut App) {
 /// letter that edits its long-form text.
 fn open_the_body_buffer(app: &mut App) {
     freeze_the_epics_row(app);
-    app.apply(Action::Body).unwrap();
+    app.apply(Action::Edit(FreeForm::Body)).unwrap();
     assert!(app.surface().is_some(), "the body key opened no buffer");
 }
 
@@ -1645,13 +1645,31 @@ fn freeze_the_epics_row(app: &mut App) {
     app.apply(Action::EnterEditing).unwrap();
 }
 
-/// The body the store holds for the epic, through the seam an editing surface
-/// opens on — never a string spelled out here, so a fixture change cannot turn a
-/// test about the buffer into a test about the fixture.
+/// One replaceable field of an entity, through the seam an editing surface opens
+/// on — never a string spelled out here, so a fixture change cannot turn a test
+/// about a surface into a test about the fixture.
+fn stored_field(store: &Store, selection: &Selection, field: FreeForm) -> String {
+    field
+        .of(&loti_tui::data::edit_target(store, selection)
+            .expect("the entity can be read for editing"))
+        .to_string()
+}
+
+/// The epic, as a surface addresses it.
+fn the_epic() -> Selection {
+    Selection::Epic("browser".into())
+}
+
+/// The first ticket, as a surface addresses it. Addressed differently from the
+/// epic, so a write aimed at the wrong one of the two looks right as long as only
+/// the epic is asserted on.
+fn the_ticket() -> Selection {
+    Selection::Node(NodeRef::new("browser", 1))
+}
+
+/// The body the store holds for the epic; see [`stored_field`].
 fn stored_body(store: &Store) -> String {
-    loti_tui::data::edit_target(store, &Selection::Epic("browser".into()))
-        .expect("the epic can be read for editing")
-        .body
+    stored_field(store, &the_epic(), FreeForm::Body)
 }
 
 /// The column the pane divider is drawn at, read off the frame: the navigation
@@ -1674,7 +1692,7 @@ fn the_body_buffer_draws_in_the_preview_pane_at_the_split_the_reader_set() {
     freeze_the_epics_row(&mut app);
     let (before, _) = draw(&mut app);
 
-    app.apply(Action::Body).unwrap();
+    app.apply(Action::Edit(FreeForm::Body)).unwrap();
     let (mut terminal, _) = draw(&mut app);
     let (before, after) = (cells(&before), cells(&terminal));
 
@@ -1783,7 +1801,7 @@ fn a_saved_body_leaves_the_mode_and_the_notice_names_the_entity() {
     // discover is a letter nobody presses.
     assert!(frozen[23].contains("b body"), "{:?}", frozen[23]);
 
-    app.apply(Action::Body).unwrap();
+    app.apply(Action::Edit(FreeForm::Body)).unwrap();
     // A line break is content in a buffer that holds many lines, so what a reader
     // types with the reflex key lands in the text.
     for c in "# a heading".chars() {
@@ -1896,6 +1914,136 @@ fn a_change_under_the_buffer_asks_before_it_overwrites_and_keeps_the_text_either
     );
     assert!(!done[0].contains("EDITING"), "{:?}", done[0]);
     assert!(done[23].contains("body of browser saved"), "{:?}", done[23]);
+}
+
+#[test]
+fn the_name_is_a_short_field_in_a_centred_float_and_the_saved_notice_names_the_entity() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    freeze_the_epics_row(&mut app);
+    let (before, frozen) = draw(&mut app);
+    // The row offers both short fields, and the strip teaches both letters: a letter
+    // a reader cannot discover is a letter nobody presses.
+    for hint in ["n name", "S summary"] {
+        assert!(frozen[23].contains(hint), "{hint:?}: {:?}", frozen[23]);
+    }
+
+    app.apply(Action::Edit(FreeForm::Name)).unwrap();
+    let (after, _) = draw(&mut app);
+    let (before, after) = (cells(&before), cells(&after));
+    // Bounded to everything above the hint strip: the strip legitimately changes,
+    // because the keys that apply are now the surface's own.
+    let body = ..after.len() - 1;
+    let region @ (x, y, width, height) = changed_box(&before[body], &after[body]);
+    let float = box_lines(&after, region);
+    // A short single line is a float and not the preview pane: the pane is for text
+    // long enough that a reader needs the row beside it, and a name is one line.
+    assert_eq!(after[y][x], "\u{250c}", "{float:#?}");
+    assert!(float[0].contains("name of browser"), "{float:#?}");
+    let held = stored_field(&store, &the_epic(), FreeForm::Name);
+    assert!(
+        float[1].contains("name"),
+        "the field is not named: {float:#?}"
+    );
+    assert!(
+        float[1].contains(&held),
+        "the field does not hold the stored name: {float:#?}"
+    );
+    // Centred on the whole terminal, like every other float, and reflowing nothing:
+    // the panes and the frozen row are where they were, merely covered.
+    let (columns, rows) = (after[0].len(), after.len());
+    assert!(
+        x.abs_diff(columns - (x + width)) <= 1,
+        "not centred across: {region:?}"
+    );
+    assert!(
+        y.abs_diff(rows - (y + height)) <= 1,
+        "not centred down: {region:?}"
+    );
+    assert!(x > 0 && y > 0, "{region:?}");
+    assert!(x + width < columns && y + height < rows - 1, "{region:?}");
+
+    // Typed onto the end of what the store held, so the save carries both halves.
+    app.apply(Action::MoveToEnd).unwrap();
+    for c in " reborn".chars() {
+        app.apply(Action::Insert(c)).unwrap();
+    }
+    app.apply(Action::Accept).unwrap();
+    // Wide enough for the whole name in the navigation pane, because what the row
+    // says after the write is part of the claim: a narrower pane elides the tail,
+    // which is exactly the part the write added.
+    let (_t, lines) = draw_at(&mut app, 140, 24);
+
+    // The mode indicator going, the float going and the notice arriving are one
+    // frame, which is what reads as "that finished".
+    assert!(!lines[0].contains("EDITING"), "{:?}", lines[0]);
+    assert!(
+        !lines[1..23].iter().any(|l| l.contains("name of browser")),
+        "the float outlived the write: {lines:#?}"
+    );
+    assert!(
+        lines[23].contains("name of browser saved"),
+        "{:?}",
+        lines[23]
+    );
+    let written = stored_field(&store, &the_epic(), FreeForm::Name);
+    assert_eq!(written, format!("{held} reborn"));
+    // The store was re-read, so the row the reader is looking at names what was
+    // written rather than what it named a moment ago.
+    assert!(
+        lines[1..23].iter().any(|l| l.contains(&written)),
+        "the row still names the old name: {lines:#?}"
+    );
+}
+
+#[test]
+fn the_summary_of_a_ticket_is_its_own_short_field_and_the_notice_names_the_ticket() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    // A ticket, because it is addressed differently from the epic: a surface that
+    // read or wrote the epic's summary instead would pass every epic-only assertion.
+    app.apply(Action::Descend).unwrap();
+    to_work_row(&mut app);
+    app.apply(Action::EnterEditing).unwrap();
+    let (before, frozen) = draw(&mut app);
+    assert!(frozen[23].contains("S summary"), "{:?}", frozen[23]);
+
+    app.apply(Action::Edit(FreeForm::Summary)).unwrap();
+    let (after, _) = draw(&mut app);
+    let (before, after) = (cells(&before), cells(&after));
+    let body = ..after.len() - 1;
+    let float = box_lines(&after, changed_box(&before[body], &after[body]));
+    // It says which row and which field, because the float covers the frozen row.
+    assert!(float[0].contains("summary of browser/1"), "{float:#?}");
+    let held = stored_field(&store, &the_ticket(), FreeForm::Summary);
+    assert!(float[1].contains("summary"), "{float:#?}");
+    assert!(
+        float[1].contains(&held),
+        "the field does not hold the ticket's stored summary: {float:#?}"
+    );
+
+    app.apply(Action::MoveToEnd).unwrap();
+    for c in " widened".chars() {
+        app.apply(Action::Insert(c)).unwrap();
+    }
+    app.apply(Action::Accept).unwrap();
+    let (_t, lines) = draw(&mut app);
+    assert!(!lines[0].contains("EDITING"), "{:?}", lines[0]);
+    assert!(
+        lines[23].contains("summary of browser/1 saved"),
+        "{:?}",
+        lines[23]
+    );
+    assert_eq!(
+        stored_field(&store, &the_ticket(), FreeForm::Summary),
+        format!("{held} widened")
+    );
+    // The ticket's summary and no other's: the epic carries one too, and a write
+    // aimed at the container would leave every assertion above standing.
+    assert!(
+        !stored_field(&store, &the_epic(), FreeForm::Summary).contains("widened"),
+        "the epic's summary was written instead"
+    );
 }
 
 #[test]

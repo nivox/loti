@@ -77,15 +77,15 @@ const UNREADABLE_TITLE: &str = " part of the store could not be read ";
 
 /// What a label field is called wherever it has to be named: on the surface that
 /// fills it in, and in the warning that says it is empty.
+///
+/// A field that replaces one of an entity's own is named by the store's word for
+/// that field instead, so no constant here can come to call it something else
+/// than the command line does.
 const LABEL_FIELD: &str = "label";
 /// See [`LABEL_FIELD`]. A blocker is named by a reference rather than written
 /// out, so the field says so: what the reader types is a token the store
 /// resolves, not prose.
 const BLOCKER_FIELD: &str = "blocker reference";
-/// See [`LABEL_FIELD`]. The long-form text of an epic or a node, named as the
-/// store names it — the warning that asks about discarding it, and the buffer's
-/// own column, say the same word the command line does.
-const BODY_FIELD: &str = "body";
 
 /// A transient one-line notice, holding the hint strip's line until its deadline
 /// passes.
@@ -134,15 +134,15 @@ enum Offer {
     Ask(Dialog),
     /// A surface to fill in and accept.
     Fill(Surface),
-    /// A surface whose starting text is the entity's own, so it cannot be built
-    /// without reading the entity.
+    /// A surface whose starting text is the entity's own field, so it cannot be
+    /// built without reading the entity.
     ///
     /// A variant of its own because this offer is asked on every frame — the hint
     /// strip asks it — and a read per frame would be a read the reader never asked
     /// for. So the offer says which text is wanted and the read happens when the
     /// letter is pressed, which is also the moment the freshness rule names: the
     /// buffer starts from the current text and the stamp is as fresh as the edit.
-    Compose(LongForm),
+    Compose(data::FreeForm),
     /// Nothing for the browser to do, and the notice that says so — naming the
     /// command line, where the job the browser does not do is done instead.
     ///
@@ -150,18 +150,6 @@ enum Offer {
     /// reader who presses the letter anyway gets an answer better than "not an
     /// editing action" rather than being left to guess where else to look.
     Signpost(String),
-}
-
-/// Which whole-field replacement a surface composes, of the ones a re-read has to
-/// fetch first.
-///
-/// Invariant: whatever is named here is read through the core seam when the letter
-/// is pressed and written back with the stamp of that read, so no free-form
-/// replacement can be composed from a preview the browser rendered minutes ago.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LongForm {
-    /// The markdown body, as long as the reader writes it.
-    Body,
 }
 
 /// A dialog: what it says, how it may be answered, what its answers are called,
@@ -666,13 +654,20 @@ enum Commit {
     /// row names. The browser judges nothing about the reference: what it names,
     /// and whether that may block this, come back from the store.
     AddBlocker(Selection),
-    /// Replace the body of the epic or node the frozen row names, guarded by the
-    /// stamp its text was read at.
+    /// Replace one whole field of the epic or node the frozen row names, guarded by
+    /// the stamp that field's text was read at.
     ///
-    /// The stamp is captured when the buffer opens and travels unread from there to
+    /// The stamp is captured when the surface opens and travels unread from there to
     /// the write: the window it guards is the edit itself, which is exactly the
     /// window the browser cannot see into.
-    SetBody(Selection, data::Stamp),
+    Replace {
+        /// The epic or node the field belongs to.
+        target: Selection,
+        /// Which of its fields the surface replaces.
+        field: data::FreeForm,
+        /// The stamp that field's text was read at.
+        stamp: data::Stamp,
+    },
 }
 
 impl Surface {
@@ -702,21 +697,40 @@ impl Surface {
         }
     }
 
-    /// The surface that edits a body: one field holding as many lines as the reader
-    /// writes, drawn in the preview pane so the frozen row stays visible beside it,
-    /// at whatever split the reader set.
+    /// The surface that replaces one whole field of an epic or a node: one field,
+    /// starting from the text the read returned and carrying that read's stamp, so
+    /// it is the current value rather than a rendered preview of an older one.
     ///
-    /// It starts from the text the read returned and carries that read's stamp, so
-    /// the buffer is the current document rather than a rendered preview of an older
-    /// one. The field is not required: a body may legitimately be emptied, and what
-    /// makes one acceptable is the store's rule.
-    fn body(target: data::EditTarget) -> Self {
+    /// One surface for every replaceable field, because everything but its shape is
+    /// the same: the read, the stamp, the conflict it may be refused for. The shape
+    /// is the field's own answer — the long-form text is many lines in the preview
+    /// pane, so the frozen row stays visible beside the prose being rewritten, while
+    /// a short line is a float, where keeping the row visible buys nothing.
+    fn replace(field: data::FreeForm, target: data::EditTarget) -> Self {
+        // A name may not be emptied: it is how every row addresses what it names,
+        // so a row with none is a row a reader cannot pick out. A summary and a body
+        // may — emptying either is a thing a reader may mean — and what makes a
+        // non-empty value acceptable is the store's rule and not this surface's.
+        let (placement, lines, required) = match field {
+            data::FreeForm::Name => (Placement::Float, Lines::One, true),
+            data::FreeForm::Summary => (Placement::Float, Lines::One, false),
+            data::FreeForm::Body => (Placement::Pane, Lines::Many, false),
+        };
         Self {
-            title: format!(" body of {} ", target.selection.reference()),
-            fields: vec![Field::filled(BODY_FIELD, false, Lines::Many, target.body)],
+            title: format!(" {} of {} ", field.noun(), target.selection.reference()),
+            fields: vec![Field::filled(
+                field.noun(),
+                required,
+                lines,
+                field.of(&target).to_string(),
+            )],
             focus: 0,
-            placement: Placement::Pane,
-            commit: Commit::SetBody(target.selection, target.stamp),
+            placement,
+            commit: Commit::Replace {
+                target: target.selection,
+                field,
+                stamp: target.stamp,
+            },
         }
     }
 
@@ -824,18 +838,23 @@ impl Surface {
                     format!("blocker {} added", data::blocker_name(list, &reference)),
                 )
             }
-            Commit::SetBody(target, stamp) => {
+            Commit::Replace {
+                target,
+                field,
+                stamp,
+            } => {
                 let reference = target.reference();
                 (
-                    data::Write::SetBody {
+                    data::Write::Replace {
                         target: target.clone(),
-                        body: self.fields[0].value.clone(),
+                        field: *field,
+                        value: self.fields[0].value.clone(),
                         expect: Some(*stamp),
                     },
-                    // The notice names the entity: the buffer that held the text is
-                    // gone by the time it is read, and the row it belonged to is one
-                    // of several that look alike.
-                    format!("body of {reference} saved"),
+                    // The notice names the field and the entity: the surface that
+                    // held the text is gone by the time it is read, and the row it
+                    // belonged to is one of several that look alike.
+                    format!("{} of {reference} saved", field.noun()),
                 )
             }
         }
@@ -1091,14 +1110,13 @@ impl App {
                 }
                 _ => None,
             },
-            // Only an epic and a node have a body of their own: a collection and its
-            // members are edited by their own operations, so no row of one offers the
-            // letter. The text itself is not fetched here — the hint strip asks this
-            // on every frame, and a read belongs to the keypress.
-            EditingAction::Body => match target {
-                Selection::Epic(_) | Selection::Node(_) => {
-                    Some(Offer::Compose(LongForm::Body))
-                }
+            // Only an epic and a node have a name, a summary and a body of their
+            // own: a collection and its members are edited by their own operations,
+            // so no row of one offers these letters. The text itself is not fetched
+            // here — the hint strip asks this on every frame, and a read belongs to
+            // the keypress.
+            EditingAction::Edit(field) => match target {
+                Selection::Epic(_) | Selection::Node(_) => Some(Offer::Compose(field)),
                 _ => None,
             },
             EditingAction::Delete => match target {
@@ -1218,7 +1236,7 @@ impl App {
             // these intents while browsing.
             Action::Add
             | Action::Delete
-            | Action::Body
+            | Action::Edit(_)
             | Action::Overwrite
             | Action::Accept
             | Action::ExternalEditor
@@ -1571,7 +1589,7 @@ impl App {
             _ => match EditingAction::for_intent(action).and_then(|a| self.offer(a)) {
                 Some(Offer::Ask(dialog)) => self.modal = Some(Modal::Dialog(Box::new(dialog))),
                 Some(Offer::Fill(surface)) => self.surface = Some(surface),
-                Some(Offer::Compose(text)) => self.compose(text),
+                Some(Offer::Compose(field)) => self.compose(field),
                 // Nothing is written and nothing opens: the row said where the job
                 // is done instead, which is the same channel as any other reason
                 // nothing happened.
@@ -1581,10 +1599,11 @@ impl App {
         }
     }
 
-    /// Open a buffer on text the store holds, re-read at this instant.
+    /// Open a surface on one field's text as the store holds it, re-read at this
+    /// instant.
     ///
     /// The read happens here rather than when the mode was entered or when the
-    /// cursor last moved: the buffer must start from the current text, and the stamp
+    /// cursor last moved: the surface must start from the current text, and the stamp
     /// it carries has to be as fresh as the edit is, or the window a conflict is
     /// reported for would be "since you last pressed a motion key" — minutes of
     /// browsing before any typing began.
@@ -1593,16 +1612,12 @@ impl App {
     /// the entity may have gone between the letter being offered and pressed, which
     /// is the same class of thing as any other part of a store the browser cannot
     /// read.
-    fn compose(&mut self, text: LongForm) {
+    fn compose(&mut self, field: data::FreeForm) {
         let Some(target) = self.editing.clone() else {
             return;
         };
         match data::edit_target(&self.store, &target) {
-            Ok(target) => {
-                self.surface = Some(match text {
-                    LongForm::Body => Surface::body(target),
-                })
-            }
+            Ok(target) => self.surface = Some(Surface::replace(field, target)),
             Err(e) => self.store_unreadable(e.to_string()),
         }
     }
@@ -1814,7 +1829,7 @@ impl App {
 mod tests {
     use super::*;
     use crate::data::fixture::Fixture;
-    use crate::data::RowKind;
+    use crate::data::{FreeForm, RowKind};
     use crate::theme::Theme;
 
     /// The browser on the shared fixture store. The fixture is returned with it
@@ -1953,7 +1968,7 @@ mod tests {
     /// the letter that edits its long-form text.
     fn open_the_body_buffer(app: &mut App) {
         freeze_the_epics_row(app);
-        app.apply(Action::Body).unwrap();
+        app.apply(Action::Edit(FreeForm::Body)).unwrap();
         assert!(app.surface().is_some(), "the body key opened no buffer");
     }
 
@@ -3673,7 +3688,7 @@ mod tests {
         // beside it was rendered from: without a read here the conflict window would
         // be "since the cursor last moved" — minutes of browsing before any typing.
         fx.rewrite_the_epics_body("theirs, after the mode was entered\n");
-        app.apply(Action::Body).unwrap();
+        app.apply(Action::Edit(FreeForm::Body)).unwrap();
         assert_eq!(field_value(&app), fx.epic_body());
         // One field holding many lines, which is the whole of what the key map is
         // told: it is what makes the reflex key a line break here and the save key
@@ -3702,10 +3717,12 @@ mod tests {
         app.apply(Action::EnterEditing).unwrap();
         // A node has a body of its own, so its row offers the letter and the strip
         // lists it.
-        assert!(app.editing_hints().contains(&hint_for(EditingAction::Body)));
+        assert!(app
+            .editing_hints()
+            .contains(&hint_for(EditingAction::Edit(FreeForm::Body))));
         hints_and_keys_agree(&mut app);
 
-        app.apply(Action::Body).unwrap();
+        app.apply(Action::Edit(FreeForm::Body)).unwrap();
         let surface = app.surface().expect("the letter opened a buffer");
         // The buffer names the row it is editing, because the pane is not the row
         // and the frozen row is dim beside it — and it holds the node's own text,
@@ -3728,10 +3745,12 @@ mod tests {
         to_a_label_row(&mut app);
         app.apply(Action::EnterEditing).unwrap();
         app.clear_flash();
-        app.apply(Action::Body).unwrap();
+        app.apply(Action::Edit(FreeForm::Body)).unwrap();
         assert!(app.surface().is_none(), "a label row opened a body buffer");
         assert_eq!(app.flash_message(), Some(NOT_AN_EDITING_ACTION));
-        assert!(!app.editing_hints().contains(&hint_for(EditingAction::Body)));
+        assert!(!app
+            .editing_hints()
+            .contains(&hint_for(EditingAction::Edit(FreeForm::Body))));
     }
 
     #[test]
@@ -3743,7 +3762,7 @@ mod tests {
         // a buffer cannot open on text nothing could read — so the read's failure is
         // reported as any other unreadable part of a store is, and the mode stands.
         fx.remove_the_epics_file();
-        app.apply(Action::Body).unwrap();
+        app.apply(Action::Edit(FreeForm::Body)).unwrap();
         assert!(
             app.surface().is_none(),
             "a buffer opened on text that could not be read"
@@ -3776,7 +3795,10 @@ mod tests {
         let Some(Modal::Dialog(dialog)) = app.modal() else {
             panic!("a dirty buffer was thrown away unasked: {:?}", app.modal())
         };
-        assert!(dialog.message().contains(BODY_FIELD), "{dialog:?}");
+        assert!(
+            dialog.message().contains(FreeForm::Body.noun()),
+            "{dialog:?}"
+        );
         assert_eq!(dialog.answers(), Answers::Destructive);
 
         // The answer that is never destructive lands back in the buffer with the
@@ -3858,6 +3880,180 @@ mod tests {
         assert!(app.surface().is_none());
         assert_eq!(app.editing_target(), None);
         assert_eq!(app.mode(), Mode::Browse);
+    }
+
+    /// Stand on the fixture's first ticket row, inside the epic, which is the other
+    /// kind of row that carries a name, a summary and a body of its own.
+    fn freeze_a_ticket_row(app: &mut App) {
+        to_the_roster(app);
+        app.apply(Action::Descend).unwrap(); // into the epic
+        to_work_row(app);
+        app.apply(Action::EnterEditing).unwrap();
+    }
+
+    /// Empty the open field the way a reader does, one deletion per character.
+    ///
+    /// Bounded by what the field held, so a deletion that stopped removing anything
+    /// fails here rather than spinning at full tilt with nothing to say.
+    fn empty_the_field(app: &mut App) {
+        for _ in 0..field_value(app).chars().count() {
+            app.apply(Action::DeleteAfter).unwrap();
+        }
+        assert_eq!(field_value(app), "", "the field would not empty");
+    }
+
+    #[test]
+    fn the_name_and_the_summary_are_one_short_field_opened_on_the_value_the_store_holds() {
+        let (fx, mut app) = app();
+        // On the epic's row and on a ticket's row, because the two are addressed
+        // differently and carry the same fields: a read aimed at the wrong kind of
+        // entity, or at the wrong field of the right one, looks correct from either
+        // case on its own.
+        for on_a_ticket in [false, true] {
+            for field in [FreeForm::Name, FreeForm::Summary] {
+                match on_a_ticket {
+                    true => freeze_a_ticket_row(&mut app),
+                    false => freeze_the_epics_row(&mut app),
+                }
+                let reference = app
+                    .editing_target()
+                    .expect("the mode froze a row")
+                    .reference();
+                // The row offers the letter, so the strip teaches it: a letter no
+                // hint names is a letter nobody presses.
+                assert!(
+                    app.editing_hints()
+                        .contains(&hint_for(EditingAction::Edit(field))),
+                    "{field:?} on {reference}"
+                );
+                app.apply(Action::Edit(field)).unwrap();
+
+                let surface = app.surface().expect("the letter opened a surface");
+                // It says which row it is editing and which field of it, because the
+                // float covers the frozen row and the row is dim beside it.
+                assert!(
+                    surface.title().contains(&reference) && surface.title().contains(field.noun()),
+                    "{:?}",
+                    surface.title()
+                );
+                assert_eq!(surface.fields()[0].label(), field.noun());
+                // It opens on that field's own value as the store holds it, and not
+                // on a neighbour's: this is the text the save writes back.
+                let held = match on_a_ticket {
+                    true => fx.node_field(field),
+                    false => fx.epic_field(field),
+                };
+                assert_eq!(field_value(&app), held, "{field:?} on {reference}");
+                // One field holding one line, which is the whole of what the key map
+                // is told: the reflex key finishes a short field rather than putting
+                // a break in a value that may hold none.
+                assert_eq!(app.mode(), surface_mode(Fields::One, Lines::One));
+                // Nothing has been typed, so the way out asks nothing: text the
+                // store already held is not text the reader wrote.
+                assert!(!app.surface().unwrap().fields()[0].is_dirty());
+                app.apply(Action::Unwind).unwrap();
+                assert_eq!(app.modal(), None, "leaving a clean field asked");
+                app.apply(Action::Unwind).unwrap();
+            }
+        }
+
+        // And a collection or one of its members has none of these fields, so no row
+        // of one offers either letter: it is as unknown there as any key the mode
+        // never binds.
+        to_a_label_row(&mut app);
+        app.apply(Action::EnterEditing).unwrap();
+        for field in [FreeForm::Name, FreeForm::Summary] {
+            app.clear_flash();
+            app.apply(Action::Edit(field)).unwrap();
+            assert!(app.surface().is_none(), "{field:?} opened on a label row");
+            assert_eq!(app.flash_message(), Some(NOT_AN_EDITING_ACTION));
+            assert!(!app
+                .editing_hints()
+                .contains(&hint_for(EditingAction::Edit(field))));
+        }
+        hints_and_keys_agree(&mut app);
+    }
+
+    #[test]
+    fn a_name_emptied_in_the_field_is_refused_as_required_and_a_summary_is_written() {
+        let (fx, mut app) = app();
+        let named = fx.epic_field(FreeForm::Name);
+
+        // A name is how every row addresses what it names, so a row with none is a
+        // row the reader cannot pick out: emptying one is refused, naming the field,
+        // and nothing reaches the store.
+        freeze_the_epics_row(&mut app);
+        app.apply(Action::Edit(FreeForm::Name)).unwrap();
+        empty_the_field(&mut app);
+        app.apply(Action::Accept).unwrap();
+        let Some(Modal::Dialog(dialog)) = app.modal() else {
+            panic!("an emptied name was written: {:?}", app.modal())
+        };
+        assert!(
+            dialog.message().contains(FreeForm::Name.noun()),
+            "{dialog:?}"
+        );
+        assert_eq!(fx.epic_field(FreeForm::Name), named, "the name was written");
+        app.apply(Action::Unwind).unwrap();
+        app.apply(Action::Unwind).unwrap();
+        app.apply(Action::Delete).unwrap(); // the field is dirty, so the way out asks
+        app.apply(Action::Unwind).unwrap();
+
+        // A summary is not the same case: an entity with no summary is a legitimate
+        // thing to mean, so emptying one is a write and not a missing field.
+        freeze_the_epics_row(&mut app);
+        app.apply(Action::Edit(FreeForm::Summary)).unwrap();
+        empty_the_field(&mut app);
+        app.apply(Action::Accept).unwrap();
+        assert_eq!(app.modal(), None, "an emptied summary was called required");
+        assert!(app.surface().is_none(), "the field outlived its own save");
+        assert_eq!(
+            fx.epic_field(FreeForm::Summary),
+            "",
+            "emptying the field wrote nothing"
+        );
+        assert_eq!(
+            fx.epic_field(FreeForm::Name),
+            named,
+            "the summary's save took the name with it"
+        );
+    }
+
+    #[test]
+    fn every_field_a_surface_replaces_is_written_under_the_stamp_it_was_read_at() {
+        let (fx, mut app) = app();
+        // Every replaceable field, because each opens on a read of its own and each
+        // has to name that read's stamp: a field whose write named none would
+        // silently overwrite whatever landed while the reader was typing.
+        for field in FreeForm::ALL.iter().copied() {
+            freeze_the_epics_row(&mut app);
+            app.apply(Action::Edit(field)).unwrap();
+            type_into(&mut app, "mine");
+            let typed = field_value(&app);
+
+            // Somebody else writes while the reader is composing theirs, which is
+            // the one window the store's own lock cannot cover. The stamp is the
+            // entity's rather than the field's, so any change to it refuses.
+            fx.rewrite_the_epics_body("theirs\n");
+            app.apply(Action::Accept).unwrap();
+            assert_eq!(
+                app.mode(),
+                Mode::Dialog(Answers::Conflict),
+                "{field:?} was written over a change that landed under it"
+            );
+
+            // The way out keeps the text and the session, whichever field it is:
+            // only a successful write ends one.
+            app.apply(Action::Unwind).unwrap();
+            assert_eq!(field_value(&app), typed, "{field:?}");
+            assert!(
+                app.editing_target().is_some(),
+                "{field:?} ended the session"
+            );
+            app.apply(Action::Unwind).unwrap();
+            app.apply(Action::Delete).unwrap(); // the field is dirty, so it asks
+            app.apply(Action::Unwind).unwrap();
+        }
     }
 
     #[test]
