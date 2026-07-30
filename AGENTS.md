@@ -2,14 +2,22 @@
 
 Conventions for agents (and humans) working in this repository.
 
-## Handbooks
+## Handbooks and prompts
 
-Work here is split between an implementer and an independent reviewer, and each
-has a handbook under `docs/handbooks/`. Read yours before you start:
-`implementing.md` covers shaping code so its boundaries are observable, which
-behaviour is pinned at which layer, and what to report; `reviewing.md` covers
-running mutations in a sandbox and judging whether the tests could ever have
-failed. The rules below bind regardless of which you are.
+Work here is split between an orchestrator, an implementer and an independent
+reviewer.
+
+The two working roles each have a handbook under `docs/handbooks/`. Read yours
+before you start: `implementing.md` covers shaping code so its boundaries are
+observable, which behaviour is pinned at which layer, and what to report;
+`reviewing.md` covers running mutations in a sandbox and judging whether the
+tests could ever have failed. The rules below bind regardless of which you are.
+
+`docs/prompts/` holds one prompt per role. An orchestrator is started on a loti
+reference with `orchestrator.md`, and spawns each subagent from `implementer.md`
+or `reviewer.md`, filling in the placeholders. A prompt points at the record and
+never restates it — a decision paraphrased from memory is how an agent ends up
+building the opposite of what was agreed.
 
 ## Comments & documentation
 
