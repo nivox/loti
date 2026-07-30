@@ -82,6 +82,12 @@ of what was agreed.
 Read `docs/prompts/reviewer.md`, fill it in, spawn one reviewer with **fresh
 context**, and pass the implementer's report verbatim.
 
+**Name the sandbox yourself, one name per ticket**, and give the same name to
+every round on that ticket. A reviewer has no memory to name itself after, so
+left to invent one it picks a fresh name each round and throws away the build
+cache the name exists to preserve — a cold build per round, and a
+multi-gigabyte directory left behind for each.
+
 ### 4. Repeat until the reviewer passes
 
 On `FAIL`, judge each must-fix yourself before delegating:
@@ -92,9 +98,26 @@ On `FAIL`, judge each must-fix yourself before delegating:
   still wrong.
 - **Send it back** to a fresh implementer when it needs design, or spans files.
 
-Either way a reviewer sees it again before the ticket is done. A re-review may
-be scoped to the remediation, saying plainly what was already accepted so it is
-not re-litigated.
+**You never run a mutation.** Run the gates — they say the tree is committable.
+Whether a test could have failed is a reviewer's finding, made in a sandbox that
+enforces one mutation at a time against a known baseline; you have no such
+sandbox and no such habits, and evidence you produce for your own change is
+evidence from the party that wants the ticket closed. Fixing by hand and
+checking it yourself is how a fix ships still broken.
+
+A remediation therefore ends one of two ways:
+
+- **Closed with no re-review** — but only when the reviewer supplied the fix *as
+  code*, proved it kills the named mutation in its own probe sandbox, and you
+  applied **exactly that and nothing else**. Quote its proof in the resolution.
+  If you retyped it, adapted it, chose where to put it, or changed anything else
+  in the same pass, this does not apply.
+- **Re-reviewed, scoped** — fill `<PRIOR_ROUNDS>` in the reviewer prompt: what
+  was already accepted, the previous round's mutation table, and the
+  remediation. Everything not on that table is judged by reading.
+
+Pick one. Doing both — self-checking *and* re-reviewing — pays twice and trusts
+the weaker of the two answers.
 
 If a must-fix needs a decision the record does not settle, **stop and put it to
 the human.** Do not guess, and do not let a subagent guess.
@@ -144,6 +167,12 @@ Then:
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test --workspace
     git add -u crates docs scripts && git commit
+    scripts/review-sandbox.sh discard <the sandbox name>
+
+The last one is not housekeeping. A reviewer's `clean` deliberately keeps the
+build directory so the next round starts warm, and by then there is no sandbox
+left to stand in to remove it — you are the only one who knows the rounds are
+over. Each is well over a gigabyte.
 
 One commit per ticket. The message states the **why** and the invariant, never
 the what, and never a ticket id or spec section — see `AGENTS.md`.

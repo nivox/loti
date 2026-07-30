@@ -21,9 +21,10 @@
 #     binary. Each sandbox gets its own, named after it.
 #
 # The build directory outlives `clean` on purpose: it is what makes the next
-# review under the same name cost seconds instead of a cold build. So name a
-# sandbox after yourself rather than after the ticket — the name exists to keep
-# concurrent reviewers apart, and a stable one keeps your cache warm.
+# review under the same name cost seconds instead of a cold build. The name is
+# therefore a cache key, and it is supplied from outside — one name per body of
+# work, reused by every review round on it. Inventing a fresh name per round
+# throws the cache away and leaves a multi-gigabyte build directory behind.
 #
 # Usage:
 #   scripts/review-sandbox.sh init <name> [--from-head]
@@ -31,11 +32,17 @@
 #       prove a survivor pre-dates the change under review). Refuses to clobber
 #       an existing sandbox: clean it first.
 #
-#   scripts/review-sandbox.sh check "<label>"        (from inside a sandbox)
+#   scripts/review-sandbox.sh check [--in <crate>] "<label>"   (in a sandbox)
 #       Test whatever you have edited. Prints the diff it is testing, runs the
 #       suite, says KILLED with every failing test named, SURVIVED, or
 #       DID-NOT-COMPILE, appends the result to mutations.log, and restores the
 #       baseline if the answer was conclusive.
+#
+#       --in <crate> runs only that crate's tests, which skips rebuilding every
+#       downstream test binary. A SURVIVED verdict is never concluded from it:
+#       the run escalates to the whole workspace before reporting one. A KILLED
+#       verdict from a narrow run names only that crate's killers, so it cannot
+#       found a redundancy claim; the log says which command answered.
 #
 #   scripts/review-sandbox.sh hold                   (from inside a sandbox)
 #       Adopt the current tree as the baseline, so `check` restores to it. Only
@@ -43,7 +50,16 @@
 #       the mutations it claimed to catch.
 #
 #   scripts/review-sandbox.sh clean [--cache]        (from inside a sandbox)
-#       Remove the sandbox. Keeps the build directory unless --cache is given.
+#       Remove the sandbox. Keeps the build directory unless --cache is given,
+#       so the next round under the same name starts warm.
+#
+#   scripts/review-sandbox.sh discard <name>         (from anywhere)
+#       Remove every sandbox and build directory under <name>, including the
+#       <name>-head twin. This is what finishes the job `clean` deliberately
+#       leaves open: the build directory outlives `clean` so the next round is
+#       warm, and by the time the work is done there is no sandbox left to
+#       stand in. Run it when the ticket closes — each build directory is well
+#       over a gigabyte.
 #
 # Exit codes: 0 killed, 10 survived, 20 did-not-compile, 30 nothing-mutated,
 # 40 sandbox unsound or misused.
@@ -108,7 +124,7 @@ diffstat() {
 
 cmd_init() {
     local name=${1:-} from_head=${2:-}
-    [[ -n $name ]] || die "init needs a name. Use your own, not the ticket's."
+    [[ -n $name ]] || die "init needs a name. Use the one you were given, so the build cache is reused."
     [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || die "a sandbox name may hold letters, digits, dot, dash and underscore."
 
     local repo sandbox target
@@ -156,8 +172,32 @@ sandbox ready: $sandbox
 EOF
 }
 
+# Classify one test run, setting verdict/status/killers for the caller.
+# Order matters: cargo prints "error: test failed" when a test fails, so a
+# search for "error" before a search for a failing test reports a kill as a
+# compilation failure.
+classify_run() {
+    local out=$1
+    if grep -qE '^test .* FAILED|test result: FAILED' <<<"$out"; then
+        verdict=KILLED; status=$EX_KILLED
+        killers=$(grep -E '^test .* \.\.\. FAILED' <<<"$out" | sed 's/^test //; s/ \.\.\. FAILED//' | sort -u)
+    elif grep -qE '^error(\[E[0-9]+\])?:|could not compile' <<<"$out"; then
+        verdict=DID-NOT-COMPILE; status=$EX_NOCOMPILE
+        killers=$(grep -E '^error' <<<"$out" | head -3)
+    else
+        verdict=SURVIVED; status=$EX_SURVIVED
+        killers=
+    fi
+}
+
 cmd_check() {
-    local label=${1:-}
+    local label= scope=
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --in) scope=${2:-}; [[ -n $scope ]] || die "--in needs a crate name."; shift 2 ;;
+            *)    label=$1; shift ;;
+        esac
+    done
     [[ -n $label ]] || die "check needs a label; it becomes the row in mutations.log."
 
     local sb target held baseline_note
@@ -180,29 +220,40 @@ cmd_check() {
     printf 'testing:  %s\n' "$label"
     diffstat "$sb" | sed 's/^/    /'
 
-    local out status verdict killers
-    out=$( cd "$sb" && CARGO_TARGET_DIR=$target $TEST_CMD 2>&1 )
-
-    # Order matters: cargo prints "error: test failed" when a test fails, so a
-    # search for "error" before a search for a failing test reports a kill as a
-    # compilation failure.
-    if grep -qE '^test .* FAILED|test result: FAILED' <<<"$out"; then
-        verdict=KILLED; status=$EX_KILLED
-        killers=$(grep -E '^test .* \.\.\. FAILED' <<<"$out" | sed 's/^test //; s/ \.\.\. FAILED//' | sort -u)
-    elif grep -qE '^error(\[E[0-9]+\])?:|could not compile' <<<"$out"; then
-        verdict=DID-NOT-COMPILE; status=$EX_NOCOMPILE
-        killers=$(grep -E '^error' <<<"$out" | head -3)
+    # Whether the killer list is one crate's rather than the whole suite's. An
+    # escalated run clears it: the canonical command named everything.
+    local out status verdict killers ran partial=0
+    if [[ -n $scope ]]; then
+        partial=1
+        ran="cargo test -p $scope --no-fail-fast"
+        out=$( cd "$sb" && CARGO_TARGET_DIR=$target cargo test -p "$scope" --no-fail-fast 2>&1 )
     else
-        verdict=SURVIVED; status=$EX_SURVIVED
-        killers=
+        ran=$TEST_CMD
+        out=$( cd "$sb" && CARGO_TARGET_DIR=$target $TEST_CMD 2>&1 )
+    fi
+    classify_run "$out"
+
+    # A narrow run can only ever report the killers it compiled. "Nothing caught
+    # it" is a claim about the whole suite, so it is never concluded from one
+    # crate: escalate and let the canonical command answer.
+    if [[ -n $scope && $verdict == SURVIVED ]]; then
+        printf '   nothing in %s caught it; escalating to the whole workspace\n' "$scope"
+        out=$( cd "$sb" && CARGO_TARGET_DIR=$target $TEST_CMD 2>&1 )
+        ran="$TEST_CMD (escalated from -p $scope)"
+        partial=0
+        classify_run "$out"
     fi
 
     printf '=> %s\n' "$verdict"
     [[ -n $killers ]] && sed 's/^/     /' <<<"$killers"
 
+    [[ $verdict == KILLED && $partial -eq 1 ]] && printf \
+        '   killers named within %s only; do not build a redundancy claim on this row\n' "$scope"
+
     {
         printf '[%s] %s  %s\n' "$(date -u +%H:%M:%S)" "$verdict" "$label"
         printf '     baseline: %s\n' "$baseline_note"
+        printf '     ran:      %s\n' "$ran"
         [[ -n $killers ]] && sed 's/^/     /' <<<"$killers"
         diffstat "$sb" | sed 's/^/     /'
     } >> "$sb/$MARKER/mutations.log"
@@ -266,10 +317,37 @@ cmd_clean() {
     fi
 }
 
+# Remove a name's sandboxes and build directories from outside any of them.
+# Addressed by name rather than by standing inside, because the thing most worth
+# removing — the build directory — is the one that outlives the sandbox.
+cmd_discard() {
+    local name=${1:-}
+    [[ -n $name ]] || die "discard needs the name the sandboxes were made under."
+    [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || die "a sandbox name may hold letters, digits, dot, dash and underscore."
+
+    # Standing inside what is about to be removed leaves the shell in a deleted
+    # directory, and every later command in the session fails obscurely.
+    cd /
+
+    local removed=0 path
+    for path in /tmp/loti-sandbox-"$name" /tmp/loti-sandbox-"$name"-*; do
+        [[ -e $path ]] || continue
+        # Only ever remove something this script made: a sandbox carries the
+        # marker directory, and a build directory is only ever named -target.
+        [[ -d $path/$MARKER || $path == *-target ]] || continue
+        rm -rf "$path"
+        printf 'removed %s\n' "$path"
+        removed=$((removed + 1))
+    done
+
+    (( removed > 0 )) || printf 'nothing to discard under %s\n' "$name"
+}
+
 case ${1:-} in
-    init)  shift; cmd_init "$@" ;;
-    check) shift; cmd_check "$@" ;;
-    hold)  shift; cmd_hold "$@" ;;
-    clean) shift; cmd_clean "$@" ;;
+    init)    shift; cmd_init "$@" ;;
+    check)   shift; cmd_check "$@" ;;
+    hold)    shift; cmd_hold "$@" ;;
+    clean)   shift; cmd_clean "$@" ;;
+    discard) shift; cmd_discard "$@" ;;
     *)     sed -n '/^# Usage:/,/^# 40 sandbox/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit $EX_UNSOUND ;;
 esac
