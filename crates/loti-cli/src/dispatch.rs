@@ -521,8 +521,10 @@ fn target_of(kind: Kind, reference: &str) -> Result<Target> {
 
 /// Resolve a `blocked-by` blocker token entered on the CLI to a canonical
 /// [`NodeRef`]. A bare number (`<n>`) resolves against the target node's own
-/// epic; a full `<epic-id>/<n>` is parsed as-is. This human-friendly shorthand
-/// exists only at the CLI edge — storage always keeps the canonical form.
+/// epic; a full `<epic-id>/<n>` is parsed as-is. This human-friendly shorthand is
+/// an input convention of the surfaces a reader types into — the CLI and the
+/// browser both offer it — and never reaches storage, which always keeps the
+/// canonical form.
 fn resolve_blocker(epic_id: &str, token: &str) -> Result<NodeRef> {
     let token = token.trim();
     if let Ok(number) = token.parse::<u64>() {

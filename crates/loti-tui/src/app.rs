@@ -12,7 +12,7 @@ use loti_core::store::Store;
 use ratatui_markdown::viewer::MarkdownViewer;
 
 use crate::action::{Action, AnswerWords, Answers, EditingAction, Fields, Mode};
-use crate::data::{self, Collection, Level, Selection};
+use crate::data::{self, Collection, Container, Level, Selection};
 use crate::keymap;
 use crate::nav::Nav;
 use crate::theme::Theme;
@@ -54,6 +54,10 @@ const EDITOR_TITLE: &str = " the editor could not run ";
 /// What a label field is called wherever it has to be named: on the surface that
 /// fills it in, and in the warning that says it is empty.
 const LABEL_FIELD: &str = "label";
+/// See [`LABEL_FIELD`]. A blocker is named by a reference rather than written
+/// out, so the field says so: what the reader types is a token the store
+/// resolves, not prose.
+const BLOCKER_FIELD: &str = "blocker reference";
 
 /// A transient one-line notice, holding the hint strip's line until its deadline
 /// passes.
@@ -439,6 +443,10 @@ pub struct Surface {
 enum Commit {
     /// Put the label the field holds on the set the frozen row names.
     AddLabel(Selection),
+    /// Put the node the field's reference names on the dependency list the frozen
+    /// row names. The browser judges nothing about the reference: what it names,
+    /// and whether that may block this, come back from the store.
+    AddBlocker(Selection),
 }
 
 impl Surface {
@@ -451,6 +459,18 @@ impl Surface {
             fields: vec![Field::new(LABEL_FIELD, true)],
             focus: 0,
             commit: Commit::AddLabel(set),
+        }
+    }
+
+    /// The surface that adds one blocker: one short field holding a reference, so
+    /// it is a float for the same reason the label surface is — there is no
+    /// long-form text here for the pane to hold.
+    fn add_blocker(list: Selection, container: String) -> Self {
+        Self {
+            title: format!(" new blocker on {container} "),
+            fields: vec![Field::new(BLOCKER_FIELD, true)],
+            focus: 0,
+            commit: Commit::AddBlocker(list),
         }
     }
 
@@ -526,6 +546,16 @@ impl Surface {
                     // The notice names the label, because by the time it is read
                     // the surface that held it is gone.
                     format!("label {label} added"),
+                )
+            }
+            Commit::AddBlocker(list) => {
+                let reference = self.fields[0].value.clone();
+                (
+                    data::Write::AddBlocker(list.clone(), reference.clone()),
+                    // The notice names the blocker as the store records it, which a
+                    // bare number is not: by the time it is read the surface that
+                    // held the reference is gone.
+                    format!("blocker {} added", data::blocker_name(list, &reference)),
                 )
             }
         }
@@ -712,6 +742,15 @@ impl App {
                 Selection::Collection(container, Collection::Labels) => Some(Offer::Fill(
                     Surface::add_label(target.clone(), container.selection().reference()),
                 )),
+                // A dependency list belongs to a node: an epic is not a unit of
+                // work that can be blocked, so it carries no such list and is
+                // never offered one.
+                Selection::Collection(container @ Container::Node(_), Collection::BlockedBy) => {
+                    Some(Offer::Fill(Surface::add_blocker(
+                        target.clone(),
+                        container.selection().reference(),
+                    )))
+                }
                 _ => None,
             },
             EditingAction::Delete => match target {
@@ -725,6 +764,21 @@ impl App {
                     },
                     "cancel",
                 ))),
+                // A dependency list has no rename either, so an entry is only ever
+                // removed. The row names both nodes, so removing one asks for no
+                // reference: the entry that goes is the entry under the bar.
+                Selection::Blocker(..) => {
+                    let blocker = target.reference();
+                    Some(Offer::Ask(Dialog::confirm(
+                        format!("Remove blocker {blocker}?"),
+                        "remove",
+                        Performs::Write {
+                            write: data::Write::RemoveBlocker(target.clone()),
+                            done: format!("blocker {blocker} removed"),
+                        },
+                        "cancel",
+                    )))
+                }
                 _ => None,
             },
         }
@@ -1300,6 +1354,44 @@ mod tests {
     fn to_a_label_row(app: &mut App) {
         to_the_labels_row(app);
         app.apply(Action::Descend).unwrap();
+    }
+
+    /// Stand on the ticket's own `blocked-by` row, which is where an addition is
+    /// offered. A dependency list belongs to a node — an epic is not a unit of work
+    /// that can be blocked — so it is a level deeper than the epic's collections.
+    fn to_the_blocked_by_row(app: &mut App) {
+        to_the_roster(app);
+        app.apply(Action::Descend).unwrap(); // into the epic
+        to_work_row(app);
+        app.apply(Action::Descend).unwrap(); // into the ticket
+        to_row(
+            app,
+            |kind| matches!(kind, RowKind::Collection(c) if c.name() == "blocked-by"),
+        );
+    }
+
+    /// Stand on the first entry of that list, which is where a removal is offered.
+    fn to_a_blocker_row(app: &mut App) {
+        to_the_blocked_by_row(app);
+        app.apply(Action::Descend).unwrap();
+    }
+
+    /// Open the blocker surface, the way a reader does: freeze the dependency
+    /// list's row and press the letter that adds a member to it.
+    fn open_the_blocker_surface(app: &mut App) {
+        to_the_blocked_by_row(app);
+        app.apply(Action::EnterEditing).unwrap();
+        app.apply(Action::Add).unwrap();
+        assert!(app.surface().is_some(), "the add key opened no surface");
+    }
+
+    /// Add one blocker the way a reader does, by typing a reference into the
+    /// surface the dependency list's row opens.
+    fn add_a_blocker(app: &mut App, reference: &str) {
+        open_the_blocker_surface(app);
+        type_into(app, reference);
+        app.apply(Action::Accept).unwrap();
+        assert_eq!(app.modal(), None, "the store refused {reference:?}");
     }
 
     /// Open the label surface, the way a reader does: freeze the label set's row
@@ -2100,15 +2192,9 @@ mod tests {
         app.apply(Action::Unwind).unwrap();
         app.apply(Action::Ascend).unwrap();
 
-        for other in ["comments", "blocked-by", "assets"] {
+        for other in ["comments", "assets"] {
             to_the_roster(&mut app);
             app.apply(Action::Descend).unwrap(); // into the epic
-                                                 // `blocked-by` is a node's collection only, so it is reached one level
-                                                 // further in; the epic's own level carries the other two.
-            if other == "blocked-by" {
-                to_work_row(&mut app);
-                app.apply(Action::Descend).unwrap();
-            }
             to_row(
                 &mut app,
                 |kind| matches!(kind, RowKind::Collection(c) if c.name() == other),
@@ -2123,6 +2209,14 @@ mod tests {
             assert!(app.editing_hints().is_empty(), "{other}");
             app.apply(Action::Unwind).unwrap();
         }
+
+        // A dependency list does offer an addition, and it is not this one: each
+        // collection's member is its own shape of input, so the surface a row opens
+        // is the surface that writes what that row holds.
+        open_the_blocker_surface(&mut app);
+        let surface = app.surface().expect("the surface is open");
+        assert_eq!(surface.fields()[0].label(), BLOCKER_FIELD);
+        assert!(!surface.title().contains("label"), "{:?}", surface.title());
     }
 
     #[test]
@@ -2718,6 +2812,271 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_add_key_opens_one_short_reference_field_on_a_dependency_list_only() {
+        let (fx, mut app) = app();
+        let before = fx.node_blockers();
+        to_the_blocked_by_row(&mut app);
+        app.apply(Action::EnterEditing).unwrap();
+        // The row offers the addition, and the strip lists exactly what it offers.
+        assert_eq!(app.editing_hints(), vec![hint_for(EditingAction::Add)]);
+        hints_and_keys_agree(&mut app);
+
+        app.apply(Action::Add).unwrap();
+        let surface = app.surface().expect("the letter opened a surface");
+        // One short field, empty and untouched: a blocker is named by a reference,
+        // and nothing the browser put there itself could be one the reader meant.
+        assert_eq!(surface.fields().len(), 1);
+        assert_eq!(surface.focus(), 0);
+        let field = &surface.fields()[0];
+        assert_eq!(field.value(), "");
+        assert!(!field.is_dirty());
+        // The float says what is being added and to what, since it covers the row
+        // it was opened from.
+        let (_, node) = fx.node_reference_forms();
+        assert!(surface.title().contains(&node), "{:?}", surface.title());
+        assert_eq!(app.mode(), Mode::Surface(Fields::One));
+
+        // There is nothing to send without a reference, so an accepted empty field
+        // warns naming it and writes nothing — which is the browser refusing to send
+        // an empty field, not a store rule about references reimplemented.
+        app.apply(Action::Accept).unwrap();
+        let Some(Modal::Dialog(dialog)) = app.modal() else {
+            panic!(
+                "an empty reference wrote or said nothing: {:?}",
+                app.modal()
+            )
+        };
+        assert!(dialog.message().contains(BLOCKER_FIELD), "{dialog:?}");
+        assert_eq!(fx.node_blockers(), before, "the warning wrote something");
+        app.apply(Action::Unwind).unwrap();
+        app.apply(Action::Unwind).unwrap();
+        app.apply(Action::Unwind).unwrap();
+
+        // An epic is not a unit of work that can be blocked, so its level carries no
+        // dependency list at all: there is no row an addition could be offered on.
+        to_the_roster(&mut app);
+        app.apply(Action::Descend).unwrap(); // into the epic
+        assert!(
+            app.nav().rows().iter().all(|row| !matches!(
+                &row.kind,
+                RowKind::Collection(c) if c.name() == "blocked-by"
+            )),
+            "an epic was offered a dependency list: {:?}",
+            app.nav().rows()
+        );
+    }
+
+    #[test]
+    fn an_epics_dependency_list_is_offered_nothing_even_when_a_row_names_one() {
+        let (fx, mut app) = app();
+        // An epic is not a unit of work that can be blocked, so no row of the
+        // browser points at a dependency list of one. The offer says so itself
+        // rather than trusting that: what a row may be given is decided from what
+        // the row names, so a level that grew a row it should not have would still
+        // be offered nothing to write with it.
+        app.editing = Some(Selection::Collection(
+            Container::Epic(fx.epic.clone()),
+            Collection::BlockedBy,
+        ));
+        assert!(app.editing_hints().is_empty());
+        app.apply(Action::Add).unwrap();
+        assert!(app.surface().is_none(), "an epic was offered a blocker");
+        assert_eq!(app.flash_message(), Some(NOT_AN_EDITING_ACTION));
+    }
+
+    #[test]
+    fn a_blocker_row_offers_a_removal_and_cannot_be_followed_to_the_node_it_names() {
+        let (_fx, mut app) = app();
+        to_a_blocker_row(&mut app);
+        let level = app.nav().crumbs().join("/");
+
+        // A collection member is a leaf, a blocker included: what blocks you is read
+        // where it stands, and there is no navigation from the entry to the node it
+        // names — so the key that opens a level says why nothing happened instead.
+        assert!(!app.nav().frame().current().unwrap().enterable());
+        app.apply(Action::Descend).unwrap();
+        assert_eq!(app.nav().crumbs().join("/"), level);
+        assert!(app.flash_message().is_some(), "nothing said why");
+        app.clear_flash();
+
+        // A dependency list has no rename, so an entry is only ever removed, and the
+        // strip lists exactly that.
+        app.apply(Action::EnterEditing).unwrap();
+        assert_eq!(app.editing_hints(), vec![hint_for(EditingAction::Delete)]);
+        hints_and_keys_agree(&mut app);
+    }
+
+    #[test]
+    fn a_blocker_is_added_in_either_form_and_the_notice_names_what_was_recorded() {
+        let (fx, mut app) = app();
+        let before = fx.node_blockers();
+        let (bare, whole) = fx.another_node();
+
+        // A bare number names a node of the dependency list's own epic, which is the
+        // shorthand every reference is written in, and the store records the whole
+        // reference whichever way it was typed.
+        add_a_blocker(&mut app, &bare);
+        let mut expected = before.clone();
+        expected.push(whole.clone());
+        assert_eq!(fx.node_blockers(), expected);
+        // A successful write ends the session, surface and all, and says what it did
+        // — naming the blocker as the store holds it, so a notice about a bare number
+        // does not read as a ticket belonging to no epic.
+        assert!(app.surface().is_none());
+        assert_eq!(app.editing_target(), None);
+        assert_eq!(app.mode(), Mode::Browse);
+        let notice = app.flash_message().expect("every write says what it did");
+        assert!(notice.contains(&whole), "{notice:?}");
+        // The store was re-read: the list under the row the reader stands on now
+        // holds one more entry than it did.
+        let row = app.nav().frame().current().expect("a highlighted row");
+        assert_eq!(row.children, expected.len());
+
+        // And a whole reference is the other form a reader writes one in — the form
+        // that reaches another epic, which is the only thing distinguishing it from
+        // the shorthand, and unprovable against a node of this epic.
+        let (_, elsewhere) = fx.a_node_of_another_epic();
+        add_a_blocker(&mut app, &elsewhere);
+        expected.push(elsewhere.clone());
+        assert_eq!(fx.node_blockers(), expected);
+        let notice = app.flash_message().expect("every write says what it did");
+        assert!(notice.contains(&elsewhere), "{notice:?}");
+    }
+
+    #[test]
+    fn a_reference_the_store_will_not_take_is_refused_in_the_stores_own_words() {
+        let (fx, mut app) = app();
+        let before = fx.node_blockers();
+        let refusal_for = |reference: &str| {
+            data::perform(
+                &fx.store,
+                &data::Write::AddBlocker(fx.blocked_by_selection(), reference.to_string()),
+            )
+            .expect_err("the store judges what may block what")
+            .to_string()
+        };
+
+        // The browser judges nothing about the reference: a blocker that does not
+        // exist is the store's judgement, so the action is offered, attempted, and
+        // what comes back is shown verbatim — compared against the message the seam
+        // itself produces, never a string spelled out here, which is what a browser
+        // precondition or a reworded refusal would pass.
+        open_the_blocker_surface(&mut app);
+        type_into(&mut app, "999");
+        app.apply(Action::Accept).unwrap();
+        assert_eq!(
+            app.modal(),
+            Some(&Modal::Dialog(Box::new(Dialog::refusal(refusal_for(
+                "999"
+            )))))
+        );
+        assert_eq!(app.mode(), Mode::Dialog(Answers::Acknowledge));
+        assert_eq!(app.flash_message(), None, "a failure is never a notice");
+        assert_eq!(fx.node_blockers(), before, "a refusal wrote something");
+
+        // A refused save keeps the buffer and the session: only a successful write
+        // ends it, so the reference is still there to be corrected.
+        app.apply(Action::Unwind).unwrap();
+        assert_eq!(field_value(&app), "999");
+        assert_eq!(app.mode(), Mode::Surface(Fields::One));
+        assert!(app.editing_target().is_some());
+
+        // A node blocking itself is the store's judgement in the same way — the
+        // browser knows which node the list belongs to and still does not pre-check
+        // it, so the rule lives in one place.
+        for _ in 0.."999".len() {
+            app.apply(Action::DeleteBefore).unwrap();
+        }
+        let (own_number, _) = fx.node_reference_forms();
+        type_into(&mut app, &own_number);
+        app.apply(Action::Accept).unwrap();
+        assert_eq!(
+            app.modal(),
+            Some(&Modal::Dialog(Box::new(Dialog::refusal(refusal_for(
+                &own_number
+            )))))
+        );
+        assert_eq!(fx.node_blockers(), before, "a self-block was written");
+    }
+
+    #[test]
+    fn a_blocker_removal_asks_naming_the_entry_and_a_cancel_changes_nothing() {
+        let (fx, mut app) = app();
+        to_a_blocker_row(&mut app);
+        let blocker = row_label(&app);
+        app.apply(Action::EnterEditing).unwrap();
+
+        app.apply(Action::Delete).unwrap();
+        // The question names the entry: the frozen row is dimmed and the entries of
+        // a list read alike, so an unnamed question would not say which one goes.
+        let Some(Modal::Dialog(dialog)) = app.modal() else {
+            panic!(
+                "a deletion is gated behind a confirmation: {:?}",
+                app.modal()
+            )
+        };
+        assert!(dialog.message().contains(&blocker), "{dialog:?}");
+        assert_eq!(dialog.answers(), Answers::Destructive);
+        assert!(
+            fx.node_blockers().contains(&blocker),
+            "asking wrote something"
+        );
+
+        // The answer that is never destructive, here as everywhere else — and it
+        // unwinds one layer: the question goes and the mode stays on its row.
+        app.apply(Action::Unwind).unwrap();
+        assert_eq!(app.modal(), None);
+        assert!(
+            fx.node_blockers().contains(&blocker),
+            "a cancel wrote something"
+        );
+        assert_eq!(app.mode(), Mode::Editing);
+        assert_eq!(row_label(&app), blocker);
+        assert_eq!(app.flash_message(), None, "nothing happened worth saying");
+    }
+
+    #[test]
+    fn a_confirmed_removal_takes_the_entry_the_row_names_and_no_other() {
+        let (fx, mut app) = app();
+        // Two entries, so the entry the row names is a claim rather than a
+        // coincidence: with one, a removal that emptied the whole list would pass.
+        let (bare, added) = fx.another_node();
+        add_a_blocker(&mut app, &bare);
+        let before = fx.node_blockers();
+        assert!(before.len() > 1, "the promise needs more than one entry");
+
+        to_a_blocker_row(&mut app);
+        // The last entry rather than the first: an entry that is only ever at the
+        // top could not tell the one the row names from the one the list leads with.
+        app.apply(Action::CursorLast).unwrap();
+        let blocker = row_label(&app);
+        assert_eq!(blocker, added, "the cursor is not on the entry just added");
+        app.apply(Action::EnterEditing).unwrap();
+
+        // The letter that asks is the letter that answers: one key for everything
+        // destructive, learned once.
+        app.apply(Action::Delete).unwrap();
+        app.apply(Action::Delete).unwrap();
+
+        assert_eq!(app.modal(), None);
+        let survivors: Vec<String> = before.into_iter().filter(|b| *b != blocker).collect();
+        assert_eq!(fx.node_blockers(), survivors);
+        assert!(
+            !survivors.is_empty(),
+            "an entry the row did not name went too"
+        );
+        // A successful write ends the session and says what it did, naming the
+        // blocker, because by the time the notice is read its row is gone.
+        assert_eq!(app.editing_target(), None);
+        assert_eq!(app.mode(), Mode::Browse);
+        let notice = app.flash_message().expect("every write says what it did");
+        assert!(notice.contains(&blocker), "{notice:?}");
+        // The store is re-read with it: an entry that no longer exists must not stay
+        // on screen for the next keypress to act on.
+        assert!(app.nav().rows().iter().all(|r| r.label != blocker));
     }
 
     #[test]

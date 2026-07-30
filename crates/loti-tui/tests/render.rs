@@ -702,6 +702,25 @@ fn open_the_label_surface(app: &mut App, text: &str) {
     }
 }
 
+/// Stand on a ticket's own `blocked-by` row, which is where a blocker is added.
+/// A dependency list belongs to a node — an epic is not a unit of work that can
+/// be blocked — so it is a level deeper than the epic's own collections.
+fn to_the_blocked_by_row(app: &mut App) {
+    app.apply(Action::Descend).unwrap(); // into the epic
+    to_work_row(app);
+    app.apply(Action::Descend).unwrap(); // into the ticket
+    let index = app
+        .nav()
+        .rows()
+        .iter()
+        .position(|r| r.name == "blocked-by")
+        .expect("a node's level carries its dependency list");
+    app.apply(Action::CursorFirst).unwrap();
+    for _ in 0..index {
+        app.apply(Action::CursorDown).unwrap();
+    }
+}
+
 /// The answers the open dialog lists, as the float shows them.
 fn listed_answers(app: &App) -> Vec<String> {
     let Some(Modal::Dialog(dialog)) = app.modal() else {
@@ -1233,6 +1252,128 @@ fn an_empty_required_field_warns_naming_it_and_the_buffer_survives_the_warning()
     app.apply(Action::Unwind).unwrap();
     let (again, _) = draw(&mut app);
     assert_eq!(cells(&again), buffer);
+}
+
+#[test]
+fn a_blocker_surface_takes_a_reference_and_the_notice_names_what_the_store_recorded() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    to_the_blocked_by_row(&mut app);
+    app.apply(Action::EnterEditing).unwrap();
+    let (before, _) = draw(&mut app);
+    app.apply(Action::Add).unwrap();
+    // A bare number is one of the two forms a reference is written in, and it names
+    // a node of the dependency list's own epic.
+    app.apply(Action::Insert('3')).unwrap();
+    let (after, _) = draw(&mut app);
+
+    let (before, after) = (cells(&before), cells(&after));
+    // Bounded to everything above the hint strip: the strip legitimately changes,
+    // because the keys that apply are now the surface's own.
+    let body = ..after.len() - 1;
+    let float = box_lines(&after, changed_box(&before[body], &after[body]));
+    // The float says what is being added and to what, and carries the field and
+    // the reference typed into it.
+    assert!(float[0].contains("new blocker on browser/1"), "{float:#?}");
+    assert!(float[1].contains("blocker reference"), "{float:#?}");
+    assert!(float[1].contains('3'), "{float:#?}");
+
+    app.apply(Action::Accept).unwrap();
+    let (_t, lines) = draw(&mut app);
+    // The mode indicator going, the float going and the notice arriving are one
+    // frame — and the notice names the blocker as the store recorded it, which a
+    // bare number is not.
+    assert!(!lines[0].contains("EDITING"), "{:?}", lines[0]);
+    assert!(
+        !lines.iter().any(|l| l.contains("new blocker on")),
+        "the float outlived the write: {lines:#?}"
+    );
+    assert!(
+        lines[23].contains("blocker browser/3 added"),
+        "{:?}",
+        lines[23]
+    );
+    assert_eq!(
+        ops::list_blocked_by(&store, &NodeRef::new("browser", 1)).unwrap(),
+        vec!["browser/3".to_string()]
+    );
+
+    // The store was re-read: the list the reader is standing on now counts an
+    // entry, and entering it shows the blocker itself.
+    let row = lines
+        .iter()
+        .find(|l| l.contains("blocked-by"))
+        .expect("the dependency list's row");
+    assert!(row.contains("(1)"), "{row:?}");
+    app.apply(Action::Descend).unwrap();
+    let (_t, members) = draw(&mut app);
+    assert!(
+        members.iter().any(|l| l.contains("browser/3")),
+        "the blocker is not in the level it was added to: {members:#?}"
+    );
+}
+
+#[test]
+fn a_blocker_removal_asks_naming_it_and_the_notice_names_it_once_it_is_gone() {
+    let (_dir, store) = fixture();
+    // A blocker to stand on, added before the level is read: a dependency list with
+    // no entries has no row to remove.
+    ops::add_blocked_by(
+        &store,
+        &NodeRef::new("browser", 1),
+        &[NodeRef::new("browser", 3)],
+    )
+    .unwrap();
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    to_the_blocked_by_row(&mut app);
+    app.apply(Action::Descend).unwrap(); // onto the blocker itself
+    app.apply(Action::EnterEditing).unwrap();
+    let (before, on_a_blocker) = draw(&mut app);
+    // A dependency list has no rename, so an entry is only ever removed, and the
+    // strip says so on the row that offers it.
+    assert!(
+        on_a_blocker[23].contains("d remove"),
+        "{:?}",
+        on_a_blocker[23]
+    );
+
+    app.apply(Action::Delete).unwrap();
+    let (after, _) = draw(&mut app);
+    let (before, after) = (cells(&before), cells(&after));
+    let float = box_lines(&after, changed_box(&before, &after));
+    // The question names the entry, because the frozen row is dimmed and the
+    // entries of a list read alike.
+    assert!(
+        float
+            .iter()
+            .any(|l| l.contains("Remove blocker browser/3?")),
+        "{float:#?}"
+    );
+    for answer in listed_answers(&app) {
+        assert!(
+            float.iter().any(|l| l.contains(&answer)),
+            "{answer:?} is not listed: {float:#?}"
+        );
+    }
+
+    app.apply(Action::Delete).unwrap();
+    let (_t, lines) = draw(&mut app);
+    assert!(!lines[0].contains("EDITING"), "{:?}", lines[0]);
+    assert!(
+        lines[23].contains("blocker browser/3 removed"),
+        "{:?}",
+        lines[23]
+    );
+    assert!(ops::list_blocked_by(&store, &NodeRef::new("browser", 1))
+        .unwrap()
+        .is_empty());
+    // The store was re-read: the list is empty, so it is no longer a level and the
+    // browser lands on the level above.
+    assert_eq!(lines[0].trim(), "epics › browser › 1 Navigation pane");
+    assert!(
+        !lines.iter().skip(1).any(|l| l.contains("Remove blocker")),
+        "the float outlived the write: {lines:#?}"
+    );
 }
 
 #[test]

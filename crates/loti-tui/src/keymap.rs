@@ -211,8 +211,8 @@ pub const HELP: &[(&str, &str)] = &[
     ("< / > / =", "narrow / widen / reset the panes"),
     ("z", "preview fills the width; mouse released"),
     ("e", "editing mode, on the highlighted row"),
-    ("a", "editing mode: add a label, in a dialog"),
-    ("d", "editing mode: remove the label, with a confirmation"),
+    ("a", "editing mode: add a label or a blocker, in a dialog"),
+    ("d", "editing mode: remove the label or blocker, confirmed"),
     (
         "Ctrl-S / Enter",
         "save the open surface; Enter if it has one field",

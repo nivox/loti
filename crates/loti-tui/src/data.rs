@@ -581,6 +581,12 @@ pub enum Write {
     AddLabel(Selection, String),
     /// Take one label off the container it sits on.
     RemoveLabel(Selection),
+    /// Put one blocker on the dependency list the row names, from the reference
+    /// the reader typed. Whether that reference names a node at all, and whether
+    /// that node may block this one, are the store's to judge.
+    AddBlocker(Selection, String),
+    /// Take one entry off the dependency list it sits on.
+    RemoveBlocker(Selection),
 }
 
 /// Carry out a write, returning the store's own refusal when it refuses.
@@ -592,6 +598,8 @@ pub fn perform(store: &Store, write: &Write) -> Result<()> {
     match write {
         Write::AddLabel(selection, label) => add_label(store, selection, label),
         Write::RemoveLabel(selection) => remove_label(store, selection),
+        Write::AddBlocker(selection, reference) => add_blocker(store, selection, reference),
+        Write::RemoveBlocker(selection) => remove_blocker(store, selection),
     }
 }
 
@@ -638,6 +646,84 @@ fn remove_label(store: &Store, selection: &Selection) -> Result<()> {
     ops::remove_labels(store, &container.target(), std::slice::from_ref(label))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
+}
+
+/// Put one blocker on a node's dependency list, from the reference as the reader
+/// typed it.
+///
+/// Nothing about the reference is judged here beyond which node it names: a
+/// blocker that does not exist, and a node blocking itself, are refused by the
+/// store in the store's own words, so each of those rules lives in exactly one
+/// place and the browser cannot go stale when one of them gains a nuance.
+///
+/// No stamp guards this write, for the same reason a label addition carries none:
+/// a stamp is the precondition of a free-form replacement, and adding one entry
+/// to a list cannot silently discard text someone else wrote.
+fn add_blocker(store: &Store, selection: &Selection, reference: &str) -> Result<()> {
+    let (node, blocker) = blocked_and_blocking(selection, reference)?;
+    ops::add_blocked_by(store, &node, std::slice::from_ref(&blocker))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
+
+/// Take one entry off the dependency list it sits on.
+///
+/// A dependency list has no rename either, so an entry is only ever removed. No
+/// reference is typed to remove one: the row carries both the node that is
+/// blocked and the node blocking it, so there is nothing here to re-derive and no
+/// second chance to name the wrong entry.
+fn remove_blocker(store: &Store, selection: &Selection) -> Result<()> {
+    // Only a blocker row offers removal, so any other selection is a caller that
+    // has lost track of what its row points at.
+    let Selection::Blocker(Container::Node(node), blocker) = selection else {
+        anyhow::bail!("{} is not a node's blocker", selection.reference())
+    };
+    ops::remove_blocked_by(store, node, std::slice::from_ref(blocker))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
+
+/// The node whose dependency list is being written, and the node a typed
+/// reference names.
+///
+/// An epic is not a unit of work that can be blocked, so it carries no dependency
+/// list and is never offered one: any selection that is not a node's dependency
+/// list is a caller that has lost track of what its row points at.
+fn blocked_and_blocking(selection: &Selection, reference: &str) -> Result<(NodeRef, NodeRef)> {
+    let Selection::Collection(Container::Node(node), Collection::BlockedBy) = selection else {
+        anyhow::bail!("{} is not a dependency list", selection.reference())
+    };
+    Ok((node.clone(), resolve_blocker(&node.epic_id, reference)?))
+}
+
+/// The node a typed blocker reference names: a bare number is a node of the
+/// blocked node's own epic, and anything else is a whole `<epic-id>/<number>`,
+/// which reaches any epic.
+///
+/// Both forms are accepted because both are how a reader writes a reference, and
+/// surrounding blanks are dropped because a reference is a token rather than
+/// text. Whether the node it names exists is not asked here — a refusal comes
+/// back from the store, in the store's words, and so does the refusal of a
+/// reference that is no reference at all.
+fn resolve_blocker(epic_id: &str, reference: &str) -> Result<NodeRef> {
+    let reference = reference.trim();
+    if let Ok(number) = reference.parse::<u64>() {
+        return Ok(NodeRef::new(epic_id, number));
+    }
+    NodeRef::parse(reference).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// How a blocker written from a typed reference is named to the reader: the
+/// canonical reference the store records it under, so a notice about a bare
+/// number does not read as a ticket belonging to no epic.
+///
+/// A reference that names no node is named back as it was typed: that write is
+/// refused, so nothing is written and no notice about it is ever read.
+pub fn blocker_name(selection: &Selection, reference: &str) -> String {
+    match blocked_and_blocking(selection, reference) {
+        Ok((_, blocker)) => blocker.to_string(),
+        Err(_) => reference.trim().to_string(),
+    }
 }
 
 /// The preview body for a selection.
@@ -854,6 +940,61 @@ pub(crate) mod fixture {
             ops::list_labels(&self.store, &Target::Epic(self.epic.clone())).unwrap()
         }
 
+        /// The ticket's dependency list as a selection: the row an addition acts
+        /// on, since creation acts on the container row the cursor stands on.
+        pub(crate) fn blocked_by_selection(&self) -> Selection {
+            Selection::Collection(Container::Node(self.node.clone()), Collection::BlockedBy)
+        }
+
+        /// The dependency list as the store holds it, in canonical references. A
+        /// test asserts against these rather than against a fixture constant, so a
+        /// richer fixture cannot turn a removal test into a false promise.
+        pub(crate) fn node_blockers(&self) -> Vec<String> {
+            ops::list_blocked_by(&self.store, &self.node).unwrap()
+        }
+
+        /// The ticket under test in the two forms a reader may type its reference
+        /// in; see [`reference_forms`]. It is the one reference no dependency list
+        /// of its own may hold, and only the store may say so.
+        pub(crate) fn node_reference_forms(&self) -> (String, String) {
+            reference_forms(&self.node)
+        }
+
+        /// A further ticket of the fixture's epic, created on demand, in the two
+        /// forms a reader may type its reference in; see [`reference_forms`].
+        ///
+        /// On demand rather than in the shared fixture: a test that adds a blocker
+        /// needs a node the list does not hold yet, and proving a removal took the
+        /// entry it named takes two entries, so the count is the test's business
+        /// rather than every other test's.
+        pub(crate) fn another_node(&self) -> (String, String) {
+            reference_forms(&new_node(&self.store, &self.epic, None, "Another", ""))
+        }
+
+        /// A ticket of a *second* epic, created on demand, in the two forms a reader
+        /// may type its reference in; see [`reference_forms`].
+        ///
+        /// This is what makes a whole reference's guarantee testable at all: with
+        /// every node in one epic, a resolver that quietly rewrote the epic to the
+        /// blocked node's own would land on the right node anyway.
+        pub(crate) fn a_node_of_another_epic(&self) -> (String, String) {
+            let epic = "elsewhere".to_string();
+            if ops::read_epic(&self.store, &epic).is_err() {
+                ops::create_epic(
+                    &self.store,
+                    NewEpic {
+                        epic_id: epic.clone(),
+                        name: "Another effort".into(),
+                        summary: "Somewhere else".into(),
+                        body: String::new(),
+                        labels: vec![],
+                    },
+                )
+                .unwrap();
+            }
+            reference_forms(&new_node(&self.store, &epic, None, "Far", ""))
+        }
+
         /// Take the epic's own file away, as a concurrent writer that closed the
         /// whole effort out would.
         ///
@@ -885,6 +1026,14 @@ pub(crate) mod fixture {
         loti_core::store::init(dir.path(), &root).unwrap();
         let store = Store::at(&root);
         (dir, store)
+    }
+
+    /// A reference as `(bare number, whole reference)` — the two forms a reader
+    /// may write one in, which no test outside this module may spell for itself:
+    /// a bare number names a node of the epic in hand and a whole reference names
+    /// a node of any epic.
+    fn reference_forms(r: &NodeRef) -> (String, String) {
+        (r.number.to_string(), r.to_string())
     }
 
     fn new_node(
@@ -1517,6 +1666,166 @@ mod tests {
             assert!(err.contains(&fx.epic), "{wrong:?}: {err}");
             assert_eq!(fx.epic_labels(), expected, "{wrong:?} wrote something");
         }
+    }
+
+    #[test]
+    fn a_blocker_is_added_by_a_bare_number_or_by_a_whole_reference() {
+        let fx = Fixture::build();
+        let before = fx.node_blockers();
+        let list = fx.blocked_by_selection();
+        let (bare, whole) = fx.another_node();
+
+        // A bare number names a node of the blocked node's own epic, which is the
+        // one thing about the text the browser resolves — and the store records the
+        // canonical form whichever way it was written.
+        perform(&fx.store, &Write::AddBlocker(list.clone(), bare)).unwrap();
+        let mut expected = before.clone();
+        expected.push(whole.clone());
+        assert_eq!(fx.node_blockers(), expected);
+
+        // The same reference written whole is the same entry, so the store's own
+        // no-op is what happens — not a refusal the browser invents on its behalf.
+        perform(&fx.store, &Write::AddBlocker(list.clone(), whole.clone())).unwrap();
+        assert_eq!(fx.node_blockers(), expected);
+
+        // A whole reference reaches a node of ANOTHER epic — which is the only
+        // property that distinguishes the two forms, and is unprovable inside one
+        // epic: a resolver that rewrote the epic to the blocked node's own would
+        // land on the right node anyway. Blanks around it are not part of it
+        // either: a reference is a token, not text.
+        let (_, elsewhere) = fx.a_node_of_another_epic();
+        assert!(
+            !elsewhere.starts_with(&fx.epic),
+            "the far reference is inside the blocked node's own epic: {elsewhere}"
+        );
+        perform(
+            &fx.store,
+            &Write::AddBlocker(list, format!("  {elsewhere}  ")),
+        )
+        .unwrap();
+        expected.push(elsewhere);
+        assert_eq!(fx.node_blockers(), expected);
+
+        // And both forms name the blocker the way the store records it, so a
+        // notice about a bare number does not read as a ticket of no epic.
+        let canonical = format!("{}/1", fx.epic);
+        assert_eq!(blocker_name(&fx.blocked_by_selection(), "1"), canonical);
+        assert_eq!(blocker_name(&fx.blocked_by_selection(), " 1 "), canonical);
+        assert_eq!(
+            blocker_name(&fx.blocked_by_selection(), &whole),
+            whole,
+            "a whole reference is named as it stands"
+        );
+        // A reference that names no node is named back as it was typed, so what a
+        // notice would say is still the reader's own words. Nothing is written for
+        // one, so that name is never read — but a name that went missing here would
+        // be a notice with a hole in it if it ever were.
+        assert_eq!(
+            blocker_name(&fx.blocked_by_selection(), " one/two/three "),
+            "one/two/three"
+        );
+    }
+
+    #[test]
+    fn a_blocker_the_store_will_not_take_is_refused_in_the_stores_own_words() {
+        let fx = Fixture::build();
+        let before = fx.node_blockers();
+        let list = fx.blocked_by_selection();
+        let (own_number, own_reference) = fx.node_reference_forms();
+
+        // Neither a blocker that does not exist nor a node blocking itself is the
+        // browser's judgement: the write is attempted and what comes back is the
+        // operation's own message, with no context wrapped round it and no rule
+        // restated in words of the browser's own. Compared against what the
+        // operation itself produces, which is what a reworded refusal would fail.
+        for (typed, blocker) in [
+            ("999".to_string(), NodeRef::new(&fx.epic, 999)),
+            (own_number, NodeRef::new(&fx.epic, fx.node.number)),
+            (own_reference, NodeRef::new(&fx.epic, fx.node.number)),
+        ] {
+            let shown = perform(&fx.store, &Write::AddBlocker(list.clone(), typed.clone()))
+                .expect_err("the store judges what may block what")
+                .to_string();
+            let its_own = ops::add_blocked_by(&fx.store, &fx.node, std::slice::from_ref(&blocker))
+                .expect_err("the store judges what may block what")
+                .to_string();
+            assert_eq!(shown, its_own, "{typed:?}");
+            assert_eq!(fx.node_blockers(), before, "{typed:?} wrote something");
+        }
+
+        // A reference that is no reference at all is refused by the parser that
+        // owns that rule, and reaches the reader in its words too.
+        let shown = perform(&fx.store, &Write::AddBlocker(list, "one/two/three".into()))
+            .expect_err("a reference is <epic-id>/<number>")
+            .to_string();
+        assert_eq!(
+            shown,
+            NodeRef::parse("one/two/three").unwrap_err().to_string()
+        );
+        assert_eq!(fx.node_blockers(), before);
+    }
+
+    #[test]
+    fn a_blocker_removal_takes_the_one_entry_it_names_and_refuses_anything_else() {
+        let fx = Fixture::build();
+        let list = fx.blocked_by_selection();
+        let (bare, whole) = fx.another_node();
+        perform(&fx.store, &Write::AddBlocker(list.clone(), bare)).unwrap();
+        let before = fx.node_blockers();
+        assert!(before.len() > 1, "the promise needs more than one entry");
+
+        // The row carries both nodes, so the entry it names is the entry that goes
+        // and every other one stays.
+        perform(
+            &fx.store,
+            &Write::RemoveBlocker(Selection::Blocker(
+                Container::Node(fx.node.clone()),
+                NodeRef::parse(&whole).unwrap(),
+            )),
+        )
+        .unwrap();
+        let survivors: Vec<String> = before.iter().filter(|b| **b != whole).cloned().collect();
+        assert_eq!(fx.node_blockers(), survivors);
+        assert!(!survivors.is_empty(), "the whole list went");
+
+        // Only a node's blocker row offers removal, so any other selection is a
+        // caller that has lost track of what its row points at — refused by name,
+        // through the seam the browser itself writes through, and with nothing
+        // written on the way to refusing.
+        for wrong in [
+            fx.epic_selection(),
+            list,
+            Selection::Blocker(
+                Container::Epic(fx.epic.clone()),
+                NodeRef::parse(&whole).unwrap(),
+            ),
+        ] {
+            let err = perform(&fx.store, &Write::RemoveBlocker(wrong.clone()))
+                .expect_err("only a blocker row takes a removal")
+                .to_string();
+            assert!(err.contains(&fx.epic), "{wrong:?}: {err}");
+            assert_eq!(fx.node_blockers(), survivors, "{wrong:?} wrote something");
+        }
+    }
+
+    #[test]
+    fn an_epic_is_never_offered_a_dependency_list_to_write_to() {
+        let fx = Fixture::build();
+        let before = fx.epic_labels();
+        // An epic is not a unit of work that can be blocked, so it carries no
+        // dependency list among its collections — and the seam refuses one by name
+        // rather than writing somewhere else, so a row that could not exist cannot
+        // become a write either.
+        assert!(!Container::Epic(fx.epic.clone())
+            .collections()
+            .contains(&Collection::BlockedBy));
+        let epics_list =
+            Selection::Collection(Container::Epic(fx.epic.clone()), Collection::BlockedBy);
+        let err = perform(&fx.store, &Write::AddBlocker(epics_list, "1".into()))
+            .expect_err("an epic has no dependency list")
+            .to_string();
+        assert!(err.contains(&fx.epic), "{err}");
+        assert_eq!(fx.epic_labels(), before, "something else was written");
     }
 
     #[test]
