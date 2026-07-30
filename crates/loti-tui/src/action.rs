@@ -25,12 +25,49 @@ pub enum Mode {
     /// field's while it is open, and a letter is a character rather than an
     /// action, so nothing typed into a field can move, reload or edit anything
     /// underneath it.
-    Surface,
+    ///
+    /// How many fields it holds travels with the mode, because a key means
+    /// different things by it — see [`Fields`] — and a mode is the whole of what
+    /// the key map is told.
+    Surface(Fields),
     /// A dialog is open, admitting the set of answers it lists and nothing else.
     ///
     /// The set travels with the dialog rather than being a mode of its own, so a
     /// new kind of dialog is a set of answers here and never another mode.
     Dialog(Answers),
+}
+
+/// How many fields an open surface holds, to the precision a key's meaning turns
+/// on: whether there is another field to move to at all.
+///
+/// Invariant: this reaches the key map, so the map decides what the reflex key
+/// means instead of guessing — it accepts a surface with one field, and moves to
+/// the next field on a surface with several, where accepting is the save key's
+/// alone. A key map that could not tell them apart would either submit a form
+/// half filled in or leave a one-field surface with no reflex way to finish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fields {
+    /// Exactly one, so there is nowhere to move: the field-navigation keys have
+    /// nothing to reach and are not bound.
+    One,
+    /// More than one, so the fields are navigated and the reflex key moves
+    /// between them.
+    Several,
+}
+
+impl Fields {
+    /// Every shape a surface may have, so a surface that has to cover them all —
+    /// the keys each answers, and the hints each lists — cannot then miss one.
+    pub const ALL: &'static [Fields] = &[Fields::One, Fields::Several];
+
+    /// The shape a surface holding this many fields has. A surface with nothing
+    /// to fill in is not a surface, so anything below two is the one-field shape.
+    pub fn of(count: usize) -> Self {
+        match count {
+            0 | 1 => Fields::One,
+            _ => Fields::Several,
+        }
+    }
 }
 
 /// The answers a dialog admits, which are exactly the answers it lists.
@@ -179,6 +216,10 @@ pub enum Action {
     MoveToStart,
     /// Move the field cursor to the end of its content.
     MoveToEnd,
+    /// Put the keyboard in the next field of the open surface.
+    NextField,
+    /// Put the keyboard in the previous field of the open surface.
+    PreviousField,
     /// Accept the open surface: write what its fields hold.
     Accept,
     /// Hand the open field's content to the external editor and take the result
@@ -195,7 +236,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_editing_action_and_every_answer_set_is_listed() {
+    fn every_editing_action_every_answer_set_and_every_field_shape_is_listed() {
         // The lists are what the hint strip and the key map walk, so a variant
         // left out of one is an action with no hint, or answers no dialog could
         // list. The exhaustive matches make a new variant a compile error here,
@@ -212,6 +253,25 @@ mod tests {
             }
         }
         assert_eq!(Answers::ALL.len(), 2);
+        for fields in Fields::ALL {
+            match fields {
+                Fields::One | Fields::Several => {}
+            }
+        }
+        assert_eq!(Fields::ALL.len(), 2);
+    }
+
+    #[test]
+    fn a_surface_holds_one_field_or_several_and_nothing_counts_as_one() {
+        // The distinction is the whole of what the key map is told, so it is drawn
+        // at exactly one place: a second field is where a surface starts being
+        // navigated. A surface with nothing to fill in is not a surface, so a count
+        // of none reads as the one-field shape rather than as a third case.
+        assert_eq!(Fields::of(1), Fields::One);
+        assert_eq!(Fields::of(0), Fields::One);
+        for count in 2..8 {
+            assert_eq!(Fields::of(count), Fields::Several, "{count} fields");
+        }
     }
 
     #[test]
@@ -228,5 +288,7 @@ mod tests {
         assert_eq!(EditingAction::for_intent(Action::Quit), None);
         assert_eq!(EditingAction::for_intent(Action::Accept), None);
         assert_eq!(EditingAction::for_intent(Action::Insert('a')), None);
+        assert_eq!(EditingAction::for_intent(Action::NextField), None);
+        assert_eq!(EditingAction::for_intent(Action::PreviousField), None);
     }
 }

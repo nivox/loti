@@ -381,14 +381,16 @@ fn footer(app: &App, width: u16) -> Span<'static> {
             // same on every row. An open surface has no row offering anything: the
             // keys that apply are its own, and the way out is out of the buffer
             // rather than out of the mode.
-            let (hints, essential) = match (app.surface().is_some(), app.editing_target().is_some())
-            {
-                (true, _) => (
-                    keymap::FOOTER_HINTS_SURFACE.to_vec(),
+            let (hints, essential) = match (app.surface(), app.editing_target().is_some()) {
+                // Which of the surface's keys apply depends on how many fields it
+                // holds, so the strip asks the surface for its shape exactly as the
+                // key map does: the strip and the keys cannot then disagree.
+                (Some(surface), _) => (
+                    keymap::footer_hints_surface(surface.shape()),
                     keymap::FOOTER_ESSENTIAL_SURFACE,
                 ),
-                (false, true) => (app.editing_hints(), keymap::FOOTER_ESSENTIAL_EDITING),
-                (false, false) => (keymap::FOOTER_HINTS.to_vec(), keymap::FOOTER_ESSENTIAL),
+                (None, true) => (app.editing_hints(), keymap::FOOTER_ESSENTIAL_EDITING),
+                (None, false) => (keymap::FOOTER_HINTS.to_vec(), keymap::FOOTER_ESSENTIAL),
             };
             Span::styled(
                 format!(" {}", hint_strip(columns, &hints, essential)),
@@ -946,9 +948,11 @@ mod tests {
 
     /// Every strip a mode can ask for: the essential pair travels with the
     /// droppable hints it is appended to. Editing mode's are taken at their
-    /// widest — every action any row offers — since a row shows a subset.
-    fn strips() -> [(Vec<&'static str>, &'static [&'static str]); 3] {
-        [
+    /// widest — every action any row offers — since a row shows a subset, and a
+    /// surface's are taken once per field shape, since the shape decides which of
+    /// its keys apply.
+    fn strips() -> Vec<(Vec<&'static str>, &'static [&'static str])> {
+        let mut strips = vec![
             (keymap::FOOTER_HINTS.to_vec(), keymap::FOOTER_ESSENTIAL),
             (
                 keymap::FOOTER_HINTS_EDITING
@@ -957,11 +961,14 @@ mod tests {
                     .collect(),
                 keymap::FOOTER_ESSENTIAL_EDITING,
             ),
-            (
-                keymap::FOOTER_HINTS_SURFACE.to_vec(),
+        ];
+        for fields in crate::action::Fields::ALL.iter().copied() {
+            strips.push((
+                keymap::footer_hints_surface(fields),
                 keymap::FOOTER_ESSENTIAL_SURFACE,
-            ),
-        ]
+            ));
+        }
+        strips
     }
 
     #[test]

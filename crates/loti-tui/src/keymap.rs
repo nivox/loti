@@ -12,7 +12,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::action::{Action, AnswerWords, Answers, EditingAction, Mode};
+use crate::action::{Action, AnswerWords, Answers, EditingAction, Fields, Mode};
 
 /// The intent a key press carries in a mode, or `None` if it is not bound there.
 pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
@@ -25,8 +25,8 @@ pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
     // An open surface takes the whole keyboard, so nothing below is consulted:
     // a letter typed into a field is a character, never the action that letter
     // carries one layer up.
-    if let Mode::Surface = mode {
-        return surface_action(key);
+    if let Mode::Surface(fields) = mode {
+        return surface_action(key, fields);
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     Some(match (key.code, ctrl) {
@@ -42,7 +42,7 @@ pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
             Mode::Browse => Action::Quit,
             // A dialog's answers and a surface's keys are settled before this
             // table is reached, so only browsing and editing arrive here.
-            Mode::Editing | Mode::Surface | Mode::Dialog(_) => Action::Unwind,
+            Mode::Editing | Mode::Surface(_) | Mode::Dialog(_) => Action::Unwind,
         },
 
         // Preview paging. Bound before the plain motions so Ctrl-D/Ctrl-U are
@@ -101,15 +101,28 @@ pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
 /// the field's while it is open, and a letter is a character rather than the
 /// action that letter carries one layer up. A key this table does not bind is
 /// ignored rather than handed to the level underneath.
-fn surface_action(key: KeyEvent) -> Option<Action> {
+///
+/// How many fields the surface holds is an input rather than something read off a
+/// key, because the reflex key means one thing on each shape.
+fn surface_action(key: KeyEvent, fields: Fields) -> Option<Action> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     Some(match (key.code, ctrl) {
         // Raw mode is already on, which clears `IXON`, so Ctrl-S arrives as a key
         // press instead of being eaten as flow control.
         (KeyCode::Char('s'), true) => Action::Accept,
         // A one-field surface is finished by the reflex key too: there is no next
-        // field for it to move to.
-        (KeyCode::Enter, _) => Action::Accept,
+        // field for it to move to. Where there is one it moves instead, so the save
+        // key is the only way to accept a form and a reader pressing on through the
+        // fields never submits one by arriving at the last.
+        (KeyCode::Enter, _) => match fields {
+            Fields::One => Action::Accept,
+            Fields::Several => Action::NextField,
+        },
+        // Field navigation, bound where there is another field to reach and nowhere
+        // else: a key that did nothing on a one-field surface would be a key taught
+        // for nothing.
+        (KeyCode::Tab, _) if matches!(fields, Fields::Several) => Action::NextField,
+        (KeyCode::BackTab, _) if matches!(fields, Fields::Several) => Action::PreviousField,
         (KeyCode::Char('g'), true) => Action::ExternalEditor,
         (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => Action::Unwind,
         // The one help key that can be pressed inside a field.
@@ -200,7 +213,14 @@ pub const HELP: &[(&str, &str)] = &[
     ("e", "editing mode, on the highlighted row"),
     ("a", "editing mode: add a label, in a dialog"),
     ("d", "editing mode: remove the label, with a confirmation"),
-    ("Ctrl-S / Enter", "save the open field"),
+    (
+        "Ctrl-S / Enter",
+        "save the open surface; Enter if it has one field",
+    ),
+    (
+        "Tab / Shift-Tab",
+        "next / previous field; Enter moves forwards too",
+    ),
     ("Ctrl-G", "edit the open field in $EDITOR"),
     (
         "Ctrl-A / Ctrl-E",
@@ -245,13 +265,24 @@ pub const FOOTER_HINTS_EDITING: &[(EditingAction, &str)] = &[
 ];
 
 /// The droppable hints of an open surface, ranked rather than in key order: they
-/// are not peers. Saving is what the reader came to do, and handing the field to
-/// an external editor is the power-user escape from a cramped one.
+/// are not peers. Saving is what the reader came to do, then moving between the
+/// fields, and handing a field to an external editor is the power-user escape
+/// from a cramped one.
 ///
 /// A list of its own rather than more entries beside the editing actions: those
 /// are letters a row offers and this row offers none of them — while a surface is
 /// open the only keys that apply are the surface's.
-pub const FOOTER_HINTS_SURFACE: &[&str] = &["Ctrl-S save", "Ctrl-G editor"];
+///
+/// The field-navigation hint is listed on a surface with fields to move between
+/// and on no other, because the strip must never name a key the surface ignores.
+pub fn footer_hints_surface(fields: Fields) -> Vec<&'static str> {
+    let mut hints = vec!["Ctrl-S save"];
+    if matches!(fields, Fields::Several) {
+        hints.push("Tab fields");
+    }
+    hints.push("Ctrl-G editor");
+    hints
+}
 
 /// Editing mode's essential pair. Neither browse hint applies — `q` does not quit
 /// while the mode is on, and the way out of the mode is not the way out of a
@@ -285,6 +316,13 @@ mod tests {
         Answers::ALL.iter().copied().map(Mode::Dialog).collect()
     }
 
+    /// Every mode an open surface puts the keyboard under, one per field shape: a
+    /// key that belongs to the field belongs to it on either shape, so a test
+    /// about the field walks both.
+    fn surface_modes() -> Vec<Mode> {
+        Fields::ALL.iter().copied().map(Mode::Surface).collect()
+    }
+
     /// Words for a dialog's answers, so a test about the letters is not also a
     /// test about anybody's prose.
     fn words() -> AnswerWords {
@@ -302,6 +340,10 @@ mod tests {
             "Esc" => plain(KeyCode::Esc),
             "Enter" => plain(KeyCode::Enter),
             "F1" => plain(KeyCode::F(1)),
+            "Tab" => plain(KeyCode::Tab),
+            // Terminals send shifted Tab as a code of its own, so the name a strip
+            // shows and the key a reader presses meet here.
+            "Shift-Tab" => KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
             _ => match spelling.strip_prefix("Ctrl-") {
                 Some(rest) => ctrl(one_char(rest).to_ascii_lowercase()),
                 None => plain(KeyCode::Char(one_char(spelling))),
@@ -358,11 +400,20 @@ mod tests {
 
     #[test]
     fn every_essential_pair_says_the_way_out_before_it_says_help() {
-        for (mode, essential) in [
+        let pairs = [
             (Mode::Browse, FOOTER_ESSENTIAL),
             (Mode::Editing, FOOTER_ESSENTIAL_EDITING),
-            (Mode::Surface, FOOTER_ESSENTIAL_SURFACE),
-        ] {
+        ]
+        .into_iter()
+        // Both field shapes: the way out of a buffer is the same key whichever
+        // shape it has, and a pair that named a key one shape ignores would seal
+        // the reader into that one.
+        .chain(
+            surface_modes()
+                .into_iter()
+                .map(|mode| (mode, FOOTER_ESSENTIAL_SURFACE)),
+        );
+        for (mode, essential) in pairs {
             // Clipping eats the tail, so the rank is the order: the way out
             // first, help second. Both are checked by what their key does in that
             // mode rather than by how they are spelled — inside a field the help
@@ -387,74 +438,126 @@ mod tests {
 
     #[test]
     fn an_open_surface_takes_every_key_and_lets_none_reach_what_is_under_it() {
-        // A letter is a character in a field, not the action it carries one layer
-        // up: nothing typed can quit, move a cursor or open a level.
-        for c in ['q', 'j', 'k', 'e', 'r', 'd', 'a', '?', 'z'] {
+        for mode in surface_modes() {
+            // A letter is a character in a field, not the action it carries one
+            // layer up: nothing typed can quit, move a cursor or open a level.
+            for c in ['q', 'j', 'k', 'e', 'r', 'd', 'a', '?', 'z'] {
+                assert_eq!(
+                    action_for(plain(KeyCode::Char(c)), mode),
+                    Some(Action::Insert(c)),
+                    "{c:?} did not reach the field in {mode:?}"
+                );
+            }
+            // The paging keys belong to the buffer while it is open, so they cannot
+            // scroll the preview behind it — and a single-line field has no page, so
+            // the ones with nothing to do there do nothing at all.
+            for code in [KeyCode::PageDown, KeyCode::PageUp] {
+                assert_eq!(action_for(plain(code), mode), None, "{code:?} in {mode:?}");
+            }
+            for c in ['d', 'u'] {
+                assert_eq!(action_for(ctrl(c), mode), None, "Ctrl-{c} in {mode:?}");
+            }
+            // The field's own ends, from the keys that page a preview one layer up.
             assert_eq!(
-                action_for(plain(KeyCode::Char(c)), Mode::Surface),
-                Some(Action::Insert(c)),
-                "{c:?} did not reach the field"
+                action_for(plain(KeyCode::Home), mode),
+                Some(Action::MoveToStart),
+                "{mode:?}"
+            );
+            assert_eq!(
+                action_for(plain(KeyCode::End), mode),
+                Some(Action::MoveToEnd),
+                "{mode:?}"
             );
         }
-        // The paging keys belong to the buffer while it is open, so they cannot
-        // scroll the preview behind it — and a single-line field has no page, so
-        // the ones with nothing to do there do nothing at all.
-        for code in [KeyCode::PageDown, KeyCode::PageUp] {
-            assert_eq!(action_for(plain(code), Mode::Surface), None, "{code:?}");
-        }
-        for c in ['d', 'u'] {
-            assert_eq!(action_for(ctrl(c), Mode::Surface), None, "Ctrl-{c}");
-        }
-        // The field's own ends, from the keys that page a preview one layer up.
-        assert_eq!(
-            action_for(plain(KeyCode::Home), Mode::Surface),
-            Some(Action::MoveToStart)
-        );
-        assert_eq!(
-            action_for(plain(KeyCode::End), Mode::Surface),
-            Some(Action::MoveToEnd)
-        );
     }
 
     #[test]
     fn a_field_is_edited_by_the_keys_a_reader_already_knows() {
-        for (key, intent) in [
-            (ctrl('a'), Action::MoveToStart),
-            (ctrl('e'), Action::MoveToEnd),
-            (ctrl('b'), Action::MoveLeft),
-            (ctrl('f'), Action::MoveRight),
-            (plain(KeyCode::Left), Action::MoveLeft),
-            (plain(KeyCode::Right), Action::MoveRight),
-            (plain(KeyCode::Backspace), Action::DeleteBefore),
-            (plain(KeyCode::Delete), Action::DeleteAfter),
-        ] {
-            assert_eq!(action_for(key, Mode::Surface), Some(intent), "{key:?}");
+        // The same keys whatever shape the surface has: how many fields there are
+        // decides which key moves between them, never what a field is edited with.
+        for mode in surface_modes() {
+            for (key, intent) in [
+                (ctrl('a'), Action::MoveToStart),
+                (ctrl('e'), Action::MoveToEnd),
+                (ctrl('b'), Action::MoveLeft),
+                (ctrl('f'), Action::MoveRight),
+                (plain(KeyCode::Left), Action::MoveLeft),
+                (plain(KeyCode::Right), Action::MoveRight),
+                (plain(KeyCode::Backspace), Action::DeleteBefore),
+                (plain(KeyCode::Delete), Action::DeleteAfter),
+            ] {
+                assert_eq!(action_for(key, mode), Some(intent), "{key:?} in {mode:?}");
+            }
         }
     }
 
     #[test]
     fn a_one_field_surface_is_accepted_by_either_key_and_left_by_the_way_out() {
+        let one = Mode::Surface(Fields::One);
         // Ctrl-S accepts anywhere; a one-field surface has no next field for the
         // reflex key to move to, so it accepts too.
         for key in [ctrl('s'), plain(KeyCode::Enter)] {
+            assert_eq!(action_for(key, one), Some(Action::Accept), "{key:?}");
+        }
+        // And no field to move to means no key that moves: a bound key that could
+        // only land where it started is a key taught for nothing.
+        for key in [key_named("Tab"), key_named("Shift-Tab")] {
+            assert_eq!(action_for(key, one), None, "{key:?}");
+        }
+        for mode in surface_modes() {
+            // The way out, and its alias: inside a mode Ctrl-C is exactly Esc.
+            for key in [plain(KeyCode::Esc), ctrl('c')] {
+                assert_eq!(
+                    action_for(key, mode),
+                    Some(Action::Unwind),
+                    "{key:?} in {mode:?}"
+                );
+            }
             assert_eq!(
-                action_for(key, Mode::Surface),
+                action_for(ctrl('g'), mode),
+                Some(Action::ExternalEditor),
+                "{mode:?}"
+            );
+            // Saving is the one way to accept that every shape shares.
+            assert_eq!(
+                action_for(ctrl('s'), mode),
                 Some(Action::Accept),
-                "{key:?}"
+                "{mode:?}"
             );
         }
-        // The way out, and its alias: inside a mode Ctrl-C is exactly Esc.
-        for key in [plain(KeyCode::Esc), ctrl('c')] {
-            assert_eq!(
-                action_for(key, Mode::Surface),
-                Some(Action::Unwind),
-                "{key:?}"
-            );
-        }
+    }
+
+    #[test]
+    fn a_surface_with_several_fields_is_navigated_and_the_reflex_key_moves_rather_than_accepts() {
+        let several = Mode::Surface(Fields::Several);
+        // The reflex key means what the shape says, which is why the shape reaches
+        // this map at all: on a form it moves on, so pressing through the fields
+        // never submits one, and the save key stays the only way to accept.
         assert_eq!(
-            action_for(ctrl('g'), Mode::Surface),
-            Some(Action::ExternalEditor)
+            action_for(plain(KeyCode::Enter), several),
+            Some(Action::NextField)
         );
+        assert_eq!(
+            action_for(plain(KeyCode::Enter), Mode::Surface(Fields::One)),
+            Some(Action::Accept),
+            "the reflex key means the same thing on both shapes"
+        );
+        // Forwards and backwards, by the keys a form is navigated with everywhere.
+        assert_eq!(
+            action_for(key_named("Tab"), several),
+            Some(Action::NextField)
+        );
+        assert_eq!(
+            action_for(key_named("Shift-Tab"), several),
+            Some(Action::PreviousField)
+        );
+        // The navigation keys are the surface's alone: while browsing they are not
+        // bound at all, so nothing moves a field cursor that does not exist.
+        for mode in [Mode::Browse, Mode::Editing] {
+            for key in [key_named("Tab"), key_named("Shift-Tab")] {
+                assert_eq!(action_for(key, mode), None, "{key:?} in {mode:?}");
+            }
+        }
     }
 
     #[test]
@@ -462,7 +565,10 @@ mod tests {
         // `?` is a literal character in a field, so `F1` is the help key that
         // reaches every mode — and it is bound outside a field as well, so there
         // is no second help key to learn on arriving in one.
-        for mode in [Mode::Browse, Mode::Editing, Mode::Surface] {
+        for mode in [Mode::Browse, Mode::Editing]
+            .into_iter()
+            .chain(surface_modes())
+        {
             assert_eq!(
                 action_for(plain(KeyCode::F(1)), mode),
                 Some(Action::ToggleHelp),
@@ -474,21 +580,32 @@ mod tests {
             Some(Action::ToggleHelp)
         );
         assert_eq!(
-            action_for(plain(KeyCode::Char('?')), Mode::Surface),
+            action_for(plain(KeyCode::Char('?')), Mode::Surface(Fields::One)),
             Some(Action::Insert('?'))
         );
     }
 
     #[test]
-    fn every_surface_hint_names_a_key_the_surface_answers() {
+    fn every_surface_hint_names_a_key_that_shape_of_surface_answers() {
         // The strip teaches keys by name, so a hint naming a key the surface does
         // not answer teaches a key that does nothing. These are not the editing
         // actions' hints: a row offers those, and while a surface is open no row
         // offers anything.
-        for hint in FOOTER_HINTS_SURFACE {
-            assert!(
-                action_for(key_named(leading(hint)), Mode::Surface).is_some(),
-                "{hint:?} names a key the surface ignores"
+        for fields in Fields::ALL.iter().copied() {
+            let hints = footer_hints_surface(fields);
+            for hint in &hints {
+                assert!(
+                    action_for(key_named(leading(hint)), Mode::Surface(fields)).is_some(),
+                    "{hint:?} names a key {fields:?} ignores"
+                );
+            }
+            // And the field keys are hinted exactly where they are bound: a shape
+            // with fields to move between says so, and the one without does not
+            // teach a key it ignores.
+            assert_eq!(
+                hints.iter().any(|hint| leading(hint) == "Tab"),
+                fields == Fields::Several,
+                "{fields:?}: {hints:?}"
             );
         }
     }

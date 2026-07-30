@@ -275,6 +275,19 @@ fn the_help_overlay_lists_the_bindings() {
 
     assert!(lines.iter().any(|l| l.contains("keys")));
     assert!(lines.iter().any(|l| l.contains("move the cursor")));
+    // Every binding the list carries reaches the screen: a list one row too tall
+    // for the terminal teaches nothing about the binding it drops.
+    for (keys, what) in loti_tui::keymap::HELP {
+        assert!(
+            lines.iter().any(|l| l.contains(what)),
+            "{keys:?} / {what:?} is listed but not on the frame"
+        );
+    }
+    // The keys that move between a surface's fields among them.
+    assert!(
+        lines.iter().any(|l| l.contains("Tab / Shift-Tab")),
+        "the field keys are not listed: {lines:#?}"
+    );
 }
 
 #[test]
@@ -1068,6 +1081,10 @@ fn the_strip_carries_the_open_surfaces_own_keys_and_drops_the_editor_first() {
     for absent in ["a add", "Esc leave", "q quit", "? keys"] {
         assert!(!lines[23].contains(absent), "{absent:?}: {:?}", lines[23]);
     }
+    // This surface holds one field, so it answers no key that moves between
+    // fields, and the strip must not teach one: a hint naming a key the surface
+    // ignores teaches a key that does nothing.
+    assert!(!lines[23].contains("Tab"), "{:?}", lines[23]);
 
     // Ranked, not in key order: a terminal too narrow for everything drops the
     // power-user escape first and keeps the way out and help.

@@ -11,7 +11,7 @@ use anyhow::Result;
 use loti_core::store::Store;
 use ratatui_markdown::viewer::MarkdownViewer;
 
-use crate::action::{Action, AnswerWords, Answers, EditingAction, Mode};
+use crate::action::{Action, AnswerWords, Answers, EditingAction, Fields, Mode};
 use crate::data::{self, Collection, Level, Selection};
 use crate::keymap;
 use crate::nav::Nav;
@@ -469,6 +469,32 @@ impl Surface {
         self.focus
     }
 
+    /// How many fields it holds, to the precision a key's meaning turns on. This
+    /// is the whole of what the key map is told about a surface, so the map decides
+    /// what the reflex key means rather than the surface deciding it after the fact.
+    pub fn shape(&self) -> Fields {
+        Fields::of(self.fields.len())
+    }
+
+    /// Put the keyboard in the next or the previous field, wrapping round at
+    /// either end.
+    ///
+    /// Wrapping because the reflex key is field navigation on a surface with
+    /// several fields: navigation that stopped at the last field would leave that
+    /// key doing nothing there, and forwards alone would no longer reach every
+    /// field.
+    fn move_focus(&mut self, forwards: bool) {
+        let Some(last) = self.fields.len().checked_sub(1) else {
+            return;
+        };
+        self.focus = match forwards {
+            true if self.focus >= last => 0,
+            true => self.focus + 1,
+            false if self.focus == 0 => last,
+            false => self.focus - 1,
+        };
+    }
+
     /// The field a warning about lost text names: the first one with typing in it,
     /// and `None` for a surface nothing has been typed into — which is what makes
     /// the way out ask on one and not on the other.
@@ -634,10 +660,13 @@ impl App {
             // An open surface takes every key, so it outranks the mode that opened
             // it: while a field is being typed into, the mode's own letters are
             // characters.
-            Some(Modal::Help) | None => match (self.surface.is_some(), self.editing.is_some()) {
-                (true, _) => Mode::Surface,
-                (false, true) => Mode::Editing,
-                (false, false) => Mode::Browse,
+            Some(Modal::Help) | None => match (&self.surface, self.editing.is_some()) {
+                // How many fields it holds travels with the mode, because the key
+                // map decides from it what the reflex key means and which keys move
+                // between fields.
+                (Some(surface), _) => Mode::Surface(surface.shape()),
+                (None, true) => Mode::Editing,
+                (None, false) => Mode::Browse,
             },
         }
     }
@@ -773,7 +802,9 @@ impl App {
             | Action::MoveLeft
             | Action::MoveRight
             | Action::MoveToStart
-            | Action::MoveToEnd => {}
+            | Action::MoveToEnd
+            | Action::NextField
+            | Action::PreviousField => {}
 
             Action::EnterEditing => match self.nav.frame().current() {
                 Some(row) => self.editing = Some(row.selection.clone()),
@@ -923,6 +954,14 @@ impl App {
             Action::ExternalEditor => {
                 if let Some(surface) = &self.surface {
                     self.editor_handoff = Some(surface.fields[surface.focus].value.clone());
+                }
+            }
+            // Moving between fields is the surface's business rather than a field's,
+            // and it is not a content key: the field it leaves is no dirtier for
+            // having been left.
+            Action::NextField | Action::PreviousField => {
+                if let Some(surface) = &mut self.surface {
+                    surface.move_focus(matches!(action, Action::NextField));
                 }
             }
             // The key list is reachable from inside a field, which is what the help
@@ -1270,6 +1309,49 @@ mod tests {
         app.apply(Action::EnterEditing).unwrap();
         app.apply(Action::Add).unwrap();
         assert!(app.surface().is_some(), "the add key opened no surface");
+    }
+
+    /// The name of a field invented for a test, so a rule about one field has a
+    /// second field to be told apart from. Nothing writes it.
+    const A_SECOND_FIELD: &str = "note";
+    const A_THIRD_FIELD: &str = "reason";
+
+    /// Open a surface with the fields a test gives it, which no shipped surface
+    /// has: the browser fills in one field today, and which multi-field surface
+    /// writes what belongs to the slice that adds it.
+    ///
+    /// Two rules about fields cannot be told from their absence while every
+    /// surface has exactly one — that a field being required is what makes the
+    /// unfilled check fire, and that the field a dismissal points at is the field
+    /// the reader lands in — so they are pinned on a shape built here. It borrows
+    /// the one write there is, and the field it writes is the first.
+    fn open_a_surface_with_fields(app: &mut App, fields: Vec<Field>) {
+        open_the_label_surface(app);
+        let surface = app.surface.as_mut().expect("the surface is open");
+        surface.fields = fields;
+        surface.focus = 0;
+    }
+
+    /// The frame's lines as a reader reads them, drawn through the headless
+    /// backend.
+    ///
+    /// Drawn from here because a surface with several fields exists only inside
+    /// this module's tests, and a hint the reader cannot read off the screen is
+    /// not a hint.
+    fn frame_lines(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
     }
 
     /// Type into the open field, one keystroke per character, as a reader does.
@@ -2001,7 +2083,7 @@ mod tests {
         assert!(surface.title().contains(&fx.epic), "{:?}", surface.title());
         // Every key now belongs to the field: the mode the keyboard is under is the
         // only bridge from this state to the key table.
-        assert_eq!(app.mode(), Mode::Surface);
+        assert_eq!(app.mode(), Mode::Surface(Fields::One));
         assert!(fx.epic_labels().iter().all(|l| !l.is_empty()));
 
         // A row that is not a label set offers no addition: this surface writes a
@@ -2117,7 +2199,7 @@ mod tests {
         // what the warning was about, so typing the answer is a straight line.
         app.apply(Action::Unwind).unwrap();
         assert_eq!(app.modal(), None);
-        assert_eq!(app.mode(), Mode::Surface);
+        assert_eq!(app.mode(), Mode::Surface(Fields::One));
         assert_eq!(app.surface().map(Surface::focus), Some(0));
         type_into(&mut app, "ui-2");
         assert_eq!(field_value(&app), "ui-2");
@@ -2132,6 +2214,159 @@ mod tests {
         app.apply(Action::Accept).unwrap();
         assert!(matches!(app.modal(), Some(Modal::Dialog(_))));
         assert_eq!(fx.epic_labels(), before);
+    }
+
+    #[test]
+    fn a_field_being_required_is_what_stops_the_write_and_the_warning_lands_in_that_field() {
+        let (fx, mut app) = app();
+        let before = fx.epic_labels();
+        // An optional field, then a required one, both empty. What stops the write
+        // is the required one: a field nobody has to fill in is not something to
+        // warn about, and the warning names the field the reader must go to.
+        // A third field, required and also empty, is what makes "the first empty
+        // required one" a claim rather than a coincidence: with one such field, a
+        // warning that named the last would pass just as happily.
+        open_a_surface_with_fields(
+            &mut app,
+            vec![
+                Field::new(A_SECOND_FIELD, false),
+                Field::new(LABEL_FIELD, true),
+                Field::new(A_THIRD_FIELD, true),
+            ],
+        );
+        // Several fields, and the key map is told so: which keys apply is decided
+        // from the shape rather than guessed at.
+        assert_eq!(app.mode(), Mode::Surface(Fields::Several));
+
+        app.apply(Action::Accept).unwrap();
+        let Some(Modal::Dialog(dialog)) = app.modal() else {
+            panic!("an empty required field wrote or said nothing")
+        };
+        assert!(dialog.message().contains(LABEL_FIELD), "{dialog:?}");
+        assert!(
+            !dialog.message().contains(A_SECOND_FIELD),
+            "an optional field was warned about: {dialog:?}"
+        );
+        assert!(
+            !dialog.message().contains(A_THIRD_FIELD),
+            "a later empty field was warned about before the first: {dialog:?}"
+        );
+        // The field it names is the field dismissal puts the reader in, which here
+        // is not the field they started in.
+        assert_eq!(dialog.dismissal.performs, Some(OnDismissal::Focus(1)));
+        assert_eq!(fx.epic_labels(), before, "the warning wrote something");
+
+        // And that focus is applied rather than merely carried: after dismissing,
+        // what is typed lands in the field the warning named.
+        app.apply(Action::Unwind).unwrap();
+        assert_eq!(app.surface().map(Surface::focus), Some(1));
+        type_into(&mut app, "ui-2");
+        let fields = app.surface().expect("the buffer is still open").fields();
+        assert_eq!(fields[1].value(), "ui-2");
+        assert_eq!(
+            fields[0].value(),
+            "",
+            "the answer was typed into the field the warning was not about"
+        );
+    }
+
+    #[test]
+    fn an_empty_optional_field_is_no_reason_to_refuse_the_write() {
+        // The other direction of the same rule: with every required field filled,
+        // an empty optional one does not stop an accept.
+        let (fx, mut app) = app();
+        let before = fx.epic_labels();
+        open_a_surface_with_fields(
+            &mut app,
+            vec![
+                Field::new(LABEL_FIELD, true),
+                Field::new(A_SECOND_FIELD, false),
+            ],
+        );
+        type_into(&mut app, "a new label");
+        app.apply(Action::Accept).unwrap();
+        assert_eq!(
+            app.modal(),
+            None,
+            "an empty optional field was warned about"
+        );
+        let mut expected = before;
+        expected.push("a new label".to_string());
+        assert_eq!(fx.epic_labels(), expected);
+    }
+
+    #[test]
+    fn the_field_keys_move_the_keyboard_round_the_fields_without_writing_to_any() {
+        let (_fx, mut app) = app();
+        open_a_surface_with_fields(
+            &mut app,
+            vec![
+                Field::new(LABEL_FIELD, true),
+                Field::new(A_SECOND_FIELD, false),
+                Field::new("third", false),
+            ],
+        );
+
+        // Forwards, and round from the last: the reflex key is field navigation on
+        // a surface with several fields, so a walk that stopped at the end would
+        // leave that key doing nothing there.
+        for expected in [1, 2, 0, 1] {
+            app.apply(Action::NextField).unwrap();
+            assert_eq!(app.surface().map(Surface::focus), Some(expected));
+        }
+        // Backwards, and round from the first.
+        for expected in [0, 2, 1] {
+            app.apply(Action::PreviousField).unwrap();
+            assert_eq!(app.surface().map(Surface::focus), Some(expected));
+        }
+
+        // The keyboard is where the focus says: what is typed lands in that field
+        // and in no other.
+        type_into(&mut app, "middle");
+        let fields = app.surface().expect("a surface is open").fields();
+        assert_eq!(
+            fields.iter().map(Field::value).collect::<Vec<_>>(),
+            vec!["", "middle", ""]
+        );
+        // And moving is not writing: a field the keyboard only passed through is
+        // untouched, so the way out stays silent about it.
+        assert!(!fields[0].is_dirty());
+        assert!(!fields[2].is_dirty());
+    }
+
+    #[test]
+    fn the_strip_offers_the_field_keys_where_there_are_fields_to_move_between() {
+        let (_fx, mut app) = app();
+        open_a_surface_with_fields(
+            &mut app,
+            vec![
+                Field::new(LABEL_FIELD, true),
+                Field::new(A_SECOND_FIELD, false),
+            ],
+        );
+        let lines = frame_lines(&mut app, 100, 24);
+        let strip = lines.last().expect("the strip is the bottom line").clone();
+        // Ranked rather than in key order: saving is what the reader came to do,
+        // then moving between the fields, then the power-user escape.
+        let at = |hint: &str| {
+            strip
+                .find(hint)
+                .unwrap_or_else(|| panic!("{hint:?}: {strip:?}"))
+        };
+        assert!(at("Ctrl-S save") < at("Tab fields"), "{strip:?}");
+        assert!(at("Tab fields") < at("Ctrl-G editor"), "{strip:?}");
+    }
+
+    #[test]
+    fn the_strip_of_a_one_field_surface_teaches_no_key_that_moves_between_fields() {
+        // A surface with one field answers no key that moves between fields, and
+        // the strip never names a key the surface ignores.
+        let (_fx, mut app) = app();
+        open_the_label_surface(&mut app);
+        let lines = frame_lines(&mut app, 100, 24);
+        let strip = lines.last().expect("the strip is the bottom line");
+        assert!(strip.contains("Ctrl-S save"), "{strip:?}");
+        assert!(!strip.contains("Tab"), "{strip:?}");
     }
 
     #[test]
@@ -2165,7 +2400,7 @@ mod tests {
         app.apply(Action::Unwind).unwrap();
         assert_eq!(app.modal(), None);
         assert_eq!(field_value(&app), "half a thought");
-        assert_eq!(app.mode(), Mode::Surface);
+        assert_eq!(app.mode(), Mode::Surface(Fields::One));
 
         // The destructive letter throws the buffer away, and only the buffer: the
         // mode stays on the row, and nothing reached the store.
@@ -2351,7 +2586,7 @@ mod tests {
         // And the answer that is never destructive lands back on the text intact.
         app.apply(Action::Unwind).unwrap();
         assert_eq!(field_value(&app), "written in the editor");
-        assert_eq!(app.mode(), Mode::Surface);
+        assert_eq!(app.mode(), Mode::Surface(Fields::One));
         assert_eq!(fx.epic_labels(), before, "the round-trip wrote something");
     }
 
@@ -2378,7 +2613,7 @@ mod tests {
         app.apply(Action::Unwind).unwrap();
         assert_eq!(app.modal(), None);
         assert_eq!(field_value(&app), "never written");
-        assert_eq!(app.mode(), Mode::Surface);
+        assert_eq!(app.mode(), Mode::Surface(Fields::One));
         assert!(app.editing_target().is_some());
     }
 
@@ -2427,13 +2662,13 @@ mod tests {
         // it is a layer above the buffer, not a way out of it.
         app.apply(Action::ToggleHelp).unwrap();
         assert_eq!(app.modal(), Some(&Modal::Help));
-        assert_eq!(app.mode(), Mode::Surface);
+        assert_eq!(app.mode(), Mode::Surface(Fields::One));
 
         // One layer at a time: the overlay goes and the buffer stays, text and all.
         app.apply(Action::Unwind).unwrap();
         assert_eq!(app.modal(), None);
         assert_eq!(field_value(&app), "kept");
-        assert_eq!(app.mode(), Mode::Surface);
+        assert_eq!(app.mode(), Mode::Surface(Fields::One));
     }
 
     #[test]
