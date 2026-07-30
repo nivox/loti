@@ -878,9 +878,16 @@ impl App {
     /// While an overlay is open it takes every key, so a keypress can never move
     /// an unseen cursor. Editing mode is the layer under it, and unwinding takes
     /// one layer at a time: closing the overlay leaves the mode standing.
+    ///
+    /// Ending the session is decided before any layer is consulted, because it is
+    /// the one intent no layer may answer for itself: see [`App::quit`].
     pub fn apply(&mut self, action: Action) -> Result<bool> {
+        if matches!(action, Action::Quit) {
+            return Ok(self.quit());
+        }
         if self.modal.is_some() {
-            return self.apply_to_modal(action);
+            self.apply_to_modal(action)?;
+            return Ok(false);
         }
         // An open surface is the layer under an overlay and above the mode that
         // opened it: every key belongs to the field while it is open.
@@ -894,7 +901,6 @@ impl App {
         }
 
         match action {
-            Action::Quit => return Ok(true),
             Action::ToggleHelp => self.modal = Some(Modal::Help),
 
             // Zoom hides the navigation pane, so the motion keys fall through to
@@ -949,6 +955,10 @@ impl App {
             | Action::NextField
             | Action::PreviousField => {}
 
+            // Ending the session was answered before this layer was reached, so
+            // no layer states the rule a second time. See [`App::quit`].
+            Action::Quit => {}
+
             Action::EnterEditing => match self.read_only {
                 // A mode whose every action is unavailable is not entered at
                 // all: the key is as unknown as any other action the browser
@@ -982,25 +992,51 @@ impl App {
         Ok(false)
     }
 
+    /// Whether the session ends where the reader is standing, and the notice for
+    /// where it does not.
+    ///
+    /// Invariant: quitting is decided here for every layer and answered nowhere
+    /// else, so no layer can let it through on behalf of the layer beneath — an
+    /// overlay is drawn over a mode, not a hole in it.
+    ///
+    /// The rule the layers are checked against is about unsaved work rather than
+    /// about which key is live: **quitting never discards text the store has not
+    /// been given.** Editing mode is the only layer that can hold any — a surface
+    /// is open only while the mode is on — so while the mode is on the session
+    /// stays and the notice names the way out, whatever is layered over it.
+    ///
+    /// A dialog refuses it in silence: the question is on screen listing its own
+    /// answers, it is raised only for something failed or costly, and it must be
+    /// answered rather than escaped past.
+    fn quit(&mut self) -> bool {
+        if matches!(self.modal, Some(Modal::Dialog(_))) {
+            return false;
+        }
+        if self.editing.is_some() {
+            self.flash(NOT_AN_EDITING_ACTION);
+            return false;
+        }
+        true
+    }
+
     /// Carry out an intent while an overlay is open.
     ///
     /// The key overlay is a layer above whichever mode raised it, so it is closed
-    /// by that mode's own way out and quitting gets through it. A dialog is not:
-    /// it admits the answers it lists and nothing else, because a question is
-    /// raised only for something failed or costly, and it must be answered rather
-    /// than escaped past.
-    fn apply_to_modal(&mut self, action: Action) -> Result<bool> {
+    /// by that mode's own way out. A dialog is not: it admits the answers it lists
+    /// and nothing else, because a question is raised only for something failed or
+    /// costly, and it must be answered rather than escaped past. Neither of them
+    /// ends the session — that is decided before an overlay is consulted, so this
+    /// cannot return an exit.
+    fn apply_to_modal(&mut self, action: Action) -> Result<()> {
         if matches!(self.modal, Some(Modal::Help)) {
             match action {
-                Action::Quit => return Ok(true),
                 Action::ToggleHelp | Action::Unwind | Action::Ascend => self.modal = None,
                 _ => {}
             }
-            return Ok(false);
+            return Ok(());
         }
-        // A dialog admits its listed answers and nothing else, quitting included:
-        // a question this critical must be answered rather than escaped past, and
-        // nothing underneath it may move while it is open.
+        // A dialog admits its listed answers and nothing else: nothing underneath
+        // it may move while it is open.
         match action {
             // The affirmative answer performs whatever the dialog carries, so no
             // one operation is named here and a further kind of question needs no
@@ -1011,7 +1047,7 @@ impl App {
             Action::Unwind => self.dismiss(),
             _ => {}
         }
-        Ok(false)
+        Ok(())
     }
 
     /// Get out of the open dialog, landing wherever it says the reader belongs.
@@ -1193,10 +1229,9 @@ impl App {
     /// must not silently drop the reader out of a mode whose indicator is at the
     /// top of the screen while their eyes are on the row.
     ///
-    /// Quitting is one of the keys the mode does not admit, so no key reaching
-    /// this far can end the session. The overlay is the exception, and a layer
-    /// above: a key that opens it is answered there, and quitting gets through
-    /// that layer whether or not the mode is on.
+    /// Quitting never reaches this layer: it is answered for every layer at once,
+    /// and the mode holds text the store has not been given, so it is refused
+    /// while the mode is on whatever is layered over it. See [`App::quit`].
     fn apply_editing(&mut self, action: Action) -> Result<()> {
         match action {
             Action::Unwind => self.editing = None,
@@ -2011,6 +2046,70 @@ mod tests {
         assert_eq!(app.mode(), Mode::Editing);
         app.apply(Action::Unwind).unwrap();
         assert_eq!(app.editing_target(), None);
+    }
+
+    #[test]
+    fn no_layer_over_the_mode_ends_a_session_the_mode_itself_refuses_to_end() {
+        let (_fx, mut app) = app();
+        app.apply(Action::Descend).unwrap(); // into the epic
+        to_work_row(&mut app);
+        app.apply(Action::EnterEditing).unwrap();
+        let target = app.editing_target().cloned();
+
+        // The key list is drawn over the mode rather than being a hole in it, so
+        // the key the mode refuses is refused while the list is open too: a reader
+        // who opens the key list mid-edit and presses the key that ends a browsing
+        // session must not lose what the mode holds.
+        app.apply(Action::ToggleHelp).unwrap();
+        assert!(
+            !app.apply(Action::Quit).unwrap(),
+            "the overlay quit the mode"
+        );
+        assert_eq!(
+            app.modal(),
+            Some(&Modal::Help),
+            "the overlay answered a key it does not own"
+        );
+        assert_eq!(app.editing_target(), target.as_ref());
+        let notice = app.flash_message().expect("a refused key says why");
+        assert!(
+            notice.contains("Esc"),
+            "{notice:?} does not name the way out"
+        );
+
+        // And the refusal lasts exactly as long as the mode does: once it is off
+        // the same key ends the session, under the overlay or without it.
+        app.apply(Action::Unwind).unwrap(); // the overlay
+        app.apply(Action::Unwind).unwrap(); // the mode
+        assert_eq!(app.editing_target(), None);
+        assert!(app.apply(Action::Quit).unwrap());
+        app.apply(Action::ToggleHelp).unwrap();
+        assert!(app.apply(Action::Quit).unwrap());
+    }
+
+    #[test]
+    fn quitting_from_the_layer_above_a_buffer_cannot_discard_it() {
+        let (_fx, mut app) = app();
+        open_the_label_surface(&mut app);
+        type_into(&mut app, "half a thought");
+
+        // The key list is the one layer reachable from inside a field, so it is
+        // the one place the quit key can be answered while a buffer holds text the
+        // store has never been given. Nothing about it is destructive.
+        app.apply(Action::ToggleHelp).unwrap();
+        assert!(
+            !app.apply(Action::Quit).unwrap(),
+            "an unsaved buffer was quit out of"
+        );
+        assert_eq!(app.modal(), Some(&Modal::Help));
+        assert_eq!(field_value(&app), "half a thought");
+
+        // So closing the overlay lands back in the buffer with the text still
+        // there to save or to discard through the warning that asks.
+        app.apply(Action::Unwind).unwrap();
+        assert_eq!(app.modal(), None);
+        assert_eq!(field_value(&app), "half a thought");
+        assert!(app.surface().unwrap().fields()[0].is_dirty());
     }
 
     #[test]
