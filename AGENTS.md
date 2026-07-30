@@ -23,6 +23,35 @@ or `reviewer.md`, filling in the placeholders. A prompt points at the record and
 never restates it — a decision paraphrased from memory is how an agent ends up
 building the opposite of what was agreed.
 
+## Run the tests under a one-minute timeout
+
+Every test command gets `timeout 60` in front of it:
+
+    timeout 60 cargo test --workspace
+
+The whole suite runs in about six seconds, and its slowest single binary in under
+two, so a minute is ten times the headroom a green run needs. A run that reaches
+the ceiling is therefore not a slow machine: it is a test that is stuck, and by
+far the likeliest cause is a loop driving an operation until a condition holds
+where the operation has gone inert. That failure is silent — no output, no
+failing assertion, one core at full tilt — so it costs far more to diagnose than
+the timeout costs to type.
+
+Compiling is not testing. If the build is cold, build first and time the tests
+separately:
+
+    cargo test --workspace --no-run     # untimed; a cold dependency graph is slow
+    timeout 60 cargo test --workspace
+
+**A timeout is an answer, not bad luck.** Never re-run the same command hoping
+for a different result. Narrow it instead — one test, one thread, output shown:
+
+    timeout 15 cargo test -p <crate> <test-name> -- --nocapture --test-threads=1
+
+And where a test drives an operation until something becomes true, bound the
+loop: a helper that gives up after a bound and says what it was waiting for
+turns a hang into a failure that names itself.
+
 ## Comments & documentation
 
 Comment the **why** and the **invariant**, never the obvious **what**. A comment
