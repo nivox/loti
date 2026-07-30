@@ -2,6 +2,15 @@
 
 Conventions for agents (and humans) working in this repository.
 
+## Handbooks
+
+Work here is split between an implementer and an independent reviewer, and each
+has a handbook under `docs/handbooks/`. Read yours before you start:
+`implementing.md` covers shaping code so its boundaries are observable, which
+behaviour is pinned at which layer, and what to report; `reviewing.md` covers
+running mutations in a sandbox and judging whether the tests could ever have
+failed. The rules below bind regardless of which you are.
+
 ## Comments & documentation
 
 Comment the **why** and the **invariant**, never the obvious **what**. A comment
