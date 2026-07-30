@@ -702,6 +702,22 @@ fn open_the_label_surface(app: &mut App, text: &str) {
     }
 }
 
+/// Stand on the epic's own `assets` row, which is the row an addition would be
+/// offered on if the browser attached payloads at all.
+fn to_the_assets_row(app: &mut App) {
+    app.apply(Action::Descend).unwrap(); // into the epic
+    let index = app
+        .nav()
+        .rows()
+        .iter()
+        .position(|r| r.name == "assets")
+        .expect("every container carries an assets row");
+    app.apply(Action::CursorFirst).unwrap();
+    for _ in 0..index {
+        app.apply(Action::CursorDown).unwrap();
+    }
+}
+
 /// Stand on a ticket's own `blocked-by` row, which is where a blocker is added.
 /// A dependency list belongs to a node — an epic is not a unit of work that can
 /// be blocked — so it is a level deeper than the epic's own collections.
@@ -1405,5 +1421,166 @@ fn a_saved_label_leaves_the_mode_and_the_notice_names_it() {
     assert!(
         members.iter().any(|l| l.contains("shipped")),
         "the label is not in the level it was added to: {members:#?}"
+    );
+}
+
+#[test]
+fn an_asset_deletion_asks_naming_the_asset_and_the_notice_names_it_once_it_is_gone() {
+    let (_dir, store) = fixture();
+    // Two assets to stand among, added before the level is read: a collection with
+    // no members has no row to delete, and one member could not tell the asset the
+    // row names from the whole level.
+    let epic = Target::Epic("browser".into());
+    ops::add_asset(&store, &epic, "sketch.txt", None, b"sketch\n").unwrap();
+    ops::add_asset(&store, &epic, "diagram.png", None, b"\x89PNG\r\n").unwrap();
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    to_the_assets_row(&mut app);
+    app.apply(Action::Descend).unwrap(); // into the assets
+    app.apply(Action::CursorLast).unwrap(); // onto the second of them
+    app.apply(Action::EnterEditing).unwrap();
+    let (before, on_an_asset) = draw(&mut app);
+    // An asset cannot be attached or replaced from the browser, so it is only ever
+    // deleted, and the strip says so on the row that offers it.
+    assert!(
+        on_an_asset[23].contains("d remove"),
+        "{:?}",
+        on_an_asset[23]
+    );
+
+    app.apply(Action::Delete).unwrap();
+    let (after, _) = draw(&mut app);
+    let (before, after) = (cells(&before), cells(&after));
+    let float = box_lines(&after, changed_box(&before, &after));
+    // The question names the asset, because the frozen row is dimmed and the
+    // members of a collection read alike — and what goes here are bytes the store
+    // keeps no tombstone for.
+    assert!(
+        float
+            .iter()
+            .any(|l| l.contains("Delete asset diagram.png?")),
+        "{float:#?}"
+    );
+    for answer in listed_answers(&app) {
+        assert!(
+            float.iter().any(|l| l.contains(&answer)),
+            "{answer:?} is not listed: {float:#?}"
+        );
+    }
+    assert_eq!(dialog_answer_set(&app), Answers::Destructive);
+    // Worded for what this question does, in the store's own verb for an asset:
+    // the destructive letter removes a label on one dialog and deletes bytes here,
+    // so a word shared across dialogs would say the wrong thing on one of them.
+    assert!(float.iter().any(|l| l.contains("d delete")), "{float:#?}");
+    assert!(float.iter().any(|l| l.contains("Esc cancel")), "{float:#?}");
+
+    app.apply(Action::Delete).unwrap();
+    let (_t, lines) = draw(&mut app);
+    // The mode indicator going, the float going and the notice arriving are one
+    // frame, which is what reads as "that finished".
+    assert!(!lines[0].contains("EDITING"), "{:?}", lines[0]);
+    assert!(
+        lines[23].contains("asset diagram.png deleted"),
+        "{:?}",
+        lines[23]
+    );
+    assert!(
+        !lines.iter().skip(1).any(|l| l.contains("Delete asset")),
+        "the float outlived the write: {lines:#?}"
+    );
+    // The asset the row named and no other, and the store was re-read: the level
+    // the reader is standing on holds the survivor alone.
+    let names: Vec<String> = ops::list_assets(&store, &epic)
+        .unwrap()
+        .into_iter()
+        .map(|asset| asset.name)
+        .collect();
+    assert_eq!(names, vec!["sketch.txt".to_string()]);
+    assert!(
+        lines.iter().any(|l| l.contains("sketch.txt")),
+        "the survivor left the level too: {lines:#?}"
+    );
+    // Everything above the strip, because the notice on the strip's own line names
+    // the asset deliberately: what must be gone is the row.
+    assert!(
+        !lines[1..23].iter().any(|l| l.contains("diagram.png")),
+        "the deleted asset is still on screen: {lines:#?}"
+    );
+}
+
+#[test]
+fn the_assets_row_teaches_no_letter_and_names_the_command_that_attaches_one() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    to_the_assets_row(&mut app);
+    app.apply(Action::EnterEditing).unwrap();
+    let (_t, lines) = draw(&mut app);
+
+    // Attaching a payload is picking a file and carrying bytes about, which the
+    // browser does not do at all: the row offers nothing, so the strip teaches no
+    // letter on it — there is no dimmed, present-but-unavailable hint.
+    assert!(!lines[23].contains("a add"), "{:?}", lines[23]);
+    assert!(!lines[23].contains("d remove"), "{:?}", lines[23]);
+    assert!(lines[23].contains("Esc leave"), "{:?}", lines[23]);
+
+    // The letter pressed anyway names the command that does the job, on the strip's
+    // own line, and the mode is still on: a row that offers nothing is not an
+    // implicit exit.
+    app.apply(Action::Add).unwrap();
+    let (_t, signposted) = draw(&mut app);
+    assert!(
+        signposted[23].contains("loti epic asset add browser --file"),
+        "{:?}",
+        signposted[23]
+    );
+    assert!(signposted[0].contains("EDITING"), "{:?}", signposted[0]);
+    // A notice is one line and clipping eats its tail, so the command leads and the
+    // words come after it: what a reader has to retype is what survives a narrow
+    // terminal, and losing the prose in front of it costs them nothing. Asserted as
+    // the ordering rather than as a width, because the reference is as long as the
+    // epic id a reader chose and no width can be promised for all of them.
+    for width in [80u16, 60, 40] {
+        let (_t, narrow) = draw_at(&mut app, width, 24);
+        assert!(
+            narrow[23].trim_start().starts_with("loti epic asset add"),
+            "width {width}: {:?}",
+            narrow[23]
+        );
+    }
+    let (_t, narrow) = draw_at(&mut app, 80, 24);
+    assert!(
+        narrow[23].contains("loti epic asset add browser --file <path>"),
+        "{:?}",
+        narrow[23]
+    );
+    // And nothing was written: the browser has no way to attach one.
+    assert!(ops::list_assets(&store, &Target::Epic("browser".into()))
+        .unwrap()
+        .is_empty());
+
+    // A node's assets are a different command: the noun the command line gives a
+    // node, and the node's own reference. A signpost naming the container the
+    // reader is not standing on sends them to the wrong assets.
+    app.apply(Action::Unwind).unwrap();
+    app.apply(Action::Ascend).unwrap(); // back to the roster
+    app.apply(Action::Descend).unwrap(); // into the epic
+    to_work_row(&mut app);
+    app.apply(Action::Descend).unwrap(); // into the ticket
+    let index = app
+        .nav()
+        .rows()
+        .iter()
+        .position(|r| r.name == "assets")
+        .expect("every container carries an assets row");
+    app.apply(Action::CursorFirst).unwrap();
+    for _ in 0..index {
+        app.apply(Action::CursorDown).unwrap();
+    }
+    app.apply(Action::EnterEditing).unwrap();
+    app.apply(Action::Add).unwrap();
+    let (_t, on_a_ticket) = draw(&mut app);
+    assert!(
+        on_a_ticket[23].contains("loti ticket asset add browser/1 --file"),
+        "{:?}",
+        on_a_ticket[23]
     );
 }

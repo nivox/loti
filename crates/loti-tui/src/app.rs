@@ -90,17 +90,29 @@ pub enum Modal {
     Dialog(Box<Dialog>),
 }
 
-/// What an editing action opens on the frozen row: something to answer, or
-/// something to fill in.
+/// What an editing action does on the frozen row: opens something to answer,
+/// opens something to fill in, or performs nothing and says why.
 ///
-/// The shape of the input decides which: a question with no text to write is a
-/// dialog to answer, and anything the reader has to type is a surface. Both are
-/// what one row offers, so the hint strip and the key consult the same answer.
+/// The shape of the input decides between the first two: a question with no text
+/// to write is a dialog to answer, and anything the reader has to type is a
+/// surface. The third is neither, because one action the browser is asked for is
+/// outside what it does at all.
+///
+/// Invariant: this is the whole of what a letter does on a row, so the hint strip
+/// and the key consult one answer — and only the two that perform something are
+/// hinted, because a letter that writes nothing must not be taught as an action.
 enum Offer {
     /// A question, answered where it stands.
     Ask(Dialog),
     /// A surface to fill in and accept.
     Fill(Surface),
+    /// Nothing for the browser to do, and the notice that says so — naming the
+    /// command line, where the job the browser does not do is done instead.
+    ///
+    /// Not a hint and not a write: the row genuinely offers no action, and a
+    /// reader who presses the letter anyway gets an answer better than "not an
+    /// editing action" rather than being left to guess where else to look.
+    Signpost(String),
 }
 
 /// A dialog: what it says, how it may be answered, what its answers are called,
@@ -706,7 +718,8 @@ impl App {
     ///
     /// Only actions the browser believes it can perform are ever listed, and one
     /// predicate decides both what is listed and what the key does — so the strip
-    /// can never name a letter the row ignores, nor hide one it answers.
+    /// can never name a letter that performs nothing on the row, nor hide one
+    /// that performs something.
     pub fn editing_hints(&self) -> Vec<&'static str> {
         keymap::FOOTER_HINTS_EDITING
             .iter()
@@ -715,19 +728,27 @@ impl App {
             .collect()
     }
 
-    /// Whether the frozen row offers an editing action. Derived from the offer
-    /// itself, so a hint and the key it names cannot disagree about a row.
+    /// Whether the frozen row offers an editing action, which is exactly when the
+    /// strip lists its hint. Derived from the offer itself, so a hint and the key
+    /// it names cannot disagree about a row.
+    ///
+    /// A signpost is not an offer: it performs nothing, so a hint naming its
+    /// letter would teach a key that writes nothing — and a letter that performs
+    /// nothing raises a notice saying why, which is what nothing happening looks
+    /// like everywhere else in the mode.
     fn offers(&self, action: EditingAction) -> bool {
-        self.offer(action).is_some()
+        matches!(self.offer(action), Some(Offer::Ask(_) | Offer::Fill(_)))
     }
 
     /// What an editing action opens on the frozen row, or `None` where the row does
     /// not offer that action.
     ///
-    /// Invariant: this is the whole of what a row offers — both the hint strip and
-    /// the key ask it — and it is exhaustive over the editing actions, so an
-    /// action added without deciding which rows offer it does not compile rather
-    /// than showing a hint no key answers.
+    /// Invariant: this is the whole of what a letter does on a row — both the hint
+    /// strip and the key ask it — and it is exhaustive over the editing actions, so
+    /// an action added without deciding which rows offer it does not compile rather
+    /// than showing a hint no key answers. A row that performs nothing but has
+    /// something to say says it here too, so the wording of a letter's outcome and
+    /// the decision that it performs nothing cannot be made in two places.
     ///
     /// A question names the object, because the frozen row is dimmed and the
     /// members of a collection read alike: an unnamed question would not say what
@@ -748,6 +769,24 @@ impl App {
                 Selection::Collection(container @ Container::Node(_), Collection::BlockedBy) => {
                     Some(Offer::Fill(Surface::add_blocker(
                         target.clone(),
+                        container.selection().reference(),
+                    )))
+                }
+                // Attaching a payload is picking a file and carrying bytes about,
+                // which the command line does and the browser does not do at all,
+                // so this row performs nothing and names the command that does the
+                // job — the container's own, since an epic's assets and a node's
+                // assets are different commands.
+                //
+                // The command comes first and the prose after it, because a notice
+                // is one line and clipping eats the tail: a reader who has to retype
+                // something needs all of it, and losing the words in front of it
+                // costs them nothing. A long reference on a narrow terminal would
+                // otherwise take the flag off the end.
+                Selection::Collection(container, Collection::Assets) => {
+                    Some(Offer::Signpost(format!(
+                        "loti {} asset add {} --file <path> — assets are attached from the command line",
+                        container.cli_noun(),
                         container.selection().reference(),
                     )))
                 }
@@ -779,6 +818,18 @@ impl App {
                         "cancel",
                     )))
                 }
+                // An asset cannot be added or replaced from the browser, so it is
+                // only ever deleted — and the deletion is hard: the bytes go with
+                // the entry, and this question is the only thing in front of them.
+                Selection::Asset(_, name) => Some(Offer::Ask(Dialog::confirm(
+                    format!("Delete asset {name}?"),
+                    "delete",
+                    Performs::Write {
+                        write: data::Write::DeleteAsset(target.clone()),
+                        done: format!("asset {name} deleted"),
+                    },
+                    "cancel",
+                ))),
                 _ => None,
             },
         }
@@ -1124,6 +1175,10 @@ impl App {
             _ => match EditingAction::for_intent(action).and_then(|a| self.offer(a)) {
                 Some(Offer::Ask(dialog)) => self.modal = Some(Modal::Dialog(Box::new(dialog))),
                 Some(Offer::Fill(surface)) => self.surface = Some(surface),
+                // Nothing is written and nothing opens: the row said where the job
+                // is done instead, which is the same channel as any other reason
+                // nothing happened.
+                Some(Offer::Signpost(notice)) => self.flash(notice),
                 None => self.flash(NOT_AN_EDITING_ACTION),
             },
         }
@@ -1376,6 +1431,24 @@ mod tests {
         app.apply(Action::Descend).unwrap();
     }
 
+    /// Stand on the epic's own `assets` row, which is the row an addition would be
+    /// offered on if the browser attached payloads at all.
+    fn to_the_assets_row(app: &mut App) {
+        to_the_roster(app);
+        app.apply(Action::Descend).unwrap(); // into the epic
+        to_row(
+            app,
+            |kind| matches!(kind, RowKind::Collection(c) if c.name() == "assets"),
+        );
+    }
+
+    /// Stand on the first asset of the epic's own assets level, which is where a
+    /// deletion is offered.
+    fn to_an_asset_row(app: &mut App) {
+        to_the_assets_row(app);
+        app.apply(Action::Descend).unwrap();
+    }
+
     /// Open the blocker surface, the way a reader does: freeze the dependency
     /// list's row and press the letter that adds a member to it.
     fn open_the_blocker_surface(app: &mut App) {
@@ -1523,7 +1596,13 @@ mod tests {
                         app.surface().is_none(),
                         "{action:?} is not hinted but the key opened a surface"
                     );
-                    assert_eq!(app.flash_message(), Some(NOT_AN_EDITING_ACTION));
+                    // An unhinted letter performs nothing and says why: either the
+                    // mode's own wording, or the row's where it has somewhere
+                    // better to send the reader. Silence would read as a broken key.
+                    assert!(
+                        app.flash_message().is_some(),
+                        "{action:?} is not hinted and said nothing"
+                    );
                 }
             }
             app.clear_flash();
@@ -2192,6 +2271,10 @@ mod tests {
         app.apply(Action::Unwind).unwrap();
         app.apply(Action::Ascend).unwrap();
 
+        // Every other collection of the epic's level opens nothing either, and
+        // none of them lists the letter. What each says when the letter is pressed
+        // anyway differs: the assets row has somewhere to send the reader and says
+        // so, which its own test pins.
         for other in ["comments", "assets"] {
             to_the_roster(&mut app);
             app.apply(Action::Descend).unwrap(); // into the epic
@@ -2200,12 +2283,29 @@ mod tests {
                 |kind| matches!(kind, RowKind::Collection(c) if c.name() == other),
             );
             app.apply(Action::EnterEditing).unwrap();
+            // Cleared first, because a notice lives five seconds: one left over
+            // from an earlier row would answer for this one.
+            app.clear_flash();
             app.apply(Action::Add).unwrap();
             assert!(
                 app.surface().is_none(),
                 "the {other} row opened the label surface"
             );
-            assert_eq!(app.flash_message(), Some(NOT_AN_EDITING_ACTION), "{other}");
+            // The exact wording, not merely that something was said: a row that
+            // raised another row's notice would send the reader to the wrong
+            // command, which is worse than saying nothing.
+            match other {
+                "assets" => assert!(
+                    app.flash_message()
+                        .is_some_and(|notice| notice.contains("asset add")),
+                    "{other} did not name the command that attaches one"
+                ),
+                _ => assert_eq!(
+                    app.flash_message(),
+                    Some(NOT_AN_EDITING_ACTION),
+                    "{other} said something other than the mode's own wording"
+                ),
+            }
             assert!(app.editing_hints().is_empty(), "{other}");
             app.apply(Action::Unwind).unwrap();
         }
@@ -3077,6 +3177,171 @@ mod tests {
         // The store is re-read with it: an entry that no longer exists must not stay
         // on screen for the next keypress to act on.
         assert!(app.nav().rows().iter().all(|r| r.label != blocker));
+    }
+
+    #[test]
+    fn an_asset_deletion_asks_naming_the_asset_and_a_cancel_changes_nothing() {
+        let (fx, mut app) = app();
+        to_an_asset_row(&mut app);
+        let asset = row_label(&app);
+        app.apply(Action::EnterEditing).unwrap();
+        // The browser cannot attach or replace an asset, so its row offers a
+        // deletion and nothing else, and the strip lists exactly that.
+        assert_eq!(app.editing_hints(), vec![hint_for(EditingAction::Delete)]);
+        hints_and_keys_agree(&mut app);
+
+        app.apply(Action::Delete).unwrap();
+        // The question names the asset: the frozen row is dimmed and the members of
+        // a collection read alike, so an unnamed question would not say what goes —
+        // and here what goes are bytes the store keeps no tombstone for.
+        let Some(Modal::Dialog(dialog)) = app.modal() else {
+            panic!(
+                "a deletion is gated behind a confirmation: {:?}",
+                app.modal()
+            )
+        };
+        assert!(dialog.message().contains(&asset), "{dialog:?}");
+        assert_eq!(dialog.answers(), Answers::Destructive);
+        assert!(fx.epic_assets().contains(&asset), "asking wrote something");
+
+        // The answer that is never destructive, here as everywhere else — and it
+        // unwinds one layer: the question goes and the mode stays on its row.
+        app.apply(Action::Unwind).unwrap();
+        assert_eq!(app.modal(), None);
+        assert!(
+            fx.epic_assets().contains(&asset),
+            "a cancel wrote something"
+        );
+        assert_eq!(app.mode(), Mode::Editing);
+        assert_eq!(row_label(&app), asset);
+        assert_eq!(app.flash_message(), None, "nothing happened worth saying");
+    }
+
+    #[test]
+    fn a_confirmed_asset_deletion_takes_the_asset_the_row_names_and_no_other() {
+        let (fx, mut app) = app();
+        // Two assets, so the asset the row names is a claim rather than a
+        // coincidence: with one, a deletion that emptied the level would pass.
+        let added = fx.another_asset();
+        let before = fx.epic_assets();
+        assert!(before.len() > 1, "the promise needs more than one asset");
+
+        to_an_asset_row(&mut app);
+        // The last row rather than the first: an asset that is only ever at the top
+        // could not tell the one the row names from the one the level leads with.
+        app.apply(Action::CursorLast).unwrap();
+        let asset = row_label(&app);
+        assert_eq!(asset, added, "the cursor is not on the asset just added");
+        app.apply(Action::EnterEditing).unwrap();
+
+        // The letter that asks is the letter that answers: one key for everything
+        // destructive, learned once.
+        app.apply(Action::Delete).unwrap();
+        app.apply(Action::Delete).unwrap();
+
+        assert_eq!(app.modal(), None);
+        let survivors: Vec<String> = before.into_iter().filter(|a| *a != asset).collect();
+        assert_eq!(fx.epic_assets(), survivors);
+        assert!(
+            !survivors.is_empty(),
+            "an asset the row did not name went too"
+        );
+        // A successful write ends the session and says what it did, naming the
+        // asset, because by the time the notice is read its row is gone.
+        assert_eq!(app.editing_target(), None);
+        assert_eq!(app.mode(), Mode::Browse);
+        let notice = app.flash_message().expect("every write says what it did");
+        assert!(notice.contains(&asset), "{notice:?}");
+        // The store is re-read with it: a row that no longer exists must not stay on
+        // screen for the next keypress to act on.
+        assert!(app.nav().rows().iter().all(|r| r.label != asset));
+    }
+
+    #[test]
+    fn a_refused_asset_deletion_carries_the_stores_own_words_and_keeps_the_session_on() {
+        let (fx, mut app) = app();
+        to_an_asset_row(&mut app);
+        let target = app.nav().frame().current().unwrap().selection.clone();
+        app.apply(Action::EnterEditing).unwrap();
+
+        // Only the store can judge a write, so the browser offers the action and
+        // shows what comes back: here the entity goes between offer and answer.
+        fx.remove_the_epics_file();
+        app.apply(Action::Delete).unwrap();
+        app.apply(Action::Delete).unwrap();
+
+        // Verbatim, so the browser and the CLI teach the same rule in the same
+        // words: compared against the message the seam itself produces, never a
+        // string spelled out here, which is what a reworded refusal would pass.
+        let refusal = data::perform(&fx.store, &data::Write::DeleteAsset(target))
+            .expect_err("the store refuses an asset deletion on a missing entity")
+            .to_string();
+        assert_eq!(
+            app.modal(),
+            Some(&Modal::Dialog(Box::new(Dialog::refusal(refusal))))
+        );
+        assert_eq!(app.mode(), Mode::Dialog(Answers::Acknowledge));
+        assert_eq!(app.flash_message(), None, "a failure is never a notice");
+
+        // Only a successful write ends the session, so dismissing lands back in it.
+        app.apply(Action::Unwind).unwrap();
+        assert_eq!(app.modal(), None);
+        assert!(app.editing_target().is_some());
+        assert_eq!(app.mode(), Mode::Editing);
+    }
+
+    #[test]
+    fn the_assets_row_offers_nothing_and_names_the_command_that_attaches_one() {
+        let (fx, mut app) = app();
+        let before = fx.epic_assets();
+        to_the_assets_row(&mut app);
+        app.apply(Action::EnterEditing).unwrap();
+
+        // Attaching a payload is picking a file and carrying bytes about, which the
+        // browser does not do at all: the row offers no action, so the strip lists
+        // no letter for it — there is no dimmed, present-but-unavailable hint.
+        assert!(app.editing_hints().is_empty());
+        hints_and_keys_agree(&mut app);
+
+        // The letter pressed anyway writes nothing, opens nothing, and names the
+        // command that does the job instead — the epic's own, since an epic's assets
+        // and a node's assets are different commands.
+        app.apply(Action::Add).unwrap();
+        assert!(app.surface().is_none(), "the assets row opened a surface");
+        assert_eq!(app.modal(), None, "the assets row raised a dialog");
+        assert_eq!(fx.epic_assets(), before, "the signpost wrote something");
+        let notice = app.flash_message().expect("the row says where to go");
+        assert!(
+            notice.contains(&format!("loti epic asset add {} --file", fx.epic)),
+            "{notice:?}"
+        );
+        // And the mode is still on: a letter a row does not offer is not an
+        // implicit exit.
+        assert!(app.editing_target().is_some());
+        assert_eq!(app.mode(), Mode::Editing);
+        app.apply(Action::Unwind).unwrap();
+
+        // A node's assets are reached by the noun the command line gives a node,
+        // and by the node's own reference: a signpost naming the container the
+        // reader is not standing on sends them to the wrong assets.
+        to_the_roster(&mut app);
+        app.apply(Action::Descend).unwrap(); // into the epic
+        to_work_row(&mut app);
+        app.apply(Action::Descend).unwrap(); // into the ticket
+        let node = app.nav().crumbs().len();
+        assert!(node > 2, "the cursor is not inside a ticket");
+        to_row(
+            &mut app,
+            |kind| matches!(kind, RowKind::Collection(c) if c.name() == "assets"),
+        );
+        app.apply(Action::EnterEditing).unwrap();
+        app.apply(Action::Add).unwrap();
+        let (_, reference) = fx.node_reference_forms();
+        let notice = app.flash_message().expect("the row says where to go");
+        assert!(
+            notice.contains(&format!("loti ticket asset add {reference} --file")),
+            "{notice:?}"
+        );
     }
 
     #[test]

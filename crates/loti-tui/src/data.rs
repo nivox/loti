@@ -51,6 +51,20 @@ impl Container {
         }
     }
 
+    /// The noun the command line addresses this container by, for a message that
+    /// tells a reader which command does a job the browser does not.
+    ///
+    /// Invariant: a container's assets and a node's assets are different commands,
+    /// so a message naming one has to name the container's own — and every node is
+    /// a `ticket` there, subtickets included, because the command line has no
+    /// second noun for a node with a parent.
+    pub fn cli_noun(&self) -> &'static str {
+        match self {
+            Container::Epic(_) => "epic",
+            Container::Node(_) => "ticket",
+        }
+    }
+
     /// The core-side target, so every collection call names the container once.
     fn target(&self) -> Target {
         match self {
@@ -587,6 +601,8 @@ pub enum Write {
     AddBlocker(Selection, String),
     /// Take one entry off the dependency list it sits on.
     RemoveBlocker(Selection),
+    /// Take one asset off the container it hangs on, index entry and bytes alike.
+    DeleteAsset(Selection),
 }
 
 /// Carry out a write, returning the store's own refusal when it refuses.
@@ -600,6 +616,7 @@ pub fn perform(store: &Store, write: &Write) -> Result<()> {
         Write::RemoveLabel(selection) => remove_label(store, selection),
         Write::AddBlocker(selection, reference) => add_blocker(store, selection, reference),
         Write::RemoveBlocker(selection) => remove_blocker(store, selection),
+        Write::DeleteAsset(selection) => delete_asset(store, selection),
     }
 }
 
@@ -680,6 +697,29 @@ fn remove_blocker(store: &Store, selection: &Selection) -> Result<()> {
     };
     ops::remove_blocked_by(store, node, std::slice::from_ref(blocker))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
+
+/// Take one asset off the container it hangs on.
+///
+/// An asset is only ever deleted from the browser: attaching one is file-picking
+/// and binary round-tripping, which the command line does and the browser does
+/// not, so there is no addition here for a deletion to be the other half of.
+///
+/// The deletion is hard — the index entry and the bytes both go, and the store
+/// keeps no tombstone for an asset the way it does for a comment — which is what
+/// the confirmation in front of it is for.
+///
+/// No stamp guards this write, for the same reason a label removal carries none:
+/// a stamp is the precondition of a free-form replacement, and taking one member
+/// out of a collection cannot silently discard text someone else wrote.
+fn delete_asset(store: &Store, selection: &Selection) -> Result<()> {
+    // Only an asset row offers a deletion, so any other selection is a caller
+    // that has lost track of what its row points at.
+    let Selection::Asset(container, name) = selection else {
+        anyhow::bail!("{} is not an asset", selection.reference())
+    };
+    ops::delete_asset(store, &container.target(), name).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
 }
 
@@ -833,12 +873,9 @@ fn asset_document(store: &Store, container: &Container, name: &str) -> Result<St
             }
         }
         None => {
-            let noun = match container {
-                Container::Epic(_) => "epic",
-                Container::Node(_) => "ticket",
-            };
             doc.push_str(&format!(
-                "_Not text, so it is not shown. Write the bytes out with_\n\n```\nloti {noun} asset show {} {name}\n```\n",
+                "_Not text, so it is not shown. Write the bytes out with_\n\n```\nloti {} asset show {} {name}\n```\n",
+                container.cli_noun(),
                 container.selection().reference()
             ));
         }
@@ -938,6 +975,61 @@ pub(crate) mod fixture {
         /// fixture cannot turn a removal test into a false promise.
         pub(crate) fn epic_labels(&self) -> Vec<String> {
             ops::list_labels(&self.store, &Target::Epic(self.epic.clone())).unwrap()
+        }
+
+        /// The names of the assets the epic carries, as the store holds them. A
+        /// test asserts against these rather than against a fixture constant, so a
+        /// richer fixture cannot turn a deletion test into a false promise.
+        pub(crate) fn epic_assets(&self) -> Vec<String> {
+            ops::list_assets(&self.store, &Target::Epic(self.epic.clone()))
+                .unwrap()
+                .into_iter()
+                .map(|asset| asset.name)
+                .collect()
+        }
+
+        /// A further asset on the epic, created on demand, by name.
+        ///
+        /// On demand rather than in the shared fixture: proving a deletion took the
+        /// asset its row named takes two of them, so the count is that test's
+        /// business rather than every other test's.
+        pub(crate) fn another_asset(&self) -> String {
+            let name = "diagram.png".to_string();
+            ops::add_asset(
+                &self.store,
+                &Target::Epic(self.epic.clone()),
+                &name,
+                None,
+                b"\x89PNG\r\n",
+            )
+            .unwrap();
+            name
+        }
+
+        /// An asset on the fixture's *node*, created on demand, by name.
+        ///
+        /// A node and an epic are addressed differently, so a write aimed at the
+        /// wrong one of the two looks correct as long as only epics are tested.
+        pub(crate) fn a_node_asset(&self) -> String {
+            let name = "trace.log".to_string();
+            ops::add_asset(
+                &self.store,
+                &Target::Node(self.node.clone()),
+                &name,
+                None,
+                b"a line\n",
+            )
+            .unwrap();
+            name
+        }
+
+        /// The names of the node's assets, as the store lists them.
+        pub(crate) fn node_assets(&self) -> Vec<String> {
+            ops::list_assets(&self.store, &Target::Node(self.node.clone()))
+                .unwrap()
+                .into_iter()
+                .map(|asset| asset.name)
+                .collect()
         }
 
         /// The ticket's dependency list as a selection: the row an addition acts
@@ -1806,6 +1898,108 @@ mod tests {
             assert!(err.contains(&fx.epic), "{wrong:?}: {err}");
             assert_eq!(fx.node_blockers(), survivors, "{wrong:?} wrote something");
         }
+    }
+
+    #[test]
+    fn an_asset_deletion_takes_the_one_asset_it_names_and_refuses_anything_else() {
+        let fx = Fixture::build();
+        let doomed = fx.another_asset();
+        let before = fx.epic_assets();
+        assert!(before.len() > 1, "the promise needs more than one asset");
+        let container = Container::Epic(fx.epic.clone());
+
+        perform(
+            &fx.store,
+            &Write::DeleteAsset(Selection::Asset(container.clone(), doomed.clone())),
+        )
+        .unwrap();
+        let survivors: Vec<String> = before.iter().filter(|a| **a != doomed).cloned().collect();
+        assert_eq!(fx.epic_assets(), survivors);
+        assert!(!survivors.is_empty(), "every asset went");
+        // Hard, not withheld: the bytes go with the index entry, so the payload is
+        // no longer readable at all. A comment keeps a tombstone; an asset does not.
+        assert!(
+            preview(
+                &fx.store,
+                &Selection::Asset(container.clone(), doomed.clone())
+            )
+            .is_err(),
+            "the bytes outlived the deletion"
+        );
+
+        // A node's assets are addressed differently from an epic's, so a deletion
+        // aimed at the wrong one of the two would pass every test above: the epic
+        // is the only container they use.
+        let on_the_node = fx.a_node_asset();
+        assert!(fx.node_assets().contains(&on_the_node));
+        let before_the_epics = fx.epic_assets();
+        perform(
+            &fx.store,
+            &Write::DeleteAsset(Selection::Asset(
+                Container::Node(fx.node.clone()),
+                on_the_node.clone(),
+            )),
+        )
+        .unwrap();
+        assert!(!fx.node_assets().contains(&on_the_node));
+        assert_eq!(
+            fx.epic_assets(),
+            before_the_epics,
+            "a node's asset was deleted off its epic"
+        );
+
+        // Only an asset row offers a deletion, so any other selection is a caller
+        // that has lost track of what its row points at — refused by name, through
+        // the seam the browser itself writes through, and with nothing written on
+        // the way to refusing. The collection's own row is refused too, though it
+        // names the same container: a deletion acts on one member, and the row
+        // pointing at the whole collection is not that row.
+        for wrong in [
+            fx.epic_selection(),
+            Selection::Collection(container, Collection::Assets),
+        ] {
+            let err = perform(&fx.store, &Write::DeleteAsset(wrong.clone()))
+                .expect_err("only an asset row takes a deletion")
+                .to_string();
+            assert!(err.contains(&fx.epic), "{wrong:?}: {err}");
+            assert_eq!(fx.epic_assets(), survivors, "{wrong:?} wrote something");
+        }
+    }
+
+    #[test]
+    fn an_asset_deletion_the_store_refuses_carries_the_stores_own_message() {
+        let fx = Fixture::build();
+        let asset = fx.epic_assets()[0].clone();
+        let selection = Selection::Asset(Container::Epic(fx.epic.clone()), asset.clone());
+
+        // Whether an asset can be deleted is the store's judgement: the write is
+        // attempted and what comes back is the operation's own message, with no
+        // context wrapped round it and no rule restated in words of the browser's
+        // own — compared against what the operation itself produces, which is what a
+        // wrapped or reworded refusal would fail. Here the entity goes out from
+        // under the write, as a concurrent writer closing the effort out would take
+        // it.
+        fx.remove_the_epics_file();
+        let shown = perform(&fx.store, &Write::DeleteAsset(selection))
+            .expect_err("the store refuses a deletion on a missing entity")
+            .to_string();
+        let its_own = ops::delete_asset(&fx.store, &Target::Epic(fx.epic.clone()), &asset)
+            .expect_err("the store refuses a deletion on a missing entity")
+            .to_string();
+        assert_eq!(shown, its_own);
+    }
+
+    #[test]
+    fn a_container_is_named_by_the_noun_the_command_line_addresses_it_by() {
+        let fx = Fixture::build();
+        // A message that tells a reader which command does a job the browser does
+        // not has to name the command that exists: an epic's collections and a
+        // node's collections are different commands, and every node is a `ticket`
+        // there — a subticket included, since the command line has no second noun
+        // for a node with a parent.
+        assert_eq!(Container::Epic(fx.epic.clone()).cli_noun(), "epic");
+        assert_eq!(Container::Node(fx.node.clone()).cli_noun(), "ticket");
+        assert_eq!(Container::Node(fx.subnode.clone()).cli_noun(), "ticket");
     }
 
     #[test]
