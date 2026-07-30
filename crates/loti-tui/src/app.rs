@@ -86,6 +86,10 @@ const LABEL_FIELD: &str = "label";
 /// out, so the field says so: what the reader types is a token the store
 /// resolves, not prose.
 const BLOCKER_FIELD: &str = "blocker reference";
+/// See [`LABEL_FIELD`]. A claim's holder is freeform text and is not attribution:
+/// it says who is on the work rather than who wrote the change, so the field is
+/// named for the holder and never for an author.
+const CLAIM_FIELD: &str = "claim holder";
 
 /// A transient one-line notice, holding the hint strip's line until its deadline
 /// passes.
@@ -143,6 +147,14 @@ enum Offer {
     /// letter is pressed, which is also the moment the freshness rule names: the
     /// buffer starts from the current text and the stamp is as fresh as the edit.
     Compose(data::FreeForm),
+    /// A write with nothing to fill in and nothing to ask, because the row carries
+    /// everything the write needs: the letter performs it.
+    ///
+    /// A variant of its own rather than a surface with no fields or a question with
+    /// one answer, because both of those would put something on screen for a reader
+    /// to dismiss. What it carries is what a dialog's answer carries, so the write
+    /// and the notice that reports it are still one decision.
+    Perform { write: data::Write, done: String },
     /// Nothing for the browser to do, and the notice that says so — naming the
     /// command line, where the job the browser does not do is done instead.
     ///
@@ -654,6 +666,10 @@ enum Commit {
     /// row names. The browser judges nothing about the reference: what it names,
     /// and whether that may block this, come back from the store.
     AddBlocker(Selection),
+    /// Take the claim on the node the frozen row names, for the holder the field
+    /// holds. No stamp: a claim is not a free-form replacement, and a claim has one
+    /// holder, so taking an already-held one reassigns it.
+    TakeClaim(Selection),
     /// Replace one whole field of the epic or node the frozen row names, guarded by
     /// the stamp that field's text was read at.
     ///
@@ -694,6 +710,22 @@ impl Surface {
             focus: 0,
             placement: Placement::Float,
             commit: Commit::AddBlocker(list),
+        }
+    }
+
+    /// The surface that takes a claim: one short field holding the holder, so it is
+    /// a float for the same reason the label surface is.
+    ///
+    /// It starts empty rather than from the holder already on the row, even though
+    /// taking an already-held claim reassigns it: a claim names who is picking the
+    /// work up, and text the browser put there itself is text nobody chose.
+    fn take_claim(node: Selection) -> Self {
+        Self {
+            title: format!(" claim on {} ", node.reference()),
+            fields: vec![Field::new(CLAIM_FIELD, true, Lines::One)],
+            focus: 0,
+            placement: Placement::Float,
+            commit: Commit::TakeClaim(node),
         }
     }
 
@@ -837,6 +869,17 @@ impl Surface {
                     // bare number is not: by the time it is read the surface that
                     // held the reference is gone.
                     format!("blocker {} added", data::blocker_name(list, &reference)),
+                )
+            }
+            Commit::TakeClaim(node) => {
+                let holder = self.fields[0].value.clone();
+                let reference = node.reference();
+                (
+                    data::Write::TakeClaim(node.clone(), holder.clone()),
+                    // The notice names the ticket and the holder: the surface that
+                    // held the holder is gone by the time it is read, and the row it
+                    // was taken on is one of several that look alike.
+                    format!("claim on {reference} taken by {holder}"),
                 )
             }
             Commit::Replace {
@@ -1045,8 +1088,33 @@ impl App {
     fn offers(&self, action: EditingAction) -> bool {
         matches!(
             self.offer(action),
-            Some(Offer::Ask(_) | Offer::Fill(_) | Offer::Compose(_))
+            Some(Offer::Ask(_) | Offer::Fill(_) | Offer::Compose(_) | Offer::Perform { .. })
         )
+    }
+
+    /// Who holds the claim on the frozen row, or `None` while nobody does — which
+    /// includes a row that cannot be claimed at all.
+    ///
+    /// Taken off the row the mode froze, which is the same value the marker beside
+    /// that row is drawn from, so an offer and the mark the reader is looking at
+    /// cannot disagree. Nothing is read from the store for it: a row is rebuilt
+    /// from the store on every listing, and the offer is asked on every frame.
+    ///
+    /// The row is matched against what the mode is acting on rather than trusted to
+    /// be it, so a holder can never arrive from a row the mode is not on — and only
+    /// a row that stands for work carries one at all.
+    fn frozen_holder(&self, target: &Selection) -> Option<&str> {
+        let row = self.nav.frame().current()?;
+        if row.selection != *target {
+            return None;
+        }
+        match &row.kind {
+            data::RowKind::Work { claimed_by, .. } => claimed_by.as_deref(),
+            data::RowKind::Collection(_)
+            | data::RowKind::Member
+            | data::RowKind::Withdrawn
+            | data::RowKind::Unreadable => None,
+        }
     }
 
     /// What an editing action opens on the frozen row, or `None` where the row does
@@ -1119,6 +1187,31 @@ impl App {
             // the keypress.
             EditingAction::Edit(field) => match target {
                 Selection::Epic(_) | Selection::Node(_) => Some(Offer::Compose(field)),
+                _ => None,
+            },
+            // A claim is taken on a unit of work, so an epic's row is never offered
+            // one and neither is a collection or one of its members. Taking is
+            // reassigning — a claim has one holder — so a held claim is offered the
+            // same letter as an unheld one, and the surface asks who is taking it.
+            EditingAction::TakeClaim => match target {
+                Selection::Node(_) => Some(Offer::Fill(Surface::take_claim(target.clone()))),
+                _ => None,
+            },
+            // The other half of the same noun, offered only while a claim is held:
+            // there is nothing to give up on a row nobody is on. Nothing is typed
+            // and nothing is asked — the row says who holds it, so the letter writes.
+            EditingAction::ReleaseClaim => match target {
+                Selection::Node(_) => {
+                    let holder = self.frozen_holder(target)?;
+                    let reference = target.reference();
+                    Some(Offer::Perform {
+                        write: data::Write::ReleaseClaim(target.clone()),
+                        // The notice names the ticket and who was on it, because by
+                        // the time it is read the mark it removed is gone from the
+                        // row.
+                        done: format!("claim on {reference} released by {holder}"),
+                    })
+                }
                 _ => None,
             },
             EditingAction::Delete => match target {
@@ -1239,6 +1332,8 @@ impl App {
             Action::Add
             | Action::Delete
             | Action::Edit(_)
+            | Action::TakeClaim
+            | Action::ReleaseClaim
             | Action::Overwrite
             | Action::Accept
             | Action::ExternalEditor
@@ -1592,6 +1687,9 @@ impl App {
                 Some(Offer::Ask(dialog)) => self.modal = Some(Modal::Dialog(Box::new(dialog))),
                 Some(Offer::Fill(surface)) => self.surface = Some(surface),
                 Some(Offer::Compose(field)) => self.compose(field),
+                // Nothing to fill in and nothing to ask: the row carried the whole
+                // write, so the letter is the whole interaction.
+                Some(Offer::Perform { write, done }) => self.commit(&write, done),
                 // Nothing is written and nothing opens: the row said where the job
                 // is done instead, which is the same channel as any other reason
                 // nothing happened.
@@ -2111,11 +2209,7 @@ mod tests {
             app.clear_flash();
             assert!(!app.apply(action.intent()).unwrap(), "{action:?} quit");
             match hinted {
-                true => {
-                    assert!(
-                        app.modal().is_some() || app.surface().is_some(),
-                        "{action:?} is hinted but the key opened nothing"
-                    );
+                true if app.modal().is_some() || app.surface().is_some() => {
                     // Back out of what it opened, leaving the mode standing. An
                     // untouched surface has nothing to lose, so it goes without a
                     // question.
@@ -2125,6 +2219,17 @@ mod tests {
                         "{action:?} could not be backed out of"
                     );
                 }
+                // A letter whose write needs nothing typed and nothing answered
+                // performs it where it stands, which ends the session and says what
+                // it did — so the row is frozen again for the rest of the walk.
+                true if app.editing_target().is_none() => {
+                    assert!(
+                        app.flash_message().is_some(),
+                        "{action:?} wrote and said nothing"
+                    );
+                    app.apply(Action::EnterEditing).unwrap();
+                }
+                true => panic!("{action:?} is hinted but the key did nothing"),
                 false => {
                     assert_eq!(
                         app.modal(),
@@ -2835,7 +2940,12 @@ mod tests {
 
     #[test]
     fn every_editing_hint_is_one_some_row_actually_offers() {
-        let (_fx, mut app) = app();
+        let (fx, mut app) = app();
+        // With a claim held somewhere on the tree, because one of the actions is
+        // offered only on a claimed row: on a store where nothing is held, its hint
+        // is unreachable for a reason that is not the one this test is about.
+        fx.claim(&fx.node);
+        app.apply(Action::Reload).unwrap();
         let mut offered = Vec::new();
         collect_offers(&mut app, &mut offered);
         // The strip lists the subset of the editing actions the frozen row offers,
@@ -4644,6 +4754,219 @@ mod tests {
             notice.contains(&format!("loti ticket asset add {reference} --file")),
             "{notice:?}"
         );
+    }
+
+    /// Stand on the fixture's ticket row, inside its epic, which is the row a
+    /// claim is taken and released on: a claim is taken on a unit of work.
+    fn to_the_tickets_row(app: &mut App) {
+        to_the_roster(app);
+        app.apply(Action::Descend).unwrap(); // into the epic
+        to_work_row(app);
+    }
+
+    /// Freeze the ticket's row with a claim already held on it, as another writer
+    /// left it: the row is what says a claim is held, so it has to be re-read
+    /// before the offer is asked.
+    fn freeze_a_claimed_ticket(fx: &Fixture, app: &mut App) -> String {
+        let holder = fx.claim(&fx.node);
+        to_the_tickets_row(app);
+        app.apply(Action::Reload).unwrap();
+        app.apply(Action::EnterEditing).unwrap();
+        holder
+    }
+
+    #[test]
+    fn the_claim_pair_is_offered_on_a_unit_of_work_and_release_only_while_it_is_held() {
+        let (fx, mut app) = app();
+        to_the_tickets_row(&mut app);
+        app.apply(Action::EnterEditing).unwrap();
+
+        // Taking is offered whatever the row's claim state, because taking is
+        // reassigning: a claim has one holder, so there is no second letter for
+        // taking one that is held. Giving up is offered only while one is — there is
+        // nothing to give up on a row nobody is on — and an action a row does not
+        // offer is not listed at all: there is no dimmed, present-but-unavailable
+        // hint anywhere in the mode.
+        let hints = app.editing_hints();
+        assert!(
+            hints.contains(&hint_for(EditingAction::TakeClaim)),
+            "{hints:?}"
+        );
+        assert!(
+            !hints.contains(&hint_for(EditingAction::ReleaseClaim)),
+            "an unclaimed row offered a release: {hints:?}"
+        );
+        hints_and_keys_agree(&mut app);
+        app.apply(Action::Unwind).unwrap();
+
+        // Held, the same row offers both halves of the pair.
+        let holder = freeze_a_claimed_ticket(&fx, &mut app);
+        let hints = app.editing_hints();
+        for action in [EditingAction::TakeClaim, EditingAction::ReleaseClaim] {
+            assert!(hints.contains(&hint_for(action)), "{action:?}: {hints:?}");
+        }
+        // The offer follows the row's own claim rather than a state captured when
+        // the mode was entered: with the claim gone from under the frozen row, the
+        // release is not offered on the next frame.
+        fx.release(&fx.node);
+        app.apply(Action::Reload).unwrap();
+        assert!(
+            !app.editing_hints()
+                .contains(&hint_for(EditingAction::ReleaseClaim)),
+            "a released claim is still offered a release"
+        );
+        assert!(
+            app.editing_target().is_some(),
+            "a claim released elsewhere ended the session"
+        );
+        assert!(!holder.is_empty(), "the fixture claimed for nobody");
+    }
+
+    #[test]
+    fn nothing_but_a_unit_of_works_own_row_is_offered_a_claim() {
+        let (fx, mut app) = app();
+        // A blocker entry reads as work and carries the claim marker, so it is the
+        // row a claim letter would wrongly reach: the entry is a reference to a node
+        // and not that node's own row, which is where its claim is acted on.
+        fx.claim(&fx.blocker);
+        to_a_blocker_row(&mut app);
+        app.apply(Action::Reload).unwrap();
+        app.apply(Action::EnterEditing).unwrap();
+        let hints = app.editing_hints();
+        for action in [EditingAction::TakeClaim, EditingAction::ReleaseClaim] {
+            assert!(!hints.contains(&hint_for(action)), "{action:?}: {hints:?}");
+        }
+        hints_and_keys_agree(&mut app);
+        app.apply(Action::Unwind).unwrap();
+
+        // An epic is not a unit of work, so its row is offered neither half however
+        // its own tickets are claimed.
+        freeze_the_epics_row(&mut app);
+        let hints = app.editing_hints();
+        for action in [EditingAction::TakeClaim, EditingAction::ReleaseClaim] {
+            assert!(!hints.contains(&hint_for(action)), "{action:?}: {hints:?}");
+        }
+        hints_and_keys_agree(&mut app);
+    }
+
+    #[test]
+    fn a_release_is_offered_from_the_frozen_rows_own_claim_and_no_others() {
+        let (fx, mut app) = app();
+        fx.claim(&fx.node);
+        // The holder comes off the frozen row, so the row has to be the row the mode
+        // is acting on: a mode standing somewhere else must not be offered the claim
+        // of whatever the cursor happens to be on, and the offer says so itself
+        // rather than trusting the two to agree.
+        to_the_tickets_row(&mut app);
+        app.apply(Action::Reload).unwrap();
+        app.editing = Some(fx.epic_selection());
+        assert!(!app
+            .editing_hints()
+            .contains(&hint_for(EditingAction::ReleaseClaim)));
+
+        // And the other way round: the mode on the claimed ticket while the cursor
+        // has been put elsewhere is offered nothing off that other row either.
+        app.editing = Some(Selection::Node(fx.node.clone()));
+        app.nav.cursor_first();
+        assert!(!app
+            .editing_hints()
+            .contains(&hint_for(EditingAction::ReleaseClaim)));
+        app.apply(Action::ReleaseClaim).unwrap();
+        assert_eq!(app.flash_message(), Some(NOT_AN_EDITING_ACTION));
+        assert!(
+            fx.node_claim().is_some(),
+            "a release wrote from a row the mode was not on"
+        );
+    }
+
+    #[test]
+    fn taking_a_claim_asks_who_is_taking_it_and_sends_nothing_without_one() {
+        let (fx, mut app) = app();
+        to_the_tickets_row(&mut app);
+        app.apply(Action::EnterEditing).unwrap();
+        app.apply(Action::TakeClaim).unwrap();
+
+        let surface = app.surface().expect("the letter opened a surface");
+        // One short field, empty and untouched: the holder is freeform text the
+        // reader supplies, and nothing the browser put there itself — the holder
+        // already on the row included — could be who is picking the work up now.
+        assert_eq!(surface.fields().len(), 1);
+        assert_eq!(surface.focus(), 0);
+        assert_eq!(surface.fields()[0].value(), "");
+        assert!(!surface.fields()[0].is_dirty());
+        assert_eq!(surface.placement(), Placement::Float);
+        // The float says which ticket is being claimed, since it covers the row it
+        // was opened from.
+        let (_, reference) = fx.node_reference_forms();
+        assert!(
+            surface.title().contains(&reference),
+            "{:?}",
+            surface.title()
+        );
+        assert_eq!(app.mode(), surface_mode(Fields::One, Lines::One));
+
+        // A claim with no holder is a row marked for nobody, so an accepted empty
+        // field warns naming it and sends nothing — the browser refusing to send a
+        // field the reader never filled in, not a store rule reimplemented.
+        app.apply(Action::Accept).unwrap();
+        let Some(Modal::Dialog(dialog)) = app.modal() else {
+            panic!("an empty holder wrote or said nothing: {:?}", app.modal())
+        };
+        assert!(dialog.message().contains(CLAIM_FIELD), "{dialog:?}");
+        assert_eq!(fx.node_claim(), None, "the warning wrote something");
+    }
+
+    #[test]
+    fn the_holder_asked_for_is_empty_even_where_somebody_already_holds_the_claim() {
+        let (fx, mut app) = app();
+        let held = freeze_a_claimed_ticket(&fx, &mut app);
+        assert!(!held.is_empty(), "the fixture claimed for nobody");
+
+        app.apply(Action::TakeClaim).unwrap();
+        let surface = app.surface().expect("the letter opened a surface");
+        // Seeding the field with whoever holds it now would make the save key alone
+        // enough to write that same holder back and report the claim as taken, so a
+        // reader who meant to take it would be told they had while nothing moved.
+        // Who is picking the work up is never something the browser can supply.
+        assert_eq!(
+            surface.fields()[0].value(),
+            "",
+            "the field was seeded with the holder it is replacing"
+        );
+        assert!(!surface.fields()[0].is_dirty());
+
+        // And the previous holder is still on the row underneath: the surface asks
+        // rather than assuming, and asking has not written anything yet.
+        assert_eq!(fx.node_claim().map(|c| c.by), Some(held));
+    }
+
+    #[test]
+    fn a_claim_taken_ends_the_session_and_a_release_asks_nothing_at_all() {
+        let (fx, mut app) = app();
+        to_the_tickets_row(&mut app);
+        app.apply(Action::EnterEditing).unwrap();
+        app.apply(Action::TakeClaim).unwrap();
+        type_into(&mut app, "a human");
+        app.apply(Action::Accept).unwrap();
+
+        // A session is one edit long, so the write that succeeded ends it, surface
+        // and all: the notice arriving as the mode indicator goes is what reads as
+        // "that finished".
+        assert_eq!(app.modal(), None);
+        assert!(app.surface().is_none());
+        assert_eq!(app.editing_target(), None);
+        assert_eq!(app.mode(), Mode::Browse);
+
+        // Giving it up again needs nothing typed and asks nothing: the row carries
+        // the claim, so the letter is the whole interaction — a confirmation is what
+        // stands in front of a deletion, and a claim is state on a unit of work.
+        app.apply(Action::EnterEditing).unwrap();
+        app.apply(Action::ReleaseClaim).unwrap();
+        assert_eq!(app.modal(), None, "a release asked something");
+        assert!(app.surface().is_none(), "a release opened a surface");
+        assert_eq!(app.editing_target(), None);
+        assert_eq!(app.mode(), Mode::Browse);
+        assert!(fx.node_claim().is_none(), "the claim is still held");
     }
 
     #[test]

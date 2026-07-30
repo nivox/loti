@@ -96,6 +96,12 @@ pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
         (KeyCode::Char('S'), false) if matches!(mode, Mode::Editing) => {
             Action::Edit(FreeForm::Summary)
         }
+        // The one shift-pair whose halves are the same noun: the letter takes the
+        // claim and the shifted letter gives it up. Giving up is the shifted half
+        // because it is offered only while a claim is held, so it is the rarer of
+        // the two.
+        (KeyCode::Char('c'), false) if matches!(mode, Mode::Editing) => Action::TakeClaim,
+        (KeyCode::Char('C'), false) if matches!(mode, Mode::Editing) => Action::ReleaseClaim,
 
         // Session. `F1` is a help key beside `?` everywhere, because inside a
         // field `?` is a literal character and a reader must not have to learn a
@@ -255,8 +261,14 @@ pub const HELP: &[(&str, &str)] = &[
     ("Enter / l / →", "open the row; a line break in a text area"),
     ("Backspace / h / ←", "leave the level"),
     ("Esc", "leave the level, a field, or editing mode"),
-    ("Ctrl-D / Ctrl-U", "scroll the preview half a screen"),
-    ("PgDn / PgUp / Space", "scroll the preview a screen"),
+    // Both ways of scrolling the preview on one row, because the list is as tall
+    // as the shortest terminal the browser supports and a row past that is
+    // clipped without saying so: the keys that page it and the keys that page half
+    // of it are one group, read together.
+    (
+        "PgDn / PgUp / Space",
+        "scroll the preview a screen; Ctrl-D / Ctrl-U half",
+    ),
     (
         "Home / End",
         "preview start / end; a field line's ends inside one",
@@ -272,6 +284,7 @@ pub const HELP: &[(&str, &str)] = &[
         "n / S / b",
         "editing mode: the name / the summary / the body",
     ),
+    ("c / C", "editing mode: take the claim / release it"),
     ("Ctrl-S", "save, whichever field you are in"),
     ("Tab / Shift-Tab", "next / previous field"),
     ("Ctrl-G", "edit the open field in $EDITOR"),
@@ -318,6 +331,8 @@ pub const FOOTER_HINTS_EDITING: &[(EditingAction, &str)] = &[
     (EditingAction::Edit(FreeForm::Name), "n name"),
     (EditingAction::Edit(FreeForm::Summary), "S summary"),
     (EditingAction::Edit(FreeForm::Body), "b body"),
+    (EditingAction::TakeClaim, "c claim"),
+    (EditingAction::ReleaseClaim, "C release"),
 ];
 
 /// The droppable hints of an open surface, ranked rather than in key order: they
@@ -1030,6 +1045,40 @@ mod tests {
                 Some(Action::MoveDown),
                 "{mode:?}"
             );
+        }
+    }
+
+    #[test]
+    fn the_claim_pair_is_one_letter_and_its_shift_and_neither_is_the_control_key() {
+        // Two halves of one noun, so a reader learns the letter once: unshifted takes
+        // the claim, shifted gives it up. Distinct intents, because a single one with
+        // a direction would let the letter that takes answer for the letter that
+        // releases.
+        assert_eq!(
+            action_for(plain(KeyCode::Char('c')), Mode::Editing),
+            Some(Action::TakeClaim)
+        );
+        assert_eq!(
+            action_for(plain(KeyCode::Char('C')), Mode::Editing),
+            Some(Action::ReleaseClaim)
+        );
+        // The letter takes no control combination with it: Ctrl-C is the way out of
+        // a mode and the way out of the browser, and neither may become a write.
+        for mode in [Mode::Browse, Mode::Editing] {
+            for intent in [Action::TakeClaim, Action::ReleaseClaim] {
+                assert_ne!(action_for(ctrl('c'), mode), Some(intent), "{mode:?}");
+            }
+        }
+        // And inside a field both are characters rather than the actions they carry
+        // one layer up, the shifted one included.
+        for mode in surface_modes() {
+            for letter in ['c', 'C'] {
+                assert_eq!(
+                    action_for(plain(KeyCode::Char(letter)), mode),
+                    Some(Action::Insert(letter)),
+                    "{letter:?} in {mode:?}"
+                );
+            }
         }
     }
 

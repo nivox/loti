@@ -1049,6 +1049,111 @@ fn the_roster_is_never_marked_however_the_epics_tickets_are_claimed() {
     assert_eq!(nav_pane(&terminal, width), before);
 }
 
+/// Type into the open field, one keystroke per character, as a reader does.
+fn type_into(app: &mut App, text: &str) {
+    for c in text.chars() {
+        app.apply(Action::Insert(c)).unwrap();
+    }
+}
+
+/// Put the cursor on the epic's first ticket and freeze it, which is the row a
+/// claim is taken and released on.
+fn freeze_a_ticket(app: &mut App) {
+    app.apply(Action::Descend).unwrap(); // into the epic
+    to_work_row(app);
+    app.apply(Action::EnterEditing).unwrap();
+}
+
+/// What a browser opened again on the store shows in the preview for the ticket a
+/// claim was taken on: the pane as the next session reads it.
+///
+/// A second browser rather than the one that wrote, because the pane a committed
+/// write leaves behind is not re-rendered while the cursor has not moved off the
+/// row — so reading it there would assert the browser's own staleness rather than
+/// what the store now holds.
+fn preview_of_the_ticket_after_reopening(store: &Store, nav_width: u16) -> Vec<String> {
+    let mut reopened = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    reopened.apply(Action::Descend).unwrap();
+    to_work_row(&mut reopened);
+    let (terminal, _) = draw(&mut reopened);
+    preview_side(&terminal, nav_width)
+}
+
+#[test]
+fn a_claim_taken_from_the_browser_marks_the_row_and_names_the_ticket_in_the_notice() {
+    let (_dir, store) = fixture();
+    // Colour disabled: what a reader has to be able to read here is the mark and
+    // the words, neither of which is a colour.
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    let width = nav_pane_width(&app);
+    freeze_a_ticket(&mut app);
+
+    // The whole interaction: the letter, the holder, the save key.
+    app.apply(Action::TakeClaim).unwrap();
+    type_into(&mut app, "a human");
+    app.apply(Action::Accept).unwrap();
+    let (terminal, lines) = draw(&mut app);
+    let rows = nav_pane(&terminal, width);
+
+    // The row the claim was taken on is marked, and the one beside it is not: the
+    // column is the level's, so a level of one row could not tell a mark that
+    // follows the claim from one drawn on every work row.
+    let (claimed, at) = row_and_name_column(&rows, "Navigation pane");
+    assert_eq!(&claimed[at - 2..at], "@ ", "{claimed:?}");
+    let (unclaimed, at) = row_and_name_column(&rows, "Preview pane");
+    assert_eq!(&unclaimed[at - 2..at], "  ", "{unclaimed:?}");
+
+    // The notice names the ticket, because the mode indicator has gone with the
+    // session and the mark it left is one character on one row.
+    assert!(lines[23].contains("browser/1"), "{:?}", lines[23]);
+    assert!(lines[23].contains("a human"), "{:?}", lines[23]);
+
+    // And the holder reaches the preview, which is where a claim's identity lives:
+    // the mark answers "is anyone on this", the pane answers who.
+    let preview = preview_of_the_ticket_after_reopening(&store, width);
+    assert!(
+        preview.iter().any(|l| l.contains("a human")),
+        "the preview does not name the holder: {preview:#?}"
+    );
+}
+
+#[test]
+fn a_claim_released_from_the_browser_unmarks_the_row_and_names_the_ticket() {
+    let (_dir, store) = fixture();
+    let node = NodeRef::new("browser", 1);
+    let holder = claim(&store, &node);
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    let width = nav_pane_width(&app);
+    freeze_a_ticket(&mut app);
+    let (before, _) = draw(&mut app);
+    let marked = nav_pane(&before, width);
+    let (row, at) = row_and_name_column(&marked, "Navigation pane");
+    assert_eq!(&row[at - 2..at], "@ ", "the row starts unmarked: {row:?}");
+
+    // Nothing typed and nothing answered: the row carries the claim, so the letter
+    // is the whole interaction.
+    app.apply(Action::ReleaseClaim).unwrap();
+    let (terminal, lines) = draw(&mut app);
+    let rows = nav_pane(&terminal, width);
+
+    // Nothing on the level is held any more, so the column costs the level nothing
+    // again: the mark and the width it took are both gone.
+    let (row, at) = row_and_name_column(&rows, "Navigation pane");
+    assert_eq!(&row[at - 2..at], "  ", "{row:?}");
+    assert!(
+        !rows.iter().any(|l| l.contains('@')),
+        "a released level still spends width on the column: {rows:#?}"
+    );
+    assert!(lines[23].contains("browser/1"), "{:?}", lines[23]);
+
+    // And the holder is gone from the preview too, which is where it was named.
+    let preview = preview_of_the_ticket_after_reopening(&store, width);
+    assert!(
+        !preview.iter().any(|l| l.contains(&holder)),
+        "the preview still names {holder:?}: {preview:#?}"
+    );
+}
+
 #[test]
 fn a_blocker_row_is_marked_like_the_work_row_it_reads_as() {
     let (_dir, store) = fixture();

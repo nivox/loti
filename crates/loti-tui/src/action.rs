@@ -219,6 +219,14 @@ pub enum EditingAction {
     /// read and asked about the same way on a conflict, so a further replaceable
     /// field is a field here rather than another path through all of that.
     Edit(FreeForm),
+    /// Take the claim on the frozen row, for a holder the reader types — which
+    /// reassigns it when it is already held, because a claim has one holder.
+    TakeClaim,
+    /// Give up the claim on the frozen row.
+    ///
+    /// Offered only while a claim is held: the pair's two halves are the same
+    /// noun, and there is nothing to give up on a row nobody is on.
+    ReleaseClaim,
 }
 
 impl EditingAction {
@@ -234,6 +242,8 @@ impl EditingAction {
         EditingAction::Edit(FreeForm::Name),
         EditingAction::Edit(FreeForm::Summary),
         EditingAction::Edit(FreeForm::Body),
+        EditingAction::TakeClaim,
+        EditingAction::ReleaseClaim,
     ];
 
     /// The intent a key carries for this action. The state machine reads an
@@ -243,6 +253,8 @@ impl EditingAction {
             EditingAction::Add => Action::Add,
             EditingAction::Delete => Action::Delete,
             EditingAction::Edit(field) => Action::Edit(field),
+            EditingAction::TakeClaim => Action::TakeClaim,
+            EditingAction::ReleaseClaim => Action::ReleaseClaim,
         }
     }
 
@@ -311,6 +323,14 @@ pub enum Action {
     /// Replace one whole field of what editing mode is acting on, which opens a
     /// surface on that field's text as the store holds it now.
     Edit(FreeForm),
+    /// Take the claim on what editing mode is acting on, which opens a surface
+    /// for the holder. A claim has one holder, so taking an already-held claim
+    /// reassigns it.
+    TakeClaim,
+    /// Give up the claim on what editing mode is acting on. Nothing is typed and
+    /// nothing is asked: the row carries the claim, so the write is what the key
+    /// performs.
+    ReleaseClaim,
     /// Write anyway, over a change that landed under the open buffer. The
     /// affirmative answer of the one question whose two answers both lose
     /// something, which is why it is not the destructive letter: what this throws
@@ -374,7 +394,10 @@ mod tests {
         // and the counts make leaving it out of the list a failure here.
         for action in EditingAction::ALL {
             match action {
-                EditingAction::Add | EditingAction::Delete => {}
+                EditingAction::Add
+                | EditingAction::Delete
+                | EditingAction::TakeClaim
+                | EditingAction::ReleaseClaim => {}
                 // Every replaceable field is an action of its own, so a field
                 // added without a key and a hint fails here rather than being an
                 // action no reader can reach.
@@ -383,7 +406,7 @@ mod tests {
                 },
             }
         }
-        assert_eq!(EditingAction::ALL.len(), 2 + FreeForm::ALL.len());
+        assert_eq!(EditingAction::ALL.len(), 4 + FreeForm::ALL.len());
         for field in FreeForm::ALL {
             assert!(
                 EditingAction::ALL.contains(&EditingAction::Edit(*field)),
@@ -463,6 +486,13 @@ mod tests {
         assert_eq!(EditingAction::for_intent(Action::MoveUp), None);
         assert_eq!(EditingAction::for_intent(Action::MoveDown), None);
         assert_eq!(EditingAction::for_intent(Action::Overwrite), None);
+        // And the two halves of the claim pair are two actions rather than one
+        // with a direction: an intent that took a claim where it should release it
+        // would be the one letter answering for the other.
+        assert_ne!(
+            EditingAction::TakeClaim.intent(),
+            EditingAction::ReleaseClaim.intent()
+        );
     }
 
     #[test]

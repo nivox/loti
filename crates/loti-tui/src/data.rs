@@ -823,6 +823,16 @@ pub enum Write {
     RemoveBlocker(Selection),
     /// Take one asset off the container it hangs on, index entry and bytes alike.
     DeleteAsset(Selection),
+    /// Take the claim on the node the row names, for the holder the reader typed.
+    ///
+    /// A claim has one holder, so taking one that is already held reassigns it.
+    /// The holder is freeform text and is not attribution — it records who is on
+    /// the work, not who wrote the change — and when the claim was taken is the
+    /// store's to maintain, so no instant travels with it.
+    TakeClaim(Selection, String),
+    /// Give up the claim on the node the row names, holder and timestamp
+    /// together.
+    ReleaseClaim(Selection),
     /// Replace one whole field of the epic or node the row names.
     ///
     /// The one write here that can silently discard text somebody else wrote —
@@ -855,6 +865,8 @@ impl Write {
             | Write::AddBlocker(target, _)
             | Write::RemoveBlocker(target)
             | Write::DeleteAsset(target)
+            | Write::TakeClaim(target, _)
+            | Write::ReleaseClaim(target)
             | Write::Replace { target, .. } => target,
         }
     }
@@ -912,6 +924,8 @@ pub fn perform(store: &Store, write: &Write) -> Result<(), Refusal> {
         Write::AddBlocker(selection, reference) => add_blocker(store, selection, reference),
         Write::RemoveBlocker(selection) => remove_blocker(store, selection),
         Write::DeleteAsset(selection) => delete_asset(store, selection),
+        Write::TakeClaim(selection, holder) => take_claim(store, selection, holder),
+        Write::ReleaseClaim(selection) => release_claim(store, selection),
         Write::Replace {
             target,
             field,
@@ -1115,6 +1129,53 @@ fn delete_asset(store: &Store, selection: &Selection) -> Result<(), Refusal> {
         )));
     };
     ops::delete_asset(store, &container.target(), name).map_err(refusal)?;
+    Ok(())
+}
+
+/// Take the claim on a node for the holder the reader typed.
+///
+/// A claim has one holder, so taking one that is already held reassigns it: the
+/// prior holder is replaced rather than joined, and that is the whole of what
+/// taking an already-held claim means.
+///
+/// The holder is freeform text and has nothing to do with attribution: it says
+/// who is on the work, not who wrote the change, so nothing about the writer's
+/// identity reaches this and the text is written exactly as it was typed —
+/// whether a given string is a holder the store will take is the store's rule.
+///
+/// When the claim was taken is the store's to maintain and is never passed, so
+/// no clock outside the store can disagree with the instant it recorded.
+///
+/// No stamp guards this write: a stamp is the precondition of a free-form
+/// replacement, and a claim's conflict is the later of two deliberate choices
+/// rather than text silently lost.
+fn take_claim(store: &Store, selection: &Selection, holder: &str) -> Result<(), Refusal> {
+    // A claim is taken on a unit of work, so any other selection is a caller that
+    // has lost track of what its row points at.
+    let Selection::Node(node) = selection else {
+        return Err(misdirected(format!(
+            "{} cannot be claimed",
+            selection.reference()
+        )));
+    };
+    ops::take_claim(store, node, holder).map_err(refusal)?;
+    Ok(())
+}
+
+/// Give up a node's claim, holder and timestamp together.
+///
+/// The row carries whether a claim is held, so nothing is typed to release one
+/// and there is no holder here to name the wrong one with. No stamp guards it,
+/// for the same reason taking one carries none.
+fn release_claim(store: &Store, selection: &Selection) -> Result<(), Refusal> {
+    // See [`take_claim`]: only a unit of work has a claim of its own.
+    let Selection::Node(node) = selection else {
+        return Err(misdirected(format!(
+            "{} has no claim of its own",
+            selection.reference()
+        )));
+    };
+    ops::release_claim(store, node).map_err(refusal)?;
     Ok(())
 }
 
@@ -1620,6 +1681,28 @@ pub(crate) mod fixture {
             let holder = "agent:builder".to_string();
             ops::take_claim(&self.store, node, &holder).unwrap();
             holder
+        }
+
+        /// The claim the ticket carries, as the store holds it: who holds it and
+        /// when it was taken.
+        ///
+        /// Read back through the store rather than remembered by the caller, so a
+        /// test about a claim asserts what was recorded and not what was passed.
+        pub(crate) fn node_claim(&self) -> Option<loti_core::model::Claim> {
+            ops::read_node(&self.store, &self.node)
+                .expect("the ticket can be read")
+                .frontmatter
+                .claim
+        }
+
+        /// When the ticket last changed, as the store holds it: the instant a claim
+        /// taken on it has to have been stamped with, since it is the store that
+        /// stamps both.
+        pub(crate) fn node_updated(&self) -> Timestamp {
+            ops::read_node(&self.store, &self.node)
+                .expect("the ticket can be read")
+                .frontmatter
+                .updated
         }
 
         /// Release a node's claim, as the holder does when the work is handed on:
@@ -3117,6 +3200,101 @@ mod tests {
     }
 
     #[test]
+    fn a_claim_is_taken_for_the_holder_typed_and_reassigned_to_the_next_one() {
+        let fx = Fixture::build();
+        assert_eq!(fx.node_claim(), None, "the fixture starts unclaimed");
+
+        // Verbatim, as the reader typed it: a holder is freeform text, and what
+        // makes one acceptable is the store's rule rather than a browser's tidying.
+        perform(
+            &fx.store,
+            &Write::TakeClaim(fx.node_selection(), "a human".into()),
+        )
+        .unwrap();
+        let taken = fx.node_claim().expect("the ticket reads back claimed");
+        assert_eq!(taken.by, "a human");
+        // The instant is the store's, and no write from here can name one: it is
+        // the same instant the store stamped the entity's own change with.
+        assert_eq!(taken.at, fx.node_updated());
+
+        // A claim has one holder, so taking one that is already held reassigns it:
+        // the holder that was there is replaced rather than joined.
+        perform(
+            &fx.store,
+            &Write::TakeClaim(fx.node_selection(), "somebody else".into()),
+        )
+        .unwrap();
+        let reassigned = fx.node_claim().expect("the ticket is still claimed");
+        assert_eq!(reassigned.by, "somebody else");
+        assert_eq!(reassigned.at, fx.node_updated());
+
+        // A holder with nothing in it is the store's refusal, in the store's own
+        // words, and it leaves the claim that was there alone: the browser
+        // reimplements no store rule, so a row is never left marked for nobody.
+        let err = refusal_words(
+            perform(
+                &fx.store,
+                &Write::TakeClaim(fx.node_selection(), "  ".into()),
+            )
+            .expect_err("a claim needs a holder"),
+        );
+        assert!(!err.is_empty(), "the refusal says nothing");
+        assert_eq!(fx.node_claim(), Some(reassigned));
+    }
+
+    #[test]
+    fn a_claim_is_released_from_the_ticket_it_names_holder_and_instant_together() {
+        let fx = Fixture::build();
+        let held = fx.claim(&fx.node);
+        assert_eq!(fx.node_claim().map(|c| c.by), Some(held));
+
+        perform(&fx.store, &Write::ReleaseClaim(fx.node_selection())).unwrap();
+        // Both halves go: a claim never carries a holder without an instant, so one
+        // left behind would be a claim the reader cannot see and cannot release.
+        assert_eq!(fx.node_claim(), None);
+
+        // Releasing a claim nobody holds is the store's own no-op rather than a
+        // refusal the browser invents on its behalf.
+        perform(&fx.store, &Write::ReleaseClaim(fx.node_selection())).unwrap();
+        assert_eq!(fx.node_claim(), None);
+    }
+
+    #[test]
+    fn only_a_unit_of_work_can_be_claimed_or_released() {
+        let fx = Fixture::build();
+        let held = fx.claim(&fx.node);
+
+        // A claim is taken on a unit of work: an epic is not one, and neither is a
+        // collection or one of its members. Each is refused by name, through the
+        // seam the browser itself writes through, with nothing written on the way to
+        // refusing — so a wrongly wired row meets the same guard.
+        for wrong in [
+            fx.epic_selection(),
+            fx.blocked_by_selection(),
+            Selection::Label(
+                Container::Epic(fx.epic.clone()),
+                fx.epic_labels()[0].clone(),
+            ),
+        ] {
+            for write in [
+                Write::TakeClaim(wrong.clone(), "nobody".into()),
+                Write::ReleaseClaim(wrong.clone()),
+            ] {
+                let err =
+                    refusal_words(perform(&fx.store, &write).expect_err("only a node has a claim"));
+                assert!(err.contains(&fx.epic), "{write:?}: {err}");
+                // And the claim that is held elsewhere is untouched: a misdirected
+                // write must not land on the nearest thing that could take it.
+                assert_eq!(
+                    fx.node_claim().map(|c| c.by),
+                    Some(held.clone()),
+                    "{write:?} wrote something"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn every_write_says_what_it_is_aimed_at_and_only_a_stamped_one_drops_a_precondition() {
         let fx = Fixture::build();
         let stamp = edit_target(&fx.store, &fx.epic_selection()).unwrap().stamp;
@@ -3134,6 +3312,8 @@ mod tests {
             Write::AddBlocker(fx.blocked_by_selection(), "1".into()),
             Write::RemoveBlocker(fx.epic_selection()),
             Write::DeleteAsset(fx.epic_selection()),
+            Write::TakeClaim(fx.node_selection(), "a human".into()),
+            Write::ReleaseClaim(fx.node_selection()),
             body.clone(),
         ] {
             // Dropping the precondition changes the precondition and nothing else:
