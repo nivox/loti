@@ -31,7 +31,9 @@ loti tui --root DIR   # browse the store at DIR
 - **The navigation pane** lists exactly one level: the children of the last
   breadcrumb entry. Each row is a status glyph, the identifier (an epic id, or a
   bare ticket number — the epic is already in the breadcrumb), the number of
-  direct children, and the name.
+  direct children, a claim marker, and the name. The marker is a dim `@` on a
+  ticket someone holds a claim on; its column is there only while something on
+  the level is claimed, and who holds it is in the preview.
 - **The preview pane** shows the same document `loti epic show` /
   `loti ticket show` print, rendered as markdown — including tables, code blocks
   and mermaid diagrams in a ticket body. Its title is the reference it shows.

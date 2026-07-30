@@ -890,6 +890,240 @@ fn the_highlighted_row_is_one_uniform_bar() {
     }
 }
 
+/// The navigation pane's interior exactly as it is painted, trailing blanks and
+/// all.
+///
+/// A trimmed line cannot tell a column that collapsed to nothing from one that
+/// collapsed to a column of spaces, and it is the collapse to nothing that an
+/// unclaimed level is promised.
+fn nav_pane(terminal: &Terminal<TestBackend>, nav_width: u16) -> Vec<String> {
+    let buffer = terminal.backend().buffer();
+    (0..buffer.area.height)
+        .map(|y| {
+            (1..nav_width - 1)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect()
+}
+
+/// The preview pane's side of every line, so a claim asserted "in the preview" is
+/// read where the preview is and not off a navigation row that shares the line.
+fn preview_side(terminal: &Terminal<TestBackend>, nav_width: u16) -> Vec<String> {
+    let buffer = terminal.backend().buffer();
+    (0..buffer.area.height)
+        .map(|y| {
+            (nav_width..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect()
+}
+
+/// Take a claim on a node, as another writer does, and answer with the holder the
+/// store recorded.
+///
+/// The holder is read back rather than repeated by the caller: a frame assertion
+/// against a literal would pass while the row showed some other writer's
+/// identifier.
+fn claim(store: &Store, node: &NodeRef) -> String {
+    ops::take_claim(store, node, "agent:builder")
+        .unwrap()
+        .0
+        .frontmatter
+        .claim
+        .expect("the node reads back claimed")
+        .by
+}
+
+/// The navigation row containing `needle`, and the column its name starts at.
+fn row_and_name_column(rows: &[String], name: &str) -> (String, usize) {
+    let row = rows
+        .iter()
+        .find(|l| l.contains(name))
+        .unwrap_or_else(|| panic!("no navigation row containing {name:?} in {rows:#?}"))
+        .clone();
+    let at = row.find(name).unwrap();
+    (row, at)
+}
+
+#[test]
+fn a_claimed_row_is_marked_left_of_its_name_and_the_holder_stays_in_the_preview() {
+    let (_dir, store) = fixture();
+    // The epic's level holds two tickets, so one frame shows a claimed row beside
+    // an unclaimed one: a level of one row cannot tell a marker that follows the
+    // claim from one drawn on every work row.
+    let holder = claim(&store, &NodeRef::new("browser", 1));
+    // Colour disabled, because the marker is specified as a character: whatever
+    // identifies a claimed row here is shape, which is what a `NO_COLOR` reader
+    // has.
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    app.apply(Action::Descend).unwrap();
+    // The cursor on the claimed ticket, so its own document is what the preview
+    // shows: the holder is one cursor move away, and this is that move.
+    to_work_row(&mut app);
+    let width = nav_pane_width(&app);
+    let (terminal, _) = draw(&mut app);
+    let rows = nav_pane(&terminal, width);
+
+    // The marker stands immediately left of the name, never right of it: the name
+    // is what gets truncated, so a marker after it would be the first thing lost
+    // on the narrow pane where scanning matters most.
+    let (claimed, at) = row_and_name_column(&rows, "Navigation pane");
+    assert_eq!(&claimed[at - 2..at], "@ ", "{claimed:?}");
+    // The column is the level's, so an unclaimed row on a claimed level reserves
+    // it and stays aligned rather than being marked.
+    let (unclaimed, at) = row_and_name_column(&rows, "Preview pane");
+    assert_eq!(&unclaimed[at - 2..at], "  ", "{unclaimed:?}");
+
+    // Who holds it is left to the preview: an identifier is long enough to crowd
+    // out the name that identifies the row.
+    assert!(
+        !rows.iter().any(|l| l.contains(&holder)),
+        "the holder is on a navigation row: {rows:#?}"
+    );
+    let preview = preview_side(&terminal, width);
+    assert!(
+        preview.iter().any(|l| l.contains(&holder)),
+        "the preview of a claimed ticket does not name {holder:?}: {preview:#?}"
+    );
+}
+
+#[test]
+fn the_claim_column_costs_a_level_nothing_while_nothing_on_it_is_claimed() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    app.apply(Action::Descend).unwrap();
+    let width = nav_pane_width(&app);
+    let (terminal, _) = draw(&mut app);
+    let unclaimed = nav_pane(&terminal, width);
+    // Every name on the level, taken from the rows the browser built rather than
+    // spelled here, so the assertion covers whatever the level holds: its
+    // collections as well as its work.
+    let names: Vec<String> = app
+        .nav()
+        .rows()
+        .iter()
+        .map(|r| r.name.clone())
+        .filter(|n| !n.is_empty())
+        .collect();
+
+    let node = NodeRef::new("browser", 1);
+    claim(&store, &node);
+    app.apply(Action::Reload).unwrap();
+    let (terminal, _) = draw(&mut app);
+    let marked = nav_pane(&terminal, width);
+    for name in &names {
+        let (_, before) = row_and_name_column(&unclaimed, name);
+        let (row, after) = row_and_name_column(&marked, name);
+        // One claim on the level buys the column for every row of it, marked or
+        // not, and buys it out of the name's own budget: the marker and its
+        // separator, and nothing else, moved.
+        assert_eq!(after, before + 2, "{name:?} on {row:?}");
+    }
+
+    // Released, the level spends no width on the column again — recomputed from
+    // the store on every listing, so a level that was claimed once does not keep
+    // paying for it.
+    ops::release_claim(&store, &node).unwrap();
+    app.apply(Action::Reload).unwrap();
+    let (terminal, _) = draw(&mut app);
+    assert_eq!(nav_pane(&terminal, width), unclaimed);
+}
+
+#[test]
+fn the_roster_is_never_marked_however_the_epics_tickets_are_claimed() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    let width = nav_pane_width(&app);
+    let (terminal, _) = draw(&mut app);
+    let before = nav_pane(&terminal, width);
+
+    // Every ticket of the epic claimed: a claim is taken on a unit of work and an
+    // epic is not one, so the roster reports nothing held beneath it.
+    for number in [1, 2, 3] {
+        claim(&store, &NodeRef::new("browser", number));
+    }
+    app.apply(Action::Reload).unwrap();
+    let (terminal, _) = draw(&mut app);
+    assert_eq!(nav_pane(&terminal, width), before);
+}
+
+#[test]
+fn a_blocker_row_is_marked_like_the_work_row_it_reads_as() {
+    let (_dir, store) = fixture();
+    ops::add_blocked_by(
+        &store,
+        &NodeRef::new("browser", 1),
+        &[NodeRef::new("browser", 3)],
+    )
+    .unwrap();
+    let holder = claim(&store, &NodeRef::new("browser", 3));
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    to_the_blocked_by_row(&mut app);
+    app.apply(Action::Descend).unwrap();
+    let width = nav_pane_width(&app);
+    let (terminal, _) = draw(&mut app);
+    let rows = nav_pane(&terminal, width);
+
+    // A dependency list's entries are work, so they carry the marker as well as
+    // the glyph, and the holder stays off the row here too.
+    let (row, at) = row_and_name_column(&rows, "Preview pane");
+    assert_eq!(&row[at - 2..at], "@ ", "{row:?}");
+    assert!(
+        !rows.iter().any(|l| l.contains(&holder)),
+        "the holder is on a navigation row: {rows:#?}"
+    );
+}
+
+#[test]
+fn the_marker_is_a_hint_beside_the_row_rather_than_a_state_of_it() {
+    let (_dir, store) = fixture();
+    claim(&store, &NodeRef::new("browser", 1));
+    let mut app = App::new(store.clone(), Theme::with_color(true)).unwrap();
+    app.apply(Action::Descend).unwrap();
+    // The cursor off the marked row: a highlighted row is drawn without any
+    // per-column colour on purpose.
+    app.apply(Action::CursorFirst).unwrap();
+    let width = nav_pane_width(&app);
+    let (terminal, _) = draw(&mut app);
+
+    let cells = row_cells(&terminal, "Navigation pane", width);
+    let marker = cells.iter().find(|(s, _)| s == "@").expect("the marker");
+    let plain_marker = marker.1;
+    // Dim like the child count and not like the identifier: the marker answers
+    // "is anyone on this?", which is a hint beside the row rather than something
+    // to read off it.
+    let count = cells.iter().find(|(s, _)| s == "(").expect("the count");
+    let glyph = &cells[0];
+    assert_eq!(marker.1.fg, count.1.fg, "{:?}", marker.1);
+    assert_ne!(marker.1.fg, glyph.1.fg, "{:?}", marker.1);
+
+    // Under the cursor the row is drawn as one uniform bar, so the marker is not
+    // dim there: a column keeping its own colour would be a mismatched block in
+    // the bar. Compared against the name rather than the count, because one
+    // expression styles the marker and the count together and a comparison
+    // between them would hold however that expression changed.
+    to_work_row(&mut app);
+    let (terminal, _) = draw(&mut app);
+    let marked = row_cells(&terminal, "Navigation pane", width);
+    let marker = marked.iter().find(|(s, _)| s == "@").expect("the marker");
+    let name = marked.iter().find(|(s, _)| s == "N").expect("the name");
+    assert_eq!(marker.1, name.1, "under the cursor: {:?}", marker.1);
+    assert_ne!(marker.1, plain_marker, "the cursor left the marker dim");
+
+    // And on a row editing mode has disabled, where the whole row dims together:
+    // a marker left at the brightness of a live row would say that row can still
+    // be acted on.
+    app.apply(Action::CursorFirst).unwrap();
+    app.apply(Action::EnterEditing).unwrap();
+    let (terminal, _) = draw(&mut app);
+    let disabled = row_cells(&terminal, "Navigation pane", width);
+    let marker = disabled.iter().find(|(s, _)| s == "@").expect("the marker");
+    let name = disabled.iter().find(|(s, _)| s == "N").expect("the name");
+    assert_eq!(marker.1, name.1, "on a disabled row: {:?}", marker.1);
+}
+
 #[test]
 fn resizing_moves_the_divider_in_the_drawn_frame() {
     let (_dir, store) = fixture();

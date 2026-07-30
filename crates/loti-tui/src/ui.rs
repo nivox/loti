@@ -89,6 +89,13 @@ fn widest_read_only_indicator() -> usize {
 /// carries nothing.
 const GUTTER_BAR: &str = "▌";
 
+/// The marker standing for "someone holds a claim on this". A character rather
+/// than a colour, so it is there with colour disabled like every other state
+/// signal in the browser; who holds it is left to the preview, one cursor move
+/// away, because a holder is long enough to crowd out the name that identifies
+/// the row.
+const CLAIM_MARKER: &str = "@";
+
 /// How wide a dialog wants to be. Fixed rather than sized to its content: a
 /// refusal can be a paragraph, and a float as wide as the terminal would stop
 /// reading as something laid over the screen.
@@ -703,6 +710,15 @@ fn draw_nav(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
             .map(|r| count_cell(r).chars().count())
             .max()
             .unwrap_or(0);
+        // Zero when nothing on the level is claimed, so an unclaimed level spends
+        // no width on the column at all. It is one decision for the level and not
+        // one per row: a marked row and its unmarked neighbours line their names
+        // up, which is what makes the column scannable.
+        let claim_width = rows
+            .iter()
+            .map(|r| claim_cell(r).chars().count())
+            .max()
+            .unwrap_or(0);
         let rule_at = rule_position(rows);
         let mut items: Vec<ListItem> = Vec::with_capacity(rows.len() + 1);
         for (index, row) in rows.iter().enumerate() {
@@ -717,6 +733,7 @@ fn draw_nav(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
                 theme,
                 label_width,
                 count_width,
+                claim_width,
                 inner.width as usize,
                 emphasis(editing, index == app.nav().cursor()),
             )));
@@ -779,6 +796,29 @@ fn count_cell(row: &Row) -> String {
     }
 }
 
+/// The claim marker cell: whether anyone holds a claim on what the row points
+/// at, and nothing else — not the holder, and not when it was taken.
+///
+/// Only a work row can be claimed, and an epic's row never carries a holder, so
+/// the roster is never marked: a claim is taken on a unit of work. This reads what
+/// the row already carries from the listing that drew it, so a marked level costs
+/// no read beyond the ones the rows themselves cost.
+fn claim_cell(row: &Row) -> &'static str {
+    match &row.kind {
+        RowKind::Work {
+            claimed_by: Some(_),
+            ..
+        } => CLAIM_MARKER,
+        RowKind::Work {
+            claimed_by: None, ..
+        }
+        | RowKind::Collection(_)
+        | RowKind::Member
+        | RowKind::Withdrawn
+        | RowKind::Unreadable => "",
+    }
+}
+
 /// How a row is drawn relative to what the reader can act on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Emphasis {
@@ -803,7 +843,7 @@ fn emphasis(editing: bool, at_cursor: bool) -> Emphasis {
     }
 }
 
-/// One row: `<glyph> <identifier> <(children)>  <name>`. Everything the eye
+/// One row: `<glyph> <identifier> <(children)>  <claim> <name>`. Everything the eye
 /// needs to judge a row sits on the left, so the name may be truncated at the
 /// pane edge without losing state or enterability.
 ///
@@ -825,11 +865,18 @@ fn emphasis(editing: bool, at_cursor: bool) -> Emphasis {
 /// dimmed by modifier as well as by colour, so which row is being acted on is
 /// legible with colour disabled too. The gutter is reserved only while the mode is
 /// on, so a level being browsed spends no width on it.
+///
+/// The claim marker sits left of the name and never right of it: the name is what
+/// gets truncated, so a marker after it would be the first thing lost exactly
+/// when the pane is narrow and scanning matters most. `claim_width` is the level's
+/// decision, zero when nothing on it is claimed, and the column is charged to the
+/// name's budget like every other one.
 fn row_line<'a>(
     row: &'a Row,
     theme: Theme,
     label_width: usize,
     count_width: usize,
+    claim_width: usize,
     pane_width: usize,
     emphasis: Emphasis,
 ) -> Line<'a> {
@@ -868,9 +915,27 @@ fn row_line<'a>(
         Emphasis::Disabled => Some(Span::raw(" ")),
         Emphasis::Plain | Emphasis::Cursor => None,
     };
-    let prefix_width = usize::from(gutter.is_some()) + 2 + label_width + 1 + count_width + 2;
+    // The marker is dim like the child count, and dims and brightens with it:
+    // both are hints beside the row rather than something to read off it, so one
+    // style decides for both and they cannot come to disagree.
+    //
+    // A separator column travels with the marker, so a level with nothing claimed
+    // on it emits no cells here and draws exactly as it did before the column
+    // existed.
+    let claim: Vec<Span> = match claim_width {
+        0 => Vec::new(),
+        _ => vec![
+            Span::styled(format!("{:<claim_width$}", claim_cell(row)), count_style),
+            Span::raw(" "),
+        ],
+    };
+    // Charged from the cells themselves, so the budget cannot disagree with what
+    // is drawn.
+    let claim_columns: usize = claim.iter().map(|s| s.content.chars().count()).sum();
+    let prefix_width =
+        usize::from(gutter.is_some()) + 2 + label_width + 1 + count_width + 2 + claim_columns;
     let name_budget = pane_width.saturating_sub(prefix_width);
-    let mut spans = Vec::with_capacity(8);
+    let mut spans = Vec::with_capacity(10);
     spans.extend(gutter);
     spans.extend([
         Span::styled(glyph_cell, id_style),
@@ -879,8 +944,9 @@ fn row_line<'a>(
         Span::raw(" "),
         Span::styled(format!("{:<count_width$}", count_cell(row)), count_style),
         Span::raw("  "),
-        Span::styled(truncate(&row.name, name_budget), name_style),
     ]);
+    spans.extend(claim);
+    spans.push(Span::styled(truncate(&row.name, name_budget), name_style));
     Line::from(spans)
 }
 
@@ -1041,7 +1107,7 @@ mod tests {
     fn only_a_work_row_carries_a_glyph() {
         let theme = Theme::with_color(false);
         for row in mixed_level() {
-            let line = row_line(&row, theme, 2, 3, 40, Emphasis::Plain);
+            let line = row_line(&row, theme, 2, 3, 0, 40, Emphasis::Plain);
             let cell = line.spans[0].content.to_string();
             let is_work = matches!(row.kind, RowKind::Work { .. });
             assert_eq!(
@@ -1059,9 +1125,9 @@ mod tests {
         // modifier, which is what a `NO_COLOR` reader has.
         let theme = Theme::with_color(false);
         let row = crate::data::fixture::epic_row("e", 0);
-        let target = row_line(&row, theme, 2, 3, 40, Emphasis::Target);
-        let disabled = row_line(&row, theme, 2, 3, 40, Emphasis::Disabled);
-        let browsed = row_line(&row, theme, 2, 3, 40, Emphasis::Plain);
+        let target = row_line(&row, theme, 2, 3, 0, 40, Emphasis::Target);
+        let disabled = row_line(&row, theme, 2, 3, 0, 40, Emphasis::Disabled);
+        let browsed = row_line(&row, theme, 2, 3, 0, 40, Emphasis::Plain);
 
         // The bar is the frozen row's own column; the others keep it blank so the
         // level stays aligned, and a browsed level spends no width on it at all.
@@ -1089,12 +1155,75 @@ mod tests {
         let mut long = row.clone();
         long.name = "a name longer than any pane is wide".repeat(2);
         for emphasis in [Emphasis::Target, Emphasis::Disabled, Emphasis::Plain] {
-            let line = row_line(&long, theme, 2, 3, 40, emphasis);
+            let line = row_line(&long, theme, 2, 3, 0, 40, emphasis);
             assert!(
                 width(&line) <= 40,
                 "a {emphasis:?} row overruns its pane by {}",
                 width(&line) - 40
             );
+        }
+    }
+
+    /// The columns a row draws, as one string: the whole line, so a shifted
+    /// column shows up as different text rather than as nothing.
+    fn drawn(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.to_string()).collect()
+    }
+
+    /// Everything left of the name, which is the part of a row that must not move
+    /// when a column is added beside it.
+    fn columns_before_the_name(line: &Line) -> String {
+        drawn(&Line::from(line.spans[..line.spans.len() - 1].to_vec()))
+    }
+
+    #[test]
+    fn the_claim_column_is_inserted_before_the_name_and_charged_to_its_budget() {
+        let theme = Theme::with_color(false);
+        let mut unclaimed = crate::data::fixture::node_row("e", 2, 4);
+        unclaimed.name = "a name longer than any navigation pane is ever wide".to_string();
+        let mut claimed = unclaimed.clone();
+        claimed.kind = RowKind::Work {
+            status: "to-do".to_string(),
+            claimed_by: Some("agent:builder".to_string()),
+        };
+
+        // Every width a pane can be, including the ones too narrow for the row's
+        // own columns: the marker is specified not to disturb the columns beside
+        // it, and "at any width" is where an off-by-one column hides.
+        for pane_width in 0..80usize {
+            for emphasis in [
+                Emphasis::Plain,
+                Emphasis::Cursor,
+                Emphasis::Target,
+                Emphasis::Disabled,
+            ] {
+                let bare = row_line(&unclaimed, theme, 2, 3, 0, pane_width, emphasis);
+                let marked = row_line(&claimed, theme, 2, 3, 1, pane_width, emphasis);
+                // The marker and its separator are inserted between the count and
+                // the name; nothing that stood left of the name moved or was drawn
+                // over.
+                assert_eq!(
+                    format!("{}{CLAIM_MARKER} ", columns_before_the_name(&bare)),
+                    columns_before_the_name(&marked),
+                    "width {pane_width}, {emphasis:?}"
+                );
+                // The column is paid for out of the name, so a pane with room for
+                // the columns holds the whole row. Uncharged, the last column is
+                // clipped by the renderer — and that column is the name's cut
+                // marker, so a clipped name would read as a whole one.
+                //
+                // A pane too narrow for the columns themselves is the one case a
+                // row is wider than its pane, and it is not this column's doing:
+                // no column left of the name is ever truncated, so the row already
+                // overran by its own prefix before there was a marker in it.
+                let width = |line: &Line| drawn(line).chars().count();
+                let columns = columns_before_the_name(&marked).chars().count();
+                assert!(
+                    width(&marked) <= pane_width.max(columns),
+                    "a {emphasis:?} row overruns a {pane_width}-wide pane: {:?}",
+                    drawn(&marked)
+                );
+            }
         }
     }
 
