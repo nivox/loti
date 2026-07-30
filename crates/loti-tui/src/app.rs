@@ -11,7 +11,7 @@ use anyhow::Result;
 use loti_core::store::Store;
 use ratatui_markdown::viewer::MarkdownViewer;
 
-use crate::action::{Action, Mode};
+use crate::action::{Action, Answers, EditingAction, Mode};
 use crate::data::{self, Level, Selection};
 use crate::keymap;
 use crate::nav::Nav;
@@ -38,6 +38,13 @@ const FLASH_LIFETIME: Duration = Duration::from_secs(5);
 /// for as long as it is up.
 const NOT_AN_EDITING_ACTION: &str = "not an editing action — Esc to leave";
 
+/// The title a question about the frozen row carries. Fixed, so what a dialog is
+/// stays legible when its text is the store's own and no browser word introduces
+/// it.
+const CONFIRM_TITLE: &str = " confirm ";
+/// See [`CONFIRM_TITLE`].
+const REFUSAL_TITLE: &str = " the store refused the change ";
+
 /// A transient one-line notice, holding the hint strip's line until its deadline
 /// passes.
 ///
@@ -58,23 +65,86 @@ struct Flash {
 pub enum Modal {
     /// The key-binding overlay.
     Help,
-    /// A destructive question about the row the mode is acting on, carrying the
-    /// question it asks. Every deletion is gated behind one: a label is trivially
-    /// re-addable and the gate buys little there, but one rule a reader can
-    /// predict beats a per-action judgement they have to remember.
-    Confirm(String),
-    /// A refusal, carrying the store's own message for it. Critical enough to
-    /// interrupt: the transient notice channel carries only what a reader need
-    /// not act on.
-    Refusal(String),
+    /// A dialog. One widget carries every question and every report, because each
+    /// of them is a critical interruption laid over the screen — the transient
+    /// notice channel carries only what a reader need not act on.
+    Dialog(Dialog),
 }
 
-/// A deletion the frozen row offers: what it asks before it happens, and what it
-/// says once it has. Both name the object, and they are built together so a
-/// question and the notice that follows it can never name different things.
-struct Deletion {
-    question: String,
-    done: String,
+/// A dialog: what it says, how it may be answered, and what answering it
+/// performs.
+///
+/// Invariant: a dialog carries all three itself, so the state machine that
+/// answers one names no operation and no answer set of its own — which is what
+/// makes a further kind of dialog a value built here rather than another branch
+/// everywhere a dialog is routed or drawn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dialog {
+    title: &'static str,
+    message: String,
+    answers: Answers,
+    /// What the affirmative answer performs, and `None` for a dialog that only
+    /// reports: such a dialog has a way out and no answer, so nothing it is shown
+    /// for can be acted on by mistake.
+    performs: Option<Performs>,
+}
+
+/// What a dialog's affirmative answer performs.
+///
+/// Invariant: every consequence an answer can have is a variant here, so the one
+/// place a dialog is answered performs whatever the dialog carried and names no
+/// operation itself — an answer that changes no store state is a variant rather
+/// than another branch there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Performs {
+    /// A change to the store, with what the notice says once it is committed. The
+    /// two are built with the question, so a question and the notice that follows
+    /// it can never name different things.
+    Write { write: data::Write, done: String },
+}
+
+impl Dialog {
+    /// A destructive question, carrying the write its answer performs and what
+    /// that write says once it has happened.
+    ///
+    /// Every deletion is gated behind one of these: a label is trivially
+    /// re-addable and the gate buys little there, but one rule a reader can
+    /// predict beats a per-action judgement they have to remember.
+    fn confirm(question: String, write: data::Write, done: String) -> Self {
+        Self {
+            title: CONFIRM_TITLE,
+            message: question,
+            answers: Answers::Destructive,
+            performs: Some(Performs::Write { write, done }),
+        }
+    }
+
+    /// A refusal, in the store's own words and with nothing to answer: the reader
+    /// is being told, not asked.
+    fn refusal(message: String) -> Self {
+        Self {
+            title: REFUSAL_TITLE,
+            message,
+            answers: Answers::Acknowledge,
+            performs: None,
+        }
+    }
+
+    /// The fixed title that says what kind of dialog this is, since the text in it
+    /// may be the store's own and introduces itself with nothing.
+    pub fn title(&self) -> &str {
+        self.title
+    }
+
+    /// What the dialog asks or reports.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// The set of answers it admits, which is also the set it lists.
+    pub fn answers(&self) -> Answers {
+        self.answers
+    }
 }
 
 /// The preview pane's rendered document.
@@ -181,9 +251,10 @@ impl App {
     /// whichever mode raised it, and unwinding takes one layer at a time, so the
     /// key that closes it is that mode's own way out.
     pub fn mode(&self) -> Mode {
-        match self.modal {
-            Some(Modal::Confirm(_)) => Mode::Confirm,
-            Some(Modal::Refusal(_)) => Mode::Acknowledge,
+        match &self.modal {
+            // The answers belong to the dialog, so the set the keyboard is under is
+            // read off the open dialog rather than off a mode per kind of dialog.
+            Some(Modal::Dialog(dialog)) => Mode::Dialog(dialog.answers),
             Some(Modal::Help) | None => match self.editing.is_some() {
                 true => Mode::Editing,
                 false => Mode::Browse,
@@ -205,28 +276,36 @@ impl App {
             .collect()
     }
 
-    /// Whether the frozen row offers an editing action.
-    fn offers(&self, action: Action) -> bool {
-        match action {
-            Action::Delete => self.deletion().is_some(),
-            _ => false,
-        }
+    /// Whether the frozen row offers an editing action. Derived from the offer
+    /// itself, so a hint and the key it names cannot disagree about a row.
+    fn offers(&self, action: EditingAction) -> bool {
+        self.offer(action).is_some()
     }
 
-    /// The deletion the frozen row offers, or `None` where it offers none.
+    /// The dialog an editing action raises on the frozen row, or `None` where the
+    /// row does not offer that action.
     ///
-    /// The question names the object, because the frozen row is dimmed and the
+    /// Invariant: this is the whole of what a row offers — both the hint strip and
+    /// the key ask it — and it is exhaustive over the editing actions, so an
+    /// action added without deciding which rows offer it does not compile rather
+    /// than showing a hint no key answers.
+    ///
+    /// A question names the object, because the frozen row is dimmed and the
     /// members of a collection read alike: an unnamed question would not say what
     /// is about to go. The notice names it for the same reason — by the time it
     /// is read the row is gone.
-    fn deletion(&self) -> Option<Deletion> {
-        match self.editing.as_ref()? {
-            // A label set has no rename, so a label is only ever removed.
-            Selection::Label(_, label) => Some(Deletion {
-                question: format!("Remove label {label}?"),
-                done: format!("label {label} removed"),
-            }),
-            _ => None,
+    fn offer(&self, action: EditingAction) -> Option<Dialog> {
+        let target = self.editing.as_ref()?;
+        match action {
+            EditingAction::Delete => match target {
+                // A label set has no rename, so a label is only ever removed.
+                Selection::Label(_, label) => Some(Dialog::confirm(
+                    format!("Remove label {label}?"),
+                    data::Write::RemoveLabel(target.clone()),
+                    format!("label {label} removed"),
+                )),
+                _ => None,
+            },
         }
     }
 
@@ -330,45 +409,47 @@ impl App {
         // A dialog admits its listed answers and nothing else, quitting included:
         // a question this critical must be answered rather than escaped past, and
         // nothing underneath it may move while it is open.
-        match self.modal {
-            Some(Modal::Confirm(_)) => match action {
-                Action::Delete => {
-                    self.modal = None;
-                    self.carry_out_deletion()?;
-                }
-                Action::Unwind => self.modal = None,
-                _ => {}
-            },
+        match action {
+            // The affirmative answer performs whatever the dialog carries, so no
+            // one operation is named here and a further kind of question needs no
+            // arm of its own.
+            Action::Delete => self.answer()?,
             // A refused write leaves the editing session standing: only a
             // successful write ends it, so dismissing lands back in the mode.
-            Some(Modal::Refusal(_)) if matches!(action, Action::Unwind) => self.modal = None,
+            Action::Unwind => self.modal = None,
             _ => {}
         }
         Ok(false)
     }
 
-    /// Carry out the deletion the confirmation answered.
+    /// Carry out what the open dialog's answer performs.
     ///
     /// A successful write ends the editing session and says what it did: the
     /// session is one edit long, and the mode indicator going as the notice
     /// arrives is what reads as "that finished". The store is re-read with it,
     /// because the row just removed must not stay on screen.
-    fn carry_out_deletion(&mut self) -> Result<()> {
-        // Only a row that offers a deletion can have raised the question this
-        // answers, so there is nothing to carry out when none does.
-        let (Some(deletion), Some(target)) = (self.deletion(), self.editing.clone()) else {
+    fn answer(&mut self) -> Result<()> {
+        // A dialog that only reports has a way out and no answer, so nothing it
+        // was raised for can be performed: it stands until it is dismissed.
+        let Some(Modal::Dialog(dialog)) = &self.modal else {
             return Ok(());
         };
-        match data::remove_label(&self.store, &target) {
-            Ok(()) => {
-                self.editing = None;
-                self.reload()?;
-                self.flash(deletion.done);
-            }
-            // The store's own words, so the browser and the CLI teach the same
-            // rule in the same words and the browser cannot go stale when a store
-            // rule gains a nuance.
-            Err(e) => self.modal = Some(Modal::Refusal(e.to_string())),
+        let Some(performs) = dialog.performs.clone() else {
+            return Ok(());
+        };
+        self.modal = None;
+        match performs {
+            Performs::Write { write, done } => match data::perform(&self.store, &write) {
+                Ok(()) => {
+                    self.editing = None;
+                    self.reload()?;
+                    self.flash(done);
+                }
+                // The store's own words, so the browser and the CLI teach the same
+                // rule in the same words and the browser cannot go stale when a
+                // store rule gains a nuance.
+                Err(e) => self.modal = Some(Modal::Dialog(Dialog::refusal(e.to_string()))),
+            },
         }
         Ok(())
     }
@@ -389,12 +470,6 @@ impl App {
     fn apply_editing(&mut self, action: Action) -> Result<()> {
         match action {
             Action::Unwind => self.editing = None,
-            Action::Delete => match self.deletion() {
-                Some(deletion) => self.modal = Some(Modal::Confirm(deletion.question)),
-                // A letter is listed only where the row offers it, so a letter
-                // this row does not offer is as unknown here as any other key.
-                None => self.flash(NOT_AN_EDITING_ACTION),
-            },
             Action::ToggleHelp => self.modal = Some(Modal::Help),
             // Nothing is pending at this layer, so a reload is safe — and it is
             // the natural move when the preview looks stale before committing to
@@ -410,7 +485,14 @@ impl App {
                     self.flash("the row you were editing is gone");
                 }
             }
-            _ => self.flash(NOT_AN_EDITING_ACTION),
+            // Everything else is an editing action or nothing. A letter is listed
+            // only where the row offers it, so a letter this row does not offer is
+            // as unknown here as any key the mode never binds — and the offer that
+            // decides it is the one the hint strip asked.
+            _ => match EditingAction::for_intent(action).and_then(|a| self.offer(a)) {
+                Some(dialog) => self.modal = Some(Modal::Dialog(dialog)),
+                None => self.flash(NOT_AN_EDITING_ACTION),
+            },
         }
         Ok(())
     }
@@ -638,13 +720,48 @@ mod tests {
     }
 
     /// The hint the strip carries for an editing action, so a test names the
-    /// intent and leaves the wording to the key map.
-    fn hint_for(action: Action) -> &'static str {
+    /// action and leaves the wording to the key map.
+    fn hint_for(action: EditingAction) -> &'static str {
         keymap::FOOTER_HINTS_EDITING
             .iter()
             .find(|(bound, _)| *bound == action)
             .map(|(_, hint)| *hint)
             .expect("the action has a hint")
+    }
+
+    /// The strip and the keys agree about the frozen row, action by action: every
+    /// editing action is either hinted and answered, or unhinted and as unknown as
+    /// any key the mode never binds. Nothing else may happen on the way — the
+    /// browser is left as it was found.
+    fn hints_and_keys_agree(app: &mut App) {
+        for action in EditingAction::ALL.iter().copied() {
+            let hinted = app.editing_hints().contains(&hint_for(action));
+            app.clear_flash();
+            assert!(!app.apply(action.intent()).unwrap(), "{action:?} quit");
+            match hinted {
+                true => {
+                    assert!(
+                        matches!(app.modal(), Some(Modal::Dialog(_))),
+                        "{action:?} is hinted but the key answers nothing"
+                    );
+                    // Back out of the question, leaving the mode standing.
+                    app.apply(Action::Unwind).unwrap();
+                }
+                false => {
+                    assert_eq!(
+                        app.modal(),
+                        None,
+                        "{action:?} is not hinted but the key acted"
+                    );
+                    assert_eq!(app.flash_message(), Some(NOT_AN_EDITING_ACTION));
+                }
+            }
+            app.clear_flash();
+            assert!(
+                app.editing_target().is_some(),
+                "{action:?} left the editing mode"
+            );
+        }
     }
 
     #[test]
@@ -1068,14 +1185,61 @@ mod tests {
         app.apply(Action::Delete).unwrap();
         assert_eq!(app.modal(), None, "a row that offers nothing asked nothing");
         assert_eq!(app.flash_message(), Some(NOT_AN_EDITING_ACTION));
+        // And no editing action at all disagrees with the strip on this row: the
+        // row's own offer is what lists a hint and what answers the key, so a hint
+        // that appears without one would be a letter nothing answers.
+        hints_and_keys_agree(&mut app);
 
-        // On a label row it is offered, and the strip lists exactly that: one
-        // predicate decides both, so a hint can never name a key the row ignores.
+        // On a label row it is offered, and the strip lists exactly that.
         app.apply(Action::Unwind).unwrap();
         app.apply(Action::Ascend).unwrap();
         to_a_label_row(&mut app);
         app.apply(Action::EnterEditing).unwrap();
-        assert_eq!(app.editing_hints(), vec![hint_for(Action::Delete)]);
+        assert_eq!(app.editing_hints(), vec![hint_for(EditingAction::Delete)]);
+        hints_and_keys_agree(&mut app);
+    }
+
+    /// Walk every row of every level below where the cursor stands, collecting the
+    /// editing actions the strip lists on each. Depth-first, and it puts the
+    /// browser back where it found it.
+    fn collect_offers(app: &mut App, found: &mut Vec<EditingAction>) {
+        let depth = app.nav().crumbs().len();
+        for index in 0..app.nav().rows().len() {
+            app.apply(Action::CursorFirst).unwrap();
+            for _ in 0..index {
+                app.apply(Action::CursorDown).unwrap();
+            }
+            app.apply(Action::EnterEditing).unwrap();
+            for action in EditingAction::ALL.iter().copied() {
+                if app.editing_hints().contains(&hint_for(action)) && !found.contains(&action) {
+                    found.push(action);
+                }
+            }
+            app.apply(Action::Unwind).unwrap();
+            app.apply(Action::Descend).unwrap();
+            if app.nav().crumbs().len() > depth {
+                collect_offers(app, found);
+                app.apply(Action::Ascend).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn every_editing_hint_is_one_some_row_actually_offers() {
+        let (_fx, mut app) = app();
+        let mut offered = Vec::new();
+        collect_offers(&mut app, &mut offered);
+        // The strip lists the subset of the editing actions the frozen row offers,
+        // so an action no row offers is a hint that can never appear: a letter
+        // added to the strip without deciding which rows offer it is silently
+        // invisible, and that is what this catches. The fixture carries a row of
+        // every kind the browser can stand on.
+        for action in EditingAction::ALL {
+            assert!(
+                offered.contains(action),
+                "no row offers {action:?}, so its hint can never be shown"
+            );
+        }
     }
 
     #[test]
@@ -1088,15 +1252,17 @@ mod tests {
         app.apply(Action::Delete).unwrap();
         // The question names the object: the frozen row is dimmed and the members
         // of a collection read alike, so an unnamed question would not say what.
-        let Some(Modal::Confirm(question)) = app.modal() else {
+        let Some(Modal::Dialog(dialog)) = app.modal() else {
             panic!(
                 "a deletion is gated behind a confirmation: {:?}",
                 app.modal()
             )
         };
-        assert!(question.contains(&label), "{question:?}");
-        // A dialog is a mode of its own, so only the answers it lists are live.
-        assert_eq!(app.mode(), Mode::Confirm);
+        assert!(dialog.message().contains(&label), "{dialog:?}");
+        // A dialog carries its own answers, and the keyboard is under exactly the
+        // set it lists: a destructive question, not something to dismiss.
+        assert_eq!(dialog.answers(), Answers::Destructive);
+        assert_eq!(app.mode(), Mode::Dialog(Answers::Destructive));
         assert!(fx.epic_labels().contains(&label), "asking wrote something");
 
         // The answer that is never destructive, here as everywhere else.
@@ -1159,13 +1325,13 @@ mod tests {
         // Verbatim, so the browser and the CLI teach the same rule in the same
         // words: compared against the message the seam itself produces, never a
         // string spelled out here, which is what a reworded refusal would pass.
-        let refusal = data::remove_label(&fx.store, &target)
+        let refusal = data::perform(&fx.store, &data::Write::RemoveLabel(target))
             .expect_err("the store refuses a label removal on a missing entity")
             .to_string();
-        assert_eq!(app.modal(), Some(&Modal::Refusal(refusal)));
+        assert_eq!(app.modal(), Some(&Modal::Dialog(Dialog::refusal(refusal))));
         // Nothing is at stake in reading it, so it is dismissed rather than
         // answered — and a failure is never a transient notice.
-        assert_eq!(app.mode(), Mode::Acknowledge);
+        assert_eq!(app.mode(), Mode::Dialog(Answers::Acknowledge));
         assert_eq!(app.flash_message(), None);
 
         app.apply(Action::Unwind).unwrap();
@@ -1183,6 +1349,7 @@ mod tests {
         app.apply(Action::EnterEditing).unwrap();
         app.apply(Action::Delete).unwrap();
         let cursor = app.nav().cursor();
+        let asked = app.modal().cloned().expect("a question is open");
 
         // A dialog admits its listed answers and nothing else. Quitting least of
         // all: the browser must not exit with an unanswered question on screen.
@@ -1199,8 +1366,11 @@ mod tests {
             Action::EnterEditing,
         ] {
             assert!(!app.apply(action).unwrap(), "{action:?} left the browser");
-            assert!(
-                matches!(app.modal(), Some(Modal::Confirm(_))),
+            // The same question, still unanswered: neither dismissed, nor replaced
+            // by the report of something one of these got through and did.
+            assert_eq!(
+                app.modal(),
+                Some(&asked),
                 "{action:?} got past the question"
             );
             assert_eq!(app.nav().cursor(), cursor, "{action:?} moved the cursor");

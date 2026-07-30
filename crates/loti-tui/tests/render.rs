@@ -9,7 +9,7 @@ use loti_core::domain::NodeRef;
 use loti_core::ops::{self, NewEpic, NewNode, Target};
 use loti_core::store::{self, Store};
 use loti_core::Actor;
-use loti_tui::action::Action;
+use loti_tui::action::{Action, Answers};
 use loti_tui::app::App;
 use loti_tui::data::RowKind;
 use loti_tui::theme::Theme;
@@ -783,7 +783,9 @@ fn a_destructive_question_lists_its_answers_and_never_the_reflex_key() {
     let lines = box_lines(&after, changed_box(&before, &after));
     // A dialog says how to answer it, so the way out never depends on the hint
     // strip a notice or a narrow terminal may have taken.
-    for answer in loti_tui::keymap::DIALOG_ANSWERS_CONFIRM {
+    // The answers of the set this dialog asked for, taken from the key map, which
+    // is where the letters live.
+    for answer in loti_tui::keymap::dialog_answers(Answers::Destructive) {
         assert!(
             lines.iter().any(|l| l.contains(answer)),
             "{answer:?} is not listed: {lines:#?}"

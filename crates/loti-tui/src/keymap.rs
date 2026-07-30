@@ -12,15 +12,15 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::action::{Action, Mode};
+use crate::action::{Action, Answers, EditingAction, Mode};
 
 /// The intent a key press carries in a mode, or `None` if it is not bound there.
 pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
     // A dialog answers for itself: only the answers it lists are bound while it
     // is open, so nothing underneath it can be moved, reloaded or quit by a key
     // pressed at a question.
-    if matches!(mode, Mode::Confirm | Mode::Acknowledge) {
-        return dialog_action(key, mode);
+    if let Mode::Dialog(answers) = mode {
+        return dialog_action(key, answers);
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     Some(match (key.code, ctrl) {
@@ -36,7 +36,7 @@ pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
             Mode::Browse => Action::Quit,
             // A dialog's own answers are settled before this table is reached, so
             // only browsing and editing arrive here.
-            Mode::Editing | Mode::Confirm | Mode::Acknowledge => Action::Unwind,
+            Mode::Editing | Mode::Dialog(_) => Action::Unwind,
         },
 
         // Preview paging. Bound before the plain motions so Ctrl-D/Ctrl-U are
@@ -85,21 +85,35 @@ pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
     })
 }
 
-/// The answers a dialog admits, which are exactly the answers it lists.
+/// The letters one set of dialog answers is given, which are exactly the answers
+/// that set lists.
 ///
 /// `d` answers anything destructive and `Esc` is the one answer that is never
 /// destructive, here as everywhere else. On a destructive question `Enter` is
 /// bound to nothing at all: a reader arrives at one in a hurry, so a reflex press
 /// must not be the thing that destroys something. Where nothing is at stake
 /// `Enter` dismisses alongside `Esc`, because a second key is then kindness.
-fn dialog_action(key: KeyEvent, mode: Mode) -> Option<Action> {
+fn dialog_action(key: KeyEvent, answers: Answers) -> Option<Action> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     Some(match (key.code, ctrl) {
-        (KeyCode::Char('d'), false) if matches!(mode, Mode::Confirm) => Action::Delete,
-        (KeyCode::Enter, _) if matches!(mode, Mode::Acknowledge) => Action::Unwind,
+        (KeyCode::Char('d'), false) if matches!(answers, Answers::Destructive) => Action::Delete,
+        (KeyCode::Enter, _) if matches!(answers, Answers::Acknowledge) => Action::Unwind,
         (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => Action::Unwind,
         _ => return None,
     })
+}
+
+/// The answers a dialog lists, in the order it lists them, for the set the dialog
+/// asked for. A dialog says how to answer it, so the way out of one never depends
+/// on the hint strip a notice or a narrow terminal may have taken.
+///
+/// Every answer leads with the key that gives it, and that key is bound in the
+/// same set: a dialog naming a letter it does not answer would seal the reader in.
+pub fn dialog_answers(answers: Answers) -> &'static [&'static str] {
+    match answers {
+        Answers::Destructive => &["d remove", "Esc cancel"],
+        Answers::Acknowledge => &["Esc / Enter dismiss"],
+    }
 }
 
 /// The bindings as the help overlay and the footer present them: one row per
@@ -151,17 +165,9 @@ pub const FOOTER_ESSENTIAL: &[&str] = &["q quit", "? keys"];
 /// own order rather than reordered per row, so a letter keeps its relative place
 /// from row to row instead of moving with what a row happens to offer.
 ///
-/// Each hint travels with the intent it names, because the strip lists the subset
+/// Each hint travels with the action it names, because the strip lists the subset
 /// the frozen row offers and only the state machine knows which that is.
-pub const FOOTER_HINTS_EDITING: &[(Action, &str)] = &[(Action::Delete, "d remove")];
-
-/// The answers a destructive question lists, in the order it lists them. A dialog
-/// says how to answer it, so the way out of one never depends on the hint strip a
-/// notice or a narrow terminal may have taken.
-pub const DIALOG_ANSWERS_CONFIRM: &[&str] = &["d remove", "Esc cancel"];
-
-/// The answers a dialog that only reports lists; see [`DIALOG_ANSWERS_CONFIRM`].
-pub const DIALOG_ANSWERS_ACKNOWLEDGE: &[&str] = &["Esc / Enter dismiss"];
+pub const FOOTER_HINTS_EDITING: &[(EditingAction, &str)] = &[(EditingAction::Delete, "d remove")];
 
 /// Editing mode's essential pair. Neither browse hint applies — `q` does not quit
 /// while the mode is on, and the way out of the mode is not the way out of a
@@ -182,6 +188,11 @@ mod tests {
 
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// Every mode a dialog puts the keyboard under, one per set of answers.
+    fn dialog_modes() -> Vec<Mode> {
+        Answers::ALL.iter().copied().map(Mode::Dialog).collect()
     }
 
     #[test]
@@ -264,12 +275,10 @@ mod tests {
     fn unbound_keys_are_ignored() {
         // A key no mode binds is ignored in every mode, dialogs included: there
         // is no layer that quietly gives a spare letter a meaning of its own.
-        for mode in [
-            Mode::Browse,
-            Mode::Editing,
-            Mode::Confirm,
-            Mode::Acknowledge,
-        ] {
+        for mode in [Mode::Browse, Mode::Editing]
+            .into_iter()
+            .chain(dialog_modes())
+        {
             assert_eq!(action_for(plain(KeyCode::Char('x')), mode), None);
             assert_eq!(action_for(plain(KeyCode::F(5)), mode), None);
         }
@@ -293,37 +302,33 @@ mod tests {
 
     #[test]
     fn the_destructive_answer_is_the_same_letter_and_never_the_reflex_key() {
+        let destructive = Mode::Dialog(Answers::Destructive);
         // The letter that asks for a deletion is the letter that answers for it.
         assert_eq!(
-            action_for(plain(KeyCode::Char('d')), Mode::Confirm),
+            action_for(plain(KeyCode::Char('d')), destructive),
             action_for(plain(KeyCode::Char('d')), Mode::Editing)
         );
         // A reader arrives at a destructive question in a hurry: `Enter` is bound
         // to nothing at all there, so a reflex press cannot be what destroys.
-        assert_eq!(action_for(plain(KeyCode::Enter), Mode::Confirm), None);
+        assert_eq!(action_for(plain(KeyCode::Enter), destructive), None);
         // `Esc` is the answer that is never destructive, anywhere.
         assert_eq!(
-            action_for(plain(KeyCode::Esc), Mode::Confirm),
+            action_for(plain(KeyCode::Esc), destructive),
             Some(Action::Unwind)
         );
-        assert_eq!(action_for(ctrl('c'), Mode::Confirm), Some(Action::Unwind));
+        assert_eq!(action_for(ctrl('c'), destructive), Some(Action::Unwind));
     }
 
     #[test]
     fn a_dialog_that_only_reports_is_dismissed_by_either_key() {
+        let acknowledge = Mode::Dialog(Answers::Acknowledge);
         // Nothing is at stake, so a second key is kindness.
         for code in [KeyCode::Esc, KeyCode::Enter] {
-            assert_eq!(
-                action_for(plain(code), Mode::Acknowledge),
-                Some(Action::Unwind)
-            );
+            assert_eq!(action_for(plain(code), acknowledge), Some(Action::Unwind));
         }
         // And nothing else: neither answer destroys anything, so there is no
         // destructive answer to offer.
-        assert_eq!(
-            action_for(plain(KeyCode::Char('d')), Mode::Acknowledge),
-            None
-        );
+        assert_eq!(action_for(plain(KeyCode::Char('d')), acknowledge), None);
     }
 
     #[test]
@@ -331,7 +336,7 @@ mod tests {
         // A question is critical by construction — the flash carries everything
         // that is not — so no key pressed at one may move, reload or end the
         // session underneath it.
-        for mode in [Mode::Confirm, Mode::Acknowledge] {
+        for mode in dialog_modes() {
             for code in [
                 KeyCode::Char('q'),
                 KeyCode::Char('j'),
@@ -355,9 +360,49 @@ mod tests {
             let letter = hint.chars().next().expect("a hint leads with its key");
             assert_eq!(
                 action_for(plain(KeyCode::Char(letter)), Mode::Editing),
-                Some(*action),
+                Some(action.intent()),
                 "{hint:?}"
             );
+        }
+    }
+
+    #[test]
+    fn every_action_a_row_may_offer_has_exactly_one_hint() {
+        // The strip lists the subset of these the frozen row offers, so an action
+        // with no hint is one no reader can discover, and a second hint for one
+        // action is a letter taught twice.
+        for action in EditingAction::ALL {
+            let hints = FOOTER_HINTS_EDITING
+                .iter()
+                .filter(|(bound, _)| bound == action)
+                .count();
+            assert_eq!(hints, 1, "{action:?}");
+        }
+        // And no hint names anything else: a hint the offer table cannot decide on
+        // would be a letter the strip shows and no row answers.
+        assert_eq!(FOOTER_HINTS_EDITING.len(), EditingAction::ALL.len());
+    }
+
+    #[test]
+    fn every_answer_a_dialog_lists_is_one_that_set_admits() {
+        for answers in Answers::ALL.iter().copied() {
+            let listed = dialog_answers(answers);
+            // A dialog that lists no answer seals the reader inside it.
+            assert!(!listed.is_empty(), "{answers:?} lists no way to answer it");
+            for answer in listed {
+                // Every answer leads with the key that gives it. Where that key is
+                // a letter it is checked here; the named keys — `Esc`, `Enter` —
+                // are pinned by the tests above, one per set, because their
+                // spelling is not their key code.
+                let leading = answer.split_whitespace().next().expect("a leading key");
+                let mut chars = leading.chars();
+                if let (Some(letter), None) = (chars.next(), chars.next()) {
+                    assert!(
+                        action_for(plain(KeyCode::Char(letter)), Mode::Dialog(answers)).is_some(),
+                        "{answer:?} is listed but not admitted by {answers:?}"
+                    );
+                }
+            }
         }
     }
 }

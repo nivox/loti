@@ -33,12 +33,6 @@ const EDITING_INDICATOR: &str = "── EDITING ──";
 /// carries nothing.
 const GUTTER_BAR: &str = "▌";
 
-/// The titles the two dialogs carry. Fixed, so what a dialog is stays legible
-/// when its text is the store's own and no browser word introduces it.
-const CONFIRM_TITLE: &str = " confirm ";
-/// See [`CONFIRM_TITLE`].
-const REFUSAL_TITLE: &str = " the store refused the change ";
-
 /// How wide a dialog wants to be. Fixed rather than sized to its content: a
 /// refusal can be a paragraph, and a float as wide as the terminal would stop
 /// reading as something laid over the screen.
@@ -93,19 +87,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     match app.modal() {
         Some(Modal::Help) => draw_help(f, f.area(), theme),
-        Some(Modal::Confirm(question)) => draw_dialog(
+        // One widget for every dialog: it draws what the dialog carries, so a
+        // further kind of question needs nothing here.
+        Some(Modal::Dialog(dialog)) => draw_dialog(
             f,
             theme,
-            CONFIRM_TITLE,
-            question,
-            keymap::DIALOG_ANSWERS_CONFIRM,
-        ),
-        Some(Modal::Refusal(message)) => draw_dialog(
-            f,
-            theme,
-            REFUSAL_TITLE,
-            message,
-            keymap::DIALOG_ANSWERS_ACKNOWLEDGE,
+            dialog.title(),
+            dialog.message(),
+            keymap::dialog_answers(dialog.answers()),
         ),
         None => {}
     }

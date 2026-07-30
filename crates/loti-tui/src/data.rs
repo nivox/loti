@@ -564,6 +564,33 @@ pub fn edit_target(store: &Store, selection: &Selection) -> Result<EditTarget> {
     })
 }
 
+/// A change to the store, naming what is written and what it is written to.
+///
+/// Invariant: a dialog carries the write its answer performs, so the state
+/// machine that answers a question names no operation of its own — a new
+/// confirmation is a value here rather than another branch there.
+///
+/// A write names its target by the row's own [`Selection`], not by a pre-checked
+/// pair of parts: the seam that carries it out is the one place that judges
+/// whether the target is the kind of thing the write applies to, and refuses by
+/// name when it is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Write {
+    /// Take one label off the container it sits on.
+    RemoveLabel(Selection),
+}
+
+/// Carry out a write, returning the store's own refusal when it refuses.
+///
+/// The browser never judges a write itself: only the store can, so the action is
+/// offered, attempted, and whatever comes back is shown — which is why nothing
+/// here pre-checks a store rule.
+pub fn perform(store: &Store, write: &Write) -> Result<()> {
+    match write {
+        Write::RemoveLabel(selection) => remove_label(store, selection),
+    }
+}
+
 /// Take one label off the container it sits on.
 ///
 /// A label set has no rename, so a label is only ever removed: renaming one is
@@ -577,7 +604,7 @@ pub fn edit_target(store: &Store, selection: &Selection) -> Result<EditTarget> {
 /// No stamp guards this write: a stamp is the precondition of a free-form
 /// replacement, and removing one member of a set cannot silently discard text
 /// someone else wrote.
-pub fn remove_label(store: &Store, selection: &Selection) -> Result<()> {
+fn remove_label(store: &Store, selection: &Selection) -> Result<()> {
     // Only a label row offers removal, so any other selection is a caller that
     // has lost track of what its row points at.
     let Selection::Label(container, label) = selection else {
@@ -1400,17 +1427,22 @@ mod tests {
         let before = fx.epic_labels();
         assert!(before.len() > 1, "the promise needs more than one label");
 
-        remove_label(
+        perform(
             &fx.store,
-            &Selection::Label(Container::Epic(fx.epic.clone()), before[0].clone()),
+            &Write::RemoveLabel(Selection::Label(
+                Container::Epic(fx.epic.clone()),
+                before[0].clone(),
+            )),
         )
         .unwrap();
         assert_eq!(fx.epic_labels(), before[1..].to_vec());
 
         // Only a label row offers removal, so a selection that is not a label is a
         // caller that has lost track of what its row points at — refused by name,
-        // and with nothing written on the way to refusing.
-        let err = remove_label(&fx.store, &fx.epic_selection())
+        // and with nothing written on the way to refusing. Checked through the
+        // seam the browser itself writes through, so a wrongly wired dialog meets
+        // the same guard.
+        let err = perform(&fx.store, &Write::RemoveLabel(fx.epic_selection()))
             .expect_err("an epic is not one of its own labels")
             .to_string();
         assert!(err.contains(&fx.epic), "{err}");
