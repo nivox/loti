@@ -274,3 +274,59 @@ fn status_and_edit_confirmations_echo_the_target_name() {
         "epic edit echoes the name: {epic_edit}"
     );
 }
+
+#[test]
+fn the_write_precondition_is_offered_only_where_a_whole_field_is_replaced() {
+    let s = Store::new();
+    s.epic("e");
+    let t = s.ticket("e", "t");
+    let stamp = s
+        .ok(&["ticket", "show", &t, "--raw", "--field", "updated"])
+        .trim()
+        .to_string();
+
+    // Creating and appending replace nobody's text, and a status pick's conflict
+    // is simply the later of two deliberate choices: none of them takes a stamp,
+    // so the parser rejects the flag outright.
+    for args in [
+        vec!["epic", "create", "e2", "--name", "n", "--summary", "s"],
+        vec!["ticket", "comment", "add", &t, "-u"],
+        vec!["ticket", "status", &t, "--in-progress"],
+        vec!["ticket", "label", "add", &t, "l"],
+    ] {
+        let mut with_flag = args.clone();
+        with_flag.extend(["--expect-updated", &stamp]);
+        let err = s.fail_stdin(&with_flag, "x");
+        assert!(
+            err.contains("--expect-updated") || err.to_lowercase().contains("unexpected"),
+            "{args:?} must not accept a write precondition, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn an_unparseable_expected_stamp_is_refused_before_anything_is_written() {
+    let s = Store::new();
+    s.epic("e");
+    let err = s.fail_stdin(
+        &[
+            "epic",
+            "edit",
+            "e",
+            "--name",
+            "renamed",
+            "--expect-updated",
+            "yesterday",
+        ],
+        "",
+    );
+    assert!(
+        err.contains("updated") && err.contains("show"),
+        "the refusal must say where the stamp comes from, got: {err}"
+    );
+    let json = s.ok(&["epic", "show", "e", "--json"]);
+    assert!(
+        !json.contains("renamed"),
+        "a rejected stamp leaves the target untouched: {json}"
+    );
+}

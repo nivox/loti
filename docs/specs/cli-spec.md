@@ -35,6 +35,18 @@ document assumes that model.
 - **Actor.** `-u|--user` xor `-a|--agent <name>` required **only** on comment
   add/edit/delete. Everything else is actor-agnostic (assets: anyone
   add/update/show/delete/list; asset delete is **hard**).
+- **Write precondition (opt-in).** The modifiers that replace a **whole field** —
+  `epic edit`, `ticket edit`, and `comment edit` — MAY carry
+  `--expect-updated <stamp>`, naming the target's `updated` value exactly as
+  `show` prints it. The write MUST apply only while the stored stamp still equals
+  it; otherwise it MUST be refused with a non-zero exit **having written
+  nothing**. Granularity is the **target**, not the field: any concurrent change
+  to the same epic or ticket moves its `updated` stamp and so refuses the write.
+  Omitting the flag names no precondition — **last write wins**, exactly as
+  before the flag existed. Creates, appends (`comment add`, `label add`,
+  `blocked-by add`) and pickers (`status`, `claim`) MUST NOT offer it: an append
+  adds an entry of its own rather than replacing anyone's text, and a pick's
+  "conflict" is simply the later of two deliberate choices.
 - **Mutation confirmations.** A successful `edit`/`status` on an epic or ticket
   confirms on stdout **naming the target** — the ref/id **and** its name — since
   refs are numeric and a mistyped but valid ref would otherwise apply silently
@@ -58,6 +70,7 @@ loti migrate-store       # align an older on-disk format to this binary
 loti epic create <epic-id> --name <s> --summary <s> [--label <l>]...   # body ← stdin|--file
 loti epic show   <id> [--field <f> | --fields <f,…>] [--markdown|--json|--raw]
 loti epic edit   <id> [--name <s>] [--summary <s>] [--file <path>]
+                      [--expect-updated <stamp>]      # apply only if unchanged
 loti epic status <id> (--closed [--reason <s>] | --open)               # set-only
 loti epic label   (add|remove|list) <id> [<label>…]
 loti epic comment (add|edit|delete|list) <id> …
@@ -67,6 +80,7 @@ loti epic list   [filters — see Filtering model for `list`]
 loti ticket create <epic-id> [--parent <ref>] --name <s> --summary <s> [--label <l>]...  # body ← stdin|--file
 loti ticket show   <ref> [--field <f> | --fields <f,…>] [--markdown|--json|--raw]
 loti ticket edit   <ref> [--name <s>] [--summary <s>] [--parent <ref>] [--file <path>]
+                        [--expect-updated <stamp>]    # apply only if unchanged
 loti ticket status <ref> (--to-do | --in-progress |
                           --blocked --reason <s> |
                           --done | --closed --reason <s> [--cascade])   # set-only
@@ -79,7 +93,8 @@ loti ticket list   <epic-id>[/<n>] [--shallow] [filters]              # scope re
 
 # Collections (identical under epic and ticket; <ref> = <id> or <epic-id>/<n>)
 loti <e|t> comment add    <ref> (-u | -a <agent>) [--file <path>]      # text ← stdin|--file (required)
-loti <e|t> comment edit   <ref> <comment-id> (-u | -a <agent>) [--file <path>]  # own author only
+loti <e|t> comment edit   <ref> <comment-id> (-u | -a <agent>) [--file <path>]
+                          [--expect-updated <stamp>]                  # own author only
 loti <e|t> comment delete <ref> <comment-id> (-u | -a <agent>)        # own author only; soft
 loti <e|t> comment list   <ref> [--include-deleted]
 loti <e|t> asset add    <ref> --name <name> [--file <path>] [--description <s>]  # data ← stdin|--file; create-only

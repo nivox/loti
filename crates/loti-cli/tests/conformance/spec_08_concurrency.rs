@@ -8,12 +8,23 @@
 //!   * a mutation never leaves a torn/partial target file (atomic rename);
 //!   * a stale advisory lock (an abandoned staging temp) makes a mutation fail
 //!     fast rather than hang or clobber;
-//!   * a cascade is idempotent — re-running one that stopped partway converges.
+//!   * a cascade is idempotent — re-running one that stopped partway converges;
+//!   * the commands that replace a whole field carry the opt-in write
+//!     precondition: named, the stamp must still match or the write is refused
+//!     with nothing written; omitted, the last write wins as it always did.
 
 use std::sync::mpsc;
 use std::thread;
 
 use super::harness::Store;
+
+/// The target's current `updated` stamp, read back through the CLI exactly as a
+/// caller composing a replacement would read it.
+fn updated_of(s: &Store, noun: &str, reference: &str) -> String {
+    s.ok(&[noun, "show", reference, "--raw", "--field", "updated"])
+        .trim()
+        .to_string()
+}
 
 #[test]
 fn competing_writers_get_distinct_never_reused_numbers() {
@@ -169,4 +180,178 @@ fn cascade_close_is_idempotent_and_re_runnable() {
             "{r} still closed: {json}"
         );
     }
+}
+
+#[test]
+fn an_epic_edit_applies_on_a_current_stamp_and_is_refused_on_a_stale_one() {
+    let s = Store::new();
+    s.epic("e");
+    let stamp = updated_of(&s, "epic", "e");
+
+    // The stamp the caller read is still the stored one, so the replacement lands.
+    s.ok_stdin(
+        &[
+            "epic",
+            "edit",
+            "e",
+            "--name",
+            "kept",
+            "--expect-updated",
+            &stamp,
+        ],
+        "",
+    );
+
+    // Another actor touches the same epic in a way that replaces none of the
+    // fields being edited. Granularity is the epic, not the field, so the stamp
+    // the caller is still holding has gone stale.
+    s.ok(&["epic", "label", "add", "e", "mid-edit"]);
+    let err = s.fail_stdin(
+        &[
+            "epic",
+            "edit",
+            "e",
+            "--name",
+            "lost",
+            "--expect-updated",
+            &stamp,
+        ],
+        "",
+    );
+    assert!(
+        err.contains("changed since it was read") && err.contains("nothing was written"),
+        "a stale stamp is refused as a conflict, got: {err}"
+    );
+
+    // Nothing was written: the name is the one the accepted edit left, and the
+    // concurrent label survived.
+    let json = s.ok(&["epic", "show", "e", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["name"], "kept", "the refused replacement never landed");
+    assert_eq!(
+        v["labels"],
+        serde_json::json!(["mid-edit"]),
+        "the concurrent change was not rolled back"
+    );
+}
+
+#[test]
+fn a_ticket_edit_applies_on_a_current_stamp_and_is_refused_on_a_stale_one() {
+    let s = Store::new();
+    s.epic("e");
+    let t = s.ticket("e", "t");
+    let stamp = updated_of(&s, "ticket", &t);
+
+    s.ok_stdin(
+        &[
+            "ticket",
+            "edit",
+            &t,
+            "--summary",
+            "kept",
+            "--expect-updated",
+            &stamp,
+        ],
+        "",
+    );
+
+    s.ok(&["ticket", "label", "add", &t, "mid-edit"]);
+    let err = s.fail_stdin(
+        &[
+            "ticket",
+            "edit",
+            &t,
+            "--summary",
+            "lost",
+            "--expect-updated",
+            &stamp,
+        ],
+        "",
+    );
+    assert!(
+        err.contains("changed since it was read") && err.contains("nothing was written"),
+        "a stale stamp is refused as a conflict, got: {err}"
+    );
+
+    let json = s.ok(&["ticket", "show", &t, "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["summary"], "kept", "the refused replacement never landed");
+}
+
+#[test]
+fn a_comment_edit_applies_on_a_current_stamp_and_is_refused_on_a_stale_one() {
+    let s = Store::new();
+    s.epic("e");
+    let t = s.ticket("e", "t");
+    s.ok_stdin(&["ticket", "comment", "add", &t, "-u"], "first draft");
+    let stamp = updated_of(&s, "ticket", &t);
+
+    s.ok_stdin(
+        &[
+            "ticket",
+            "comment",
+            "edit",
+            &t,
+            "1",
+            "-u",
+            "--expect-updated",
+            &stamp,
+        ],
+        "kept",
+    );
+
+    // An appended comment moves the ticket's stamp, so a replacement of an
+    // earlier comment's text composed before it arrived is refused.
+    s.ok_stdin(
+        &["ticket", "comment", "add", &t, "-u"],
+        "a note arriving mid-edit",
+    );
+    let err = s.fail_stdin(
+        &[
+            "ticket",
+            "comment",
+            "edit",
+            &t,
+            "1",
+            "-u",
+            "--expect-updated",
+            &stamp,
+        ],
+        "lost",
+    );
+    assert!(
+        err.contains("changed since it was read") && err.contains("nothing was written"),
+        "a stale stamp is refused as a conflict, got: {err}"
+    );
+
+    let listed = s.ok(&["ticket", "comment", "list", &t]);
+    assert!(
+        listed.contains("kept") && !listed.contains("lost"),
+        "the refused replacement never landed: {listed}"
+    );
+    assert!(
+        listed.contains("a note arriving mid-edit"),
+        "the concurrent append survived: {listed}"
+    );
+}
+
+#[test]
+fn naming_no_stamp_still_overwrites_a_target_that_changed() {
+    // Omitting the precondition is exactly the behaviour that shipped before it
+    // existed: the write applies to whatever is there now.
+    let s = Store::new();
+    s.epic("e");
+    let t = s.ticket("e", "t");
+    s.ok(&[
+        "ticket",
+        "edit",
+        &t,
+        "--summary",
+        "written by another actor",
+    ]);
+    s.ok_stdin(&["ticket", "edit", &t, "--summary", "last write wins"], "");
+
+    let json = s.ok(&["ticket", "show", &t, "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["summary"], "last write wins");
 }

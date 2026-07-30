@@ -198,6 +198,52 @@ mod tests {
         );
     }
 
+    /// The rendered help for one command: everything from its heading up to the
+    /// next command's separator, so an assertion about a command's flags cannot
+    /// be satisfied by a different command's.
+    fn section<'a>(text: &'a str, heading: &str) -> &'a str {
+        let marker = format!("  {heading}\n");
+        let start = text
+            .find(&marker)
+            .unwrap_or_else(|| panic!("missing heading: {heading}"))
+            + marker.len();
+        // A heading line is followed by its own closing separator line; the help
+        // body runs from there to the next command's separator.
+        let rest = &text[start..];
+        let body_at = rest.find('\n').map(|i| i + 1).unwrap_or(rest.len());
+        let body = &rest[body_at..];
+        let end = body.find("-----").unwrap_or(body.len());
+        &body[..end]
+    }
+
+    #[test]
+    fn carries_the_write_precondition_on_the_whole_field_replacements() {
+        let text = full();
+        // Every command that replaces a whole field offers the precondition, and
+        // its help says what a mismatch does rather than merely naming the flag.
+        for heading in [
+            "loti epic edit",
+            "loti ticket edit",
+            "loti epic comment edit",
+            "loti ticket comment edit",
+        ] {
+            let s = section(&text, heading);
+            assert!(
+                s.contains("--expect-updated <STAMP>"),
+                "{heading} must offer the write precondition, got: {s}"
+            );
+            assert!(
+                s.contains("refuse and write nothing"),
+                "{heading} must state what a mismatch does, got: {s}"
+            );
+        }
+        // An append replaces nobody's text, so it must not advertise a stamp.
+        assert!(
+            !section(&text, "loti ticket comment add").contains("--expect-updated"),
+            "appending a comment takes no expected stamp"
+        );
+    }
+
     #[test]
     fn shows_the_root_options_including_help_full() {
         let text = full();

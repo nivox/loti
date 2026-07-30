@@ -13,6 +13,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
+use jiff::Timestamp;
 
 /// `loti` — a local, markdown-backed ticket tracker driven entirely by this CLI.
 ///
@@ -153,6 +154,8 @@ pub struct EpicEditArgs {
     /// New body source: stdin or --file (never inline).
     #[command(flatten)]
     pub content: ContentInput,
+    #[command(flatten)]
+    pub expect: ExpectStamp,
 }
 
 #[derive(Debug, Args)]
@@ -330,6 +333,8 @@ pub struct TicketEditArgs {
     /// New body source: stdin or --file (never inline).
     #[command(flatten)]
     pub content: ContentInput,
+    #[command(flatten)]
+    pub expect: ExpectStamp,
 }
 
 #[derive(Debug, Args)]
@@ -515,6 +520,8 @@ pub struct CommentEditArgs {
     /// Replacement text: stdin or --file (required; never inline).
     #[command(flatten)]
     pub content: ContentInput,
+    #[command(flatten)]
+    pub expect: ExpectStamp,
 }
 
 #[derive(Debug, Args)]
@@ -627,6 +634,36 @@ pub struct ContentInput {
     /// PATH `-` to name stdin explicitly (same as piping with no --file).
     #[arg(long, value_name = "PATH")]
     pub file: Option<PathBuf>,
+}
+
+/// The opt-in write precondition carried by the commands that replace a whole
+/// field — a name, a summary, a body, one comment's text. Declared once and
+/// flattened into each, so those commands cannot state different rules or parse
+/// the stamp differently.
+///
+/// The precondition is per target, not per field: any change to the same epic or
+/// ticket moves its `updated` stamp, so an unrelated one refuses the edit too.
+/// Appending a comment takes no stamp — an append adds a slot of its own rather
+/// than replacing anyone's text.
+#[derive(Debug, Args)]
+pub struct ExpectStamp {
+    /// Apply only while the target's `updated` stamp is still STAMP; if anyone
+    /// changed the target since, refuse and write nothing. Read STAMP with
+    /// `show` before composing the replacement, and pass it back verbatim.
+    /// Omitted, the edit applies regardless and the last write wins.
+    #[arg(long = "expect-updated", value_name = "STAMP", value_parser = parse_stamp)]
+    pub expect_updated: Option<Timestamp>,
+}
+
+/// Accept the stamp in exactly the form `show` prints it, so the value is copied
+/// rather than reformatted, and say so when it is not one.
+fn parse_stamp(raw: &str) -> Result<Timestamp, String> {
+    raw.parse::<Timestamp>().map_err(|_| {
+        format!(
+            "`{raw}` is not a timestamp: pass the target's `updated` value \
+             exactly as `show` prints it (for example 2024-01-31T09:15:00Z)"
+        )
+    })
 }
 
 /// `show` projection: at most one of `--field` / `--fields`.
