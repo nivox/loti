@@ -12,7 +12,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::action::{Action, AnswerWords, Answers, EditingAction, Fields, Mode};
+use crate::action::{Action, AnswerWords, Answers, EditingAction, Fields, Lines, Mode, Shape};
 
 /// The intent a key press carries in a mode, or `None` if it is not bound there.
 pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
@@ -25,8 +25,8 @@ pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
     // An open surface takes the whole keyboard, so nothing below is consulted:
     // a letter typed into a field is a character, never the action that letter
     // carries one layer up.
-    if let Mode::Surface(fields) = mode {
-        return surface_action(key, fields);
+    if let Mode::Surface(shape) = mode {
+        return surface_action(key, shape);
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     Some(match (key.code, ctrl) {
@@ -102,39 +102,57 @@ pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
 /// action that letter carries one layer up. A key this table does not bind is
 /// ignored rather than handed to the level underneath.
 ///
-/// How many fields the surface holds is an input rather than something read off a
-/// key, because the reflex key means one thing on each shape.
-fn surface_action(key: KeyEvent, fields: Fields) -> Option<Action> {
+/// The surface's shape is an input rather than something read off a key, because
+/// the reflex key means one thing on each shape: how many fields there are decides
+/// whether there is another to move to, and how many lines the focused field holds
+/// decides whether a line break is content.
+fn surface_action(key: KeyEvent, shape: Shape) -> Option<Action> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     Some(match (key.code, ctrl) {
         // Raw mode is already on, which clears `IXON`, so Ctrl-S arrives as a key
         // press instead of being eaten as flow control.
         (KeyCode::Char('s'), true) => Action::Accept,
-        // A one-field surface is finished by the reflex key too: there is no next
-        // field for it to move to. Where there is one it moves instead, so the save
-        // key is the only way to accept a form and a reader pressing on through the
-        // fields never submits one by arriving at the last.
-        (KeyCode::Enter, _) => match fields {
-            Fields::One => Action::Accept,
-            Fields::Several => Action::NextField,
+        // In a field that holds many lines the reflex key is content: a line break
+        // is what a reader means by it while writing prose, so accepting there is
+        // the save key's alone however many fields the surface has. Where the field
+        // holds one line the key finishes a one-field surface — there is no next
+        // field for it to move to — and moves on through a form, so the save key is
+        // the only way to accept one and pressing through the fields never submits
+        // it by arriving at the last.
+        (KeyCode::Enter, _) => match shape.lines {
+            Lines::Many => Action::Insert('\n'),
+            Lines::One => match shape.fields {
+                Fields::One => Action::Accept,
+                Fields::Several => Action::NextField,
+            },
         },
         // Field navigation, bound where there is another field to reach and nowhere
         // else: a key that did nothing on a one-field surface would be a key taught
         // for nothing.
-        (KeyCode::Tab, _) if matches!(fields, Fields::Several) => Action::NextField,
-        (KeyCode::BackTab, _) if matches!(fields, Fields::Several) => Action::PreviousField,
+        (KeyCode::Tab, _) if matches!(shape.fields, Fields::Several) => Action::NextField,
+        (KeyCode::BackTab, _) if matches!(shape.fields, Fields::Several) => Action::PreviousField,
         (KeyCode::Char('g'), true) => Action::ExternalEditor,
         (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => Action::Unwind,
         // The one help key that can be pressed inside a field.
         (KeyCode::F(1), _) => Action::ToggleHelp,
 
-        // The emacs motions, with the arrows and the line keys beside them. A
-        // single-line field's start and end are its line's, so the keys that page
-        // a preview while browsing move within the field here.
+        // The emacs motions, with the arrows and the line keys beside them. These
+        // are a line's start and end, which in a field holding one line is the whole
+        // of it, so the keys that page a preview while browsing move within the
+        // field here.
         (KeyCode::Char('a'), true) | (KeyCode::Home, _) => Action::MoveToStart,
         (KeyCode::Char('e'), true) | (KeyCode::End, _) => Action::MoveToEnd,
         (KeyCode::Char('b'), true) | (KeyCode::Left, _) => Action::MoveLeft,
         (KeyCode::Char('f'), true) | (KeyCode::Right, _) => Action::MoveRight,
+        // Vertical motion, bound where there is a line to move to and nowhere else:
+        // in a field holding one line these keys would land where they started, and
+        // a key taught for that is a key taught for nothing.
+        (KeyCode::Up, _) | (KeyCode::Char('p'), true) if matches!(shape.lines, Lines::Many) => {
+            Action::MoveUp
+        }
+        (KeyCode::Down, _) | (KeyCode::Char('n'), true) if matches!(shape.lines, Lines::Many) => {
+            Action::MoveDown
+        }
 
         // Ctrl-H is unavailable as a binding of its own: terminals send 0x08 for
         // Backspace, so it cannot be told apart from the key that deletes a
@@ -194,7 +212,10 @@ pub fn dialog_answers(answers: Answers, words: AnswerWords) -> Vec<String> {
 /// The bindings as the help overlay and the footer present them: one row per
 /// group, so both surfaces describe the same keymap without restating it.
 pub const HELP: &[(&str, &str)] = &[
-    ("j / k / ↓ / ↑", "move the cursor"),
+    (
+        "j / k / ↓ / ↑",
+        "move the cursor; ↑ / ↓ by line in a text area",
+    ),
     ("g / G", "first / last row"),
     (
         "Enter / l / →",
@@ -206,7 +227,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("PgDn / PgUp / Space", "scroll the preview a screen"),
     (
         "Home / End",
-        "preview start / end; a field's ends inside one",
+        "preview start / end; a field line's ends inside one",
     ),
     ("< / > / =", "narrow / widen / reset the panes"),
     ("z", "preview fills the width; mouse released"),
@@ -215,7 +236,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("d", "editing mode: remove or delete the row, confirmed"),
     (
         "Ctrl-S / Enter",
-        "save the open surface; Enter if it has one field",
+        "save; Enter unless it is a newline or the next field",
     ),
     (
         "Tab / Shift-Tab",
@@ -224,7 +245,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("Ctrl-G", "edit the open field in $EDITOR"),
     (
         "Ctrl-A / Ctrl-E",
-        "field start / end; Ctrl-B / Ctrl-F or ← / → by one",
+        "line start / end; Ctrl-B / Ctrl-F or ← / → by one",
     ),
     ("r", "re-read the store"),
     ("? / F1", "these keys; F1 works inside a field"),
@@ -316,11 +337,35 @@ mod tests {
         Answers::ALL.iter().copied().map(Mode::Dialog).collect()
     }
 
-    /// Every mode an open surface puts the keyboard under, one per field shape: a
-    /// key that belongs to the field belongs to it on either shape, so a test
-    /// about the field walks both.
+    /// Every mode an open surface puts the keyboard under, one per shape: a key
+    /// that belongs to the field belongs to it on every shape, so a test about the
+    /// field walks them all.
     fn surface_modes() -> Vec<Mode> {
-        Fields::ALL.iter().copied().map(Mode::Surface).collect()
+        Shape::ALL.iter().copied().map(Mode::Surface).collect()
+    }
+
+    /// A surface holding this many fields, whose focused field holds one line —
+    /// the shape every surface the browser ships has.
+    fn one_line(fields: Fields) -> Mode {
+        Mode::Surface(Shape {
+            fields,
+            lines: Lines::One,
+        })
+    }
+
+    /// A surface whose focused field holds many lines, at each field count: the
+    /// count must not change what the reflex key means there.
+    fn text_areas() -> Vec<Mode> {
+        Fields::ALL
+            .iter()
+            .copied()
+            .map(|fields| {
+                Mode::Surface(Shape {
+                    fields,
+                    lines: Lines::Many,
+                })
+            })
+            .collect()
     }
 
     /// Words for a dialog's answers, so a test about the letters is not also a
@@ -493,7 +538,7 @@ mod tests {
 
     #[test]
     fn a_one_field_surface_is_accepted_by_either_key_and_left_by_the_way_out() {
-        let one = Mode::Surface(Fields::One);
+        let one = one_line(Fields::One);
         // Ctrl-S accepts anywhere; a one-field surface has no next field for the
         // reflex key to move to, so it accepts too.
         for key in [ctrl('s'), plain(KeyCode::Enter)] {
@@ -529,7 +574,7 @@ mod tests {
 
     #[test]
     fn a_surface_with_several_fields_is_navigated_and_the_reflex_key_moves_rather_than_accepts() {
-        let several = Mode::Surface(Fields::Several);
+        let several = one_line(Fields::Several);
         // The reflex key means what the shape says, which is why the shape reaches
         // this map at all: on a form it moves on, so pressing through the fields
         // never submits one, and the save key stays the only way to accept.
@@ -538,9 +583,9 @@ mod tests {
             Some(Action::NextField)
         );
         assert_eq!(
-            action_for(plain(KeyCode::Enter), Mode::Surface(Fields::One)),
+            action_for(plain(KeyCode::Enter), one_line(Fields::One)),
             Some(Action::Accept),
-            "the reflex key means the same thing on both shapes"
+            "the reflex key means the same thing on both counts"
         );
         // Forwards and backwards, by the keys a form is navigated with everywhere.
         assert_eq!(
@@ -580,7 +625,7 @@ mod tests {
             Some(Action::ToggleHelp)
         );
         assert_eq!(
-            action_for(plain(KeyCode::Char('?')), Mode::Surface(Fields::One)),
+            action_for(plain(KeyCode::Char('?')), one_line(Fields::One)),
             Some(Action::Insert('?'))
         );
     }
@@ -591,12 +636,12 @@ mod tests {
         // not answer teaches a key that does nothing. These are not the editing
         // actions' hints: a row offers those, and while a surface is open no row
         // offers anything.
-        for fields in Fields::ALL.iter().copied() {
-            let hints = footer_hints_surface(fields);
+        for shape in Shape::ALL.iter().copied() {
+            let hints = footer_hints_surface(shape.fields);
             for hint in &hints {
                 assert!(
-                    action_for(key_named(leading(hint)), Mode::Surface(fields)).is_some(),
-                    "{hint:?} names a key {fields:?} ignores"
+                    action_for(key_named(leading(hint)), Mode::Surface(shape)).is_some(),
+                    "{hint:?} names a key {shape:?} ignores"
                 );
             }
             // And the field keys are hinted exactly where they are bound: a shape
@@ -604,9 +649,64 @@ mod tests {
             // teach a key it ignores.
             assert_eq!(
                 hints.iter().any(|hint| leading(hint) == "Tab"),
-                fields == Fields::Several,
-                "{fields:?}: {hints:?}"
+                shape.fields == Fields::Several,
+                "{shape:?}: {hints:?}"
             );
+        }
+    }
+
+    #[test]
+    fn in_a_field_that_holds_many_lines_the_reflex_key_is_a_newline_and_only_the_save_key_accepts()
+    {
+        // The kind outranks the count, which is why both reach this map: a body
+        // buffer is one field, and the shape that accepts a one-field surface by
+        // reflex would submit a paragraph break as a finished body.
+        for mode in text_areas() {
+            assert_eq!(
+                action_for(plain(KeyCode::Enter), mode),
+                Some(Action::Insert('\n')),
+                "{mode:?}"
+            );
+            assert_eq!(
+                action_for(ctrl('s'), mode),
+                Some(Action::Accept),
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_field_that_holds_many_lines_is_moved_through_by_line_and_a_one_line_field_is_not() {
+        for mode in text_areas() {
+            for (key, intent) in [
+                (plain(KeyCode::Up), Action::MoveUp),
+                (plain(KeyCode::Down), Action::MoveDown),
+                (ctrl('p'), Action::MoveUp),
+                (ctrl('n'), Action::MoveDown),
+            ] {
+                assert_eq!(action_for(key, mode), Some(intent), "{key:?} in {mode:?}");
+            }
+        }
+        // And nowhere else: a field holding one line has no line to move to, so
+        // the keys are unbound there rather than landing where they started — and
+        // the letters they are spelled with are still characters in it.
+        for fields in Fields::ALL.iter().copied() {
+            let mode = one_line(fields);
+            for key in [
+                plain(KeyCode::Up),
+                plain(KeyCode::Down),
+                ctrl('p'),
+                ctrl('n'),
+            ] {
+                assert_eq!(action_for(key, mode), None, "{key:?} in {mode:?}");
+            }
+            for c in ['p', 'n'] {
+                assert_eq!(
+                    action_for(plain(KeyCode::Char(c)), mode),
+                    Some(Action::Insert(c)),
+                    "{c:?} in {mode:?}"
+                );
+            }
         }
     }
 

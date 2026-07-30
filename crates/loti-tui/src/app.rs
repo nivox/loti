@@ -11,7 +11,7 @@ use anyhow::Result;
 use loti_core::store::Store;
 use ratatui_markdown::viewer::MarkdownViewer;
 
-use crate::action::{Action, AnswerWords, Answers, EditingAction, Fields, Mode};
+use crate::action::{Action, AnswerWords, Answers, EditingAction, Fields, Lines, Mode, Shape};
 use crate::data::{self, Collection, Container, Level, ReadOnly, Selection};
 use crate::keymap;
 use crate::nav::Nav;
@@ -308,9 +308,12 @@ impl Dialog {
 
 /// One text field of an editing surface.
 ///
-/// Invariant: the field holds one line. Whatever arrives with line breaks in it —
-/// the external editor's result — has them dropped rather than turned into
-/// spaces, because a space is content the reader did not type.
+/// Invariant: a field says how many lines it holds, and that answer is the whole
+/// of the difference. A field holding one line never holds a line break, whichever
+/// door text arrives through — a keystroke or an external editor's result — and
+/// breaks are dropped rather than turned into spaces, because a space is content
+/// the reader did not type. A field holding many keeps them, and its cursor moves
+/// between lines as well as along one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field {
     /// What the field is called wherever it has to be named: on the surface, and
@@ -323,6 +326,10 @@ pub struct Field {
     cursor: usize,
     /// Whether the store cannot be given this surface with the field left empty.
     required: bool,
+    /// How many lines it holds. Not a property of what is in it: an empty field
+    /// that holds many lines is still a text area, and a one-line field stays one
+    /// however long its value grows.
+    lines: Lines,
     /// Whether a content-mutating keystroke has landed here.
     ///
     /// Invariant: a flag, never a comparison against what the field started from.
@@ -337,12 +344,13 @@ pub struct Field {
 impl Field {
     /// An empty field, which is where every surface starts: nothing the browser
     /// puts there itself could be text the reader meant to write.
-    fn new(label: &'static str, required: bool) -> Self {
+    fn new(label: &'static str, required: bool, lines: Lines) -> Self {
         Self {
             label,
             value: String::new(),
             cursor: 0,
             required,
+            lines,
             dirty: false,
         }
     }
@@ -350,6 +358,12 @@ impl Field {
     /// What the field is called.
     pub fn label(&self) -> &'static str {
         self.label
+    }
+
+    /// How many lines it holds, which is what decides whether a line break in it
+    /// is content and whether there is anywhere to move vertically.
+    pub fn lines(&self) -> Lines {
+        self.lines
     }
 
     /// What it holds.
@@ -386,9 +400,14 @@ impl Field {
     fn apply(&mut self, action: Action) {
         match action {
             Action::Insert(c) => {
-                let at = self.byte_at(self.cursor);
-                self.value.insert(at, c);
-                self.cursor += 1;
+                // A character the field does not hold is dropped rather than
+                // refused: the keystroke still counts as typing, because dirty is
+                // what was pressed and not what differs.
+                if self.accepts(c) {
+                    let at = self.byte_at(self.cursor);
+                    self.value.insert(at, c);
+                    self.cursor += 1;
+                }
                 self.dirty = true;
             }
             Action::DeleteBefore => {
@@ -408,8 +427,31 @@ impl Field {
             }
             Action::MoveLeft => self.cursor = self.cursor.saturating_sub(1),
             Action::MoveRight => self.cursor = (self.cursor + 1).min(self.len()),
-            Action::MoveToStart => self.cursor = 0,
-            Action::MoveToEnd => self.cursor = self.len(),
+            // The line's ends, which in a field holding one line are the value's:
+            // one rule covers both kinds rather than one rule per kind that could
+            // come to disagree.
+            Action::MoveToStart => self.cursor = self.line(self.cursor).0,
+            Action::MoveToEnd => self.cursor = self.line(self.cursor).1,
+            // Vertical motion keeps the column, clamped to what the line it lands
+            // on has: a short line puts the cursor at its end rather than past it.
+            // A field with no line that way leaves the cursor alone — a field
+            // holding one line has none in either direction.
+            Action::MoveUp => {
+                let (start, _) = self.line(self.cursor);
+                let column = self.cursor - start;
+                if start > 0 {
+                    let (above, above_end) = self.line(start - 1);
+                    self.cursor = (above + column).min(above_end);
+                }
+            }
+            Action::MoveDown => {
+                let (start, end) = self.line(self.cursor);
+                let column = self.cursor - start;
+                if end < self.len() {
+                    let (below, below_end) = self.line(end + 1);
+                    self.cursor = (below + column).min(below_end);
+                }
+            }
             // Everything else is the surface's business or nobody's: a key the
             // field does not answer must not silently change what it holds.
             _ => {}
@@ -419,12 +461,46 @@ impl Field {
     /// Take an external editor's result, which counts as content the reader typed:
     /// the way out warns about it exactly as it does about typing.
     ///
-    /// The line breaks an editor leaves behind are dropped, because the field holds
-    /// one line — see [`Field`].
+    /// It goes through the same sieve a keystroke does, so a field holding one line
+    /// cannot be given a line break by the editor either — see [`Field`].
     fn replace(&mut self, text: &str) {
-        self.value = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+        let kept: String = text.chars().filter(|c| self.accepts(*c)).collect();
+        self.value = kept;
         self.cursor = self.len();
         self.dirty = true;
+    }
+
+    /// Whether a character may land in this field at all.
+    ///
+    /// A line break is content where the field holds many lines and is dropped
+    /// where it holds one. A carriage return is never content: nothing types one,
+    /// and an editor that hands back CRLF means one line break rather than a break
+    /// and a character no terminal shows.
+    fn accepts(&self, c: char) -> bool {
+        match c {
+            '\r' => false,
+            '\n' => matches!(self.lines, Lines::Many),
+            _ => true,
+        }
+    }
+
+    /// The line a character offset is on: where it starts, and the offset just past
+    /// its last character. A field holding one line has exactly one, spanning the
+    /// whole value.
+    fn line(&self, cursor: usize) -> (usize, usize) {
+        let chars: Vec<char> = self.value.chars().collect();
+        let cursor = cursor.min(chars.len());
+        let start = chars[..cursor]
+            .iter()
+            .rposition(|c| *c == '\n')
+            .map(|at| at + 1)
+            .unwrap_or(0);
+        let end = chars[cursor..]
+            .iter()
+            .position(|c| *c == '\n')
+            .map(|at| cursor + at)
+            .unwrap_or(chars.len());
+        (start, end)
     }
 
     /// How many characters the field holds, which is where the cursor may go up to.
@@ -451,13 +527,43 @@ impl Field {
 /// lands back in the buffer it was raised about, with the text intact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Surface {
-    /// What the float is titled: the action and the row it acts on, since the
-    /// float covers the row it was opened from.
+    /// What the surface is titled: the action and the row it acts on, since a
+    /// float covers the row it was opened from and the pane is not the row either.
     title: String,
     fields: Vec<Field>,
     /// Which field the keyboard is in.
     focus: usize,
+    /// Where it renders. Carried by the surface rather than worked out by the
+    /// drawing from what the surface happens to contain — see [`Placement`].
+    placement: Placement,
     commit: Commit,
+}
+
+/// Where an open surface renders.
+///
+/// Invariant: the surface says where, and the drawing obeys it. So a surface whose
+/// shape a centred float does not suit is a value here rather than a second
+/// drawing path, and the drawing never guesses from a surface's field count or
+/// field kinds where that surface belongs.
+///
+/// Whether an open surface may fill the width is a separate question and not
+/// settled here: a surface that renders in the pane renders wherever the pane is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    /// Centred over everything and as tall as its fields, covering the row it was
+    /// opened from — which is why its title names that row. The answer for a short
+    /// field, where keeping the row visible buys nothing.
+    Float,
+    /// In the preview pane, so the navigation pane keeps the frozen row visible
+    /// beside it. The answer for text long enough that a reader needs to see it
+    /// against what it belongs to.
+    Pane,
+}
+
+impl Placement {
+    /// Everywhere a surface may render, so the drawing that has to place them all
+    /// cannot then miss one.
+    pub const ALL: &'static [Placement] = &[Placement::Float, Placement::Pane];
 }
 
 /// What accepting a surface writes.
@@ -482,8 +588,9 @@ impl Surface {
     fn add_label(set: Selection, container: String) -> Self {
         Self {
             title: format!(" new label on {container} "),
-            fields: vec![Field::new(LABEL_FIELD, true)],
+            fields: vec![Field::new(LABEL_FIELD, true, Lines::One)],
             focus: 0,
+            placement: Placement::Float,
             commit: Commit::AddLabel(set),
         }
     }
@@ -494,15 +601,21 @@ impl Surface {
     fn add_blocker(list: Selection, container: String) -> Self {
         Self {
             title: format!(" new blocker on {container} "),
-            fields: vec![Field::new(BLOCKER_FIELD, true)],
+            fields: vec![Field::new(BLOCKER_FIELD, true, Lines::One)],
             focus: 0,
+            placement: Placement::Float,
             commit: Commit::AddBlocker(list),
         }
     }
 
-    /// What the float is titled.
+    /// What the surface is titled.
     pub fn title(&self) -> &str {
         &self.title
+    }
+
+    /// Where it renders, which is the surface's own say and not the drawing's.
+    pub fn placement(&self) -> Placement {
+        self.placement
     }
 
     /// Its fields, in the order they are filled in.
@@ -515,11 +628,26 @@ impl Surface {
         self.focus
     }
 
-    /// How many fields it holds, to the precision a key's meaning turns on. This
-    /// is the whole of what the key map is told about a surface, so the map decides
-    /// what the reflex key means rather than the surface deciding it after the fact.
-    pub fn shape(&self) -> Fields {
-        Fields::of(self.fields.len())
+    /// Its shape, to the precision a key's meaning turns on: how many fields it
+    /// holds, and how many lines the focused one holds. This is the whole of what
+    /// the key map is told about a surface, so the map decides what the reflex key
+    /// means rather than the surface deciding it after the fact.
+    ///
+    /// Recomputed on every ask rather than captured when the surface opens: the
+    /// focus moves and a field may come and go, so a captured shape is a key map
+    /// and a strip waiting to disagree with the surface they describe.
+    pub fn shape(&self) -> Shape {
+        Shape {
+            fields: Fields::of(self.fields.len()),
+            // A surface with no fields is not a surface, and the one-line kind is
+            // the answer that holds no line break: a keyboard with nowhere to type
+            // must not be the keyboard a line break is content in.
+            lines: self
+                .fields
+                .get(self.focus)
+                .map(Field::lines)
+                .unwrap_or(Lines::One),
+        }
     }
 
     /// Put the keyboard in the next or the previous field, wrapping round at
@@ -962,6 +1090,8 @@ impl App {
             | Action::MoveRight
             | Action::MoveToStart
             | Action::MoveToEnd
+            | Action::MoveUp
+            | Action::MoveDown
             | Action::NextField
             | Action::PreviousField => {}
 
@@ -1525,10 +1655,24 @@ mod tests {
 
     /// Walk back out to the epic roster, so a test that has been somewhere already
     /// can still say where it goes next from the top.
+    ///
+    /// Bounded, because repeating an intent until a condition holds is a hang when
+    /// the intent stops moving the reader: the bound is one level per crumb there
+    /// were to leave, so an intent that leaves none turns the whole suite from a
+    /// silent spin into one failure that says what it was waiting for.
     fn to_the_roster(app: &mut App) {
-        while app.nav().crumbs().len() > 1 {
+        for _ in 0..app.nav().crumbs().len() {
+            if app.nav().crumbs().len() == 1 {
+                return;
+            }
             app.apply(Action::Ascend).unwrap();
         }
+        assert_eq!(
+            app.nav().crumbs().len(),
+            1,
+            "leaving a level stopped reaching the roster: {:?}",
+            app.nav().crumbs()
+        );
     }
 
     /// Stand on the epic's own `labels` row, which is where an addition is
@@ -1614,6 +1758,12 @@ mod tests {
         assert!(app.surface().is_some(), "the add key opened no surface");
     }
 
+    /// The mode an open surface of this shape puts the keyboard under, so a test
+    /// names the shape rather than assembling one.
+    fn surface_mode(fields: Fields, lines: Lines) -> Mode {
+        Mode::Surface(Shape { fields, lines })
+    }
+
     /// The name of a field invented for a test, so a rule about one field has a
     /// second field to be told apart from. Nothing writes it.
     const A_SECOND_FIELD: &str = "note";
@@ -1662,6 +1812,19 @@ mod tests {
         for c in text.chars() {
             app.apply(Action::Insert(c)).unwrap();
         }
+    }
+
+    /// Where the focused field's cursor sits, as a line and a column read off what
+    /// the field holds — so a test says where a motion landed in the terms a reader
+    /// sees rather than in a character offset nobody can check by eye.
+    fn cursor_at(app: &App) -> (usize, usize) {
+        let surface = app.surface().expect("a surface is open");
+        let field = &surface.fields()[surface.focus()];
+        let before: String = field.value().chars().take(field.cursor()).collect();
+        (
+            before.matches('\n').count(),
+            before.chars().rev().take_while(|c| *c != '\n').count(),
+        )
     }
 
     /// What the open surface's focused field holds.
@@ -2610,7 +2773,7 @@ mod tests {
         assert!(surface.title().contains(&fx.epic), "{:?}", surface.title());
         // Every key now belongs to the field: the mode the keyboard is under is the
         // only bridge from this state to the key table.
-        assert_eq!(app.mode(), Mode::Surface(Fields::One));
+        assert_eq!(app.mode(), surface_mode(Fields::One, Lines::One));
         assert!(fx.epic_labels().iter().all(|l| !l.is_empty()));
 
         // A row that is not a label set offers no addition: this surface writes a
@@ -2749,7 +2912,7 @@ mod tests {
         // what the warning was about, so typing the answer is a straight line.
         app.apply(Action::Unwind).unwrap();
         assert_eq!(app.modal(), None);
-        assert_eq!(app.mode(), Mode::Surface(Fields::One));
+        assert_eq!(app.mode(), surface_mode(Fields::One, Lines::One));
         assert_eq!(app.surface().map(Surface::focus), Some(0));
         type_into(&mut app, "ui-2");
         assert_eq!(field_value(&app), "ui-2");
@@ -2779,14 +2942,14 @@ mod tests {
         open_a_surface_with_fields(
             &mut app,
             vec![
-                Field::new(A_SECOND_FIELD, false),
-                Field::new(LABEL_FIELD, true),
-                Field::new(A_THIRD_FIELD, true),
+                Field::new(A_SECOND_FIELD, false, Lines::One),
+                Field::new(LABEL_FIELD, true, Lines::One),
+                Field::new(A_THIRD_FIELD, true, Lines::One),
             ],
         );
         // Several fields, and the key map is told so: which keys apply is decided
         // from the shape rather than guessed at.
-        assert_eq!(app.mode(), Mode::Surface(Fields::Several));
+        assert_eq!(app.mode(), surface_mode(Fields::Several, Lines::One));
 
         app.apply(Action::Accept).unwrap();
         let Some(Modal::Dialog(dialog)) = app.modal() else {
@@ -2829,8 +2992,8 @@ mod tests {
         open_a_surface_with_fields(
             &mut app,
             vec![
-                Field::new(LABEL_FIELD, true),
-                Field::new(A_SECOND_FIELD, false),
+                Field::new(LABEL_FIELD, true, Lines::One),
+                Field::new(A_SECOND_FIELD, false, Lines::One),
             ],
         );
         type_into(&mut app, "a new label");
@@ -2851,9 +3014,9 @@ mod tests {
         open_a_surface_with_fields(
             &mut app,
             vec![
-                Field::new(LABEL_FIELD, true),
-                Field::new(A_SECOND_FIELD, false),
-                Field::new("third", false),
+                Field::new(LABEL_FIELD, true, Lines::One),
+                Field::new(A_SECOND_FIELD, false, Lines::One),
+                Field::new("third", false, Lines::One),
             ],
         );
 
@@ -2890,8 +3053,8 @@ mod tests {
         open_a_surface_with_fields(
             &mut app,
             vec![
-                Field::new(LABEL_FIELD, true),
-                Field::new(A_SECOND_FIELD, false),
+                Field::new(LABEL_FIELD, true, Lines::One),
+                Field::new(A_SECOND_FIELD, false, Lines::One),
             ],
         );
         let lines = frame_lines(&mut app, 100, 24);
@@ -2917,6 +3080,113 @@ mod tests {
         let strip = lines.last().expect("the strip is the bottom line");
         assert!(strip.contains("Ctrl-S save"), "{strip:?}");
         assert!(!strip.contains("Tab"), "{strip:?}");
+    }
+
+    #[test]
+    fn a_field_that_holds_many_lines_keeps_the_breaks_and_is_moved_through_by_line() {
+        let (_fx, mut app) = app();
+        open_a_surface_with_fields(
+            &mut app,
+            vec![Field::new(A_SECOND_FIELD, false, Lines::Many)],
+        );
+
+        // A line break is content in a field that holds many lines, so it lands in
+        // the value like any other character.
+        type_into(&mut app, "one");
+        app.apply(Action::Insert('\n')).unwrap();
+        type_into(&mut app, "twelve");
+        app.apply(Action::Insert('\n')).unwrap();
+        type_into(&mut app, "x");
+        assert_eq!(field_value(&app), "one\ntwelve\nx");
+        assert_eq!(cursor_at(&app), (2, 1));
+
+        // The line keys are the line's, not the whole value's: a field holding one
+        // line cannot tell the two apart, and this one can.
+        app.apply(Action::MoveToStart).unwrap();
+        assert_eq!(cursor_at(&app), (2, 0));
+        app.apply(Action::MoveUp).unwrap();
+        assert_eq!(cursor_at(&app), (1, 0));
+        app.apply(Action::MoveToEnd).unwrap();
+        assert_eq!(cursor_at(&app), (1, "twelve".len()));
+
+        // Vertical motion keeps the column, clamped to what the line it lands on
+        // has: a short line takes the cursor to its end rather than past it. The
+        // clamp is asserted in both directions, because an unclamped step lands
+        // inside the line the cursor came from rather than past the value's end,
+        // which is a silent wrong place rather than a panic.
+        app.apply(Action::MoveUp).unwrap();
+        assert_eq!(cursor_at(&app), (0, "one".len()));
+        app.apply(Action::MoveDown).unwrap();
+        assert_eq!(cursor_at(&app), (1, "one".len()));
+        app.apply(Action::MoveToEnd).unwrap();
+        assert_eq!(cursor_at(&app), (1, "twelve".len()));
+        app.apply(Action::MoveDown).unwrap();
+        assert_eq!(cursor_at(&app), (2, 1));
+        app.apply(Action::MoveUp).unwrap();
+        assert_eq!(cursor_at(&app), (1, 1));
+        app.apply(Action::MoveUp).unwrap();
+        assert_eq!(cursor_at(&app), (0, 1));
+        // And there is no line past either end to land on.
+        app.apply(Action::MoveUp).unwrap();
+        assert_eq!(cursor_at(&app), (0, 1));
+        app.apply(Action::MoveDown).unwrap();
+        app.apply(Action::MoveDown).unwrap();
+        app.apply(Action::MoveDown).unwrap();
+        assert_eq!(cursor_at(&app), (2, 1));
+
+        // What the external editor hands back keeps its breaks too — the one door
+        // that carries whole paragraphs — while a carriage return is dropped: an
+        // editor leaving CRLF behind means one break, not a break and a character no
+        // terminal shows.
+        app.editor_returned("alpha\r\nbeta\n");
+        assert_eq!(field_value(&app), "alpha\nbeta\n");
+    }
+
+    #[test]
+    fn a_line_break_never_reaches_a_field_that_holds_one_line() {
+        let (_fx, mut app) = app();
+        open_the_label_surface(&mut app);
+
+        // The key map sends no break to a one-line field — the reflex key accepts
+        // there — but the field is what guarantees the value never holds one, so a
+        // break arriving by any route is dropped rather than stored. (The editor's
+        // door is pinned where the editor round-trip is.)
+        type_into(&mut app, "one");
+        app.apply(Action::Insert('\n')).unwrap();
+        type_into(&mut app, "two");
+        assert_eq!(field_value(&app), "onetwo");
+
+        // A dropped character was still a keystroke that writes, so the field is
+        // dirty by it: dirty is what was pressed and not what came out different.
+        app.apply(Action::Unwind).unwrap();
+        app.apply(Action::Delete).unwrap();
+        app.apply(Action::Add).unwrap();
+        app.apply(Action::Insert('\n')).unwrap();
+        assert_eq!(field_value(&app), "");
+        assert!(app.surface().unwrap().fields()[0].is_dirty());
+    }
+
+    #[test]
+    fn the_shape_the_key_map_is_told_carries_the_focused_fields_kind() {
+        let (_fx, mut app) = app();
+        // One surface, two kinds of field: which one the keyboard is in is what
+        // decides whether a line break is content, so the kind has to follow the
+        // focus rather than describe the surface as a whole.
+        open_a_surface_with_fields(
+            &mut app,
+            vec![
+                Field::new(LABEL_FIELD, true, Lines::One),
+                Field::new(A_SECOND_FIELD, false, Lines::Many),
+            ],
+        );
+        assert_eq!(app.mode(), surface_mode(Fields::Several, Lines::One));
+        app.apply(Action::NextField).unwrap();
+        assert_eq!(app.mode(), surface_mode(Fields::Several, Lines::Many));
+        // Recomputed on every ask rather than captured when the surface opened, so
+        // the key map and the surface cannot come to disagree about where the
+        // keyboard is.
+        app.apply(Action::PreviousField).unwrap();
+        assert_eq!(app.mode(), surface_mode(Fields::Several, Lines::One));
     }
 
     #[test]
@@ -2950,7 +3220,7 @@ mod tests {
         app.apply(Action::Unwind).unwrap();
         assert_eq!(app.modal(), None);
         assert_eq!(field_value(&app), "half a thought");
-        assert_eq!(app.mode(), Mode::Surface(Fields::One));
+        assert_eq!(app.mode(), surface_mode(Fields::One, Lines::One));
 
         // The destructive letter throws the buffer away, and only the buffer: the
         // mode stays on the row, and nothing reached the store.
@@ -3136,7 +3406,7 @@ mod tests {
         // And the answer that is never destructive lands back on the text intact.
         app.apply(Action::Unwind).unwrap();
         assert_eq!(field_value(&app), "written in the editor");
-        assert_eq!(app.mode(), Mode::Surface(Fields::One));
+        assert_eq!(app.mode(), surface_mode(Fields::One, Lines::One));
         assert_eq!(fx.epic_labels(), before, "the round-trip wrote something");
     }
 
@@ -3163,7 +3433,7 @@ mod tests {
         app.apply(Action::Unwind).unwrap();
         assert_eq!(app.modal(), None);
         assert_eq!(field_value(&app), "never written");
-        assert_eq!(app.mode(), Mode::Surface(Fields::One));
+        assert_eq!(app.mode(), surface_mode(Fields::One, Lines::One));
         assert!(app.editing_target().is_some());
     }
 
@@ -3212,13 +3482,13 @@ mod tests {
         // it is a layer above the buffer, not a way out of it.
         app.apply(Action::ToggleHelp).unwrap();
         assert_eq!(app.modal(), Some(&Modal::Help));
-        assert_eq!(app.mode(), Mode::Surface(Fields::One));
+        assert_eq!(app.mode(), surface_mode(Fields::One, Lines::One));
 
         // One layer at a time: the overlay goes and the buffer stays, text and all.
         app.apply(Action::Unwind).unwrap();
         assert_eq!(app.modal(), None);
         assert_eq!(field_value(&app), "kept");
-        assert_eq!(app.mode(), Mode::Surface(Fields::One));
+        assert_eq!(app.mode(), surface_mode(Fields::One, Lines::One));
     }
 
     #[test]
@@ -3293,7 +3563,7 @@ mod tests {
         // it was opened from.
         let (_, node) = fx.node_reference_forms();
         assert!(surface.title().contains(&node), "{:?}", surface.title());
-        assert_eq!(app.mode(), Mode::Surface(Fields::One));
+        assert_eq!(app.mode(), surface_mode(Fields::One, Lines::One));
 
         // There is nothing to send without a reference, so an accepted empty field
         // warns naming it and writes nothing — which is the browser refusing to send
@@ -3437,7 +3707,7 @@ mod tests {
         // ends it, so the reference is still there to be corrected.
         app.apply(Action::Unwind).unwrap();
         assert_eq!(field_value(&app), "999");
-        assert_eq!(app.mode(), Mode::Surface(Fields::One));
+        assert_eq!(app.mode(), surface_mode(Fields::One, Lines::One));
         assert!(app.editing_target().is_some());
 
         // A node blocking itself is the store's judgement in the same way — the

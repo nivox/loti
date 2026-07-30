@@ -26,10 +26,10 @@ pub enum Mode {
     /// action, so nothing typed into a field can move, reload or edit anything
     /// underneath it.
     ///
-    /// How many fields it holds travels with the mode, because a key means
-    /// different things by it — see [`Fields`] — and a mode is the whole of what
+    /// The shape of the surface travels with the mode, because a key means
+    /// different things by it — see [`Shape`] — and a mode is the whole of what
     /// the key map is told.
-    Surface(Fields),
+    Surface(Shape),
     /// A dialog is open, admitting the set of answers it lists and nothing else.
     ///
     /// The set travels with the dialog rather than being a mode of its own, so a
@@ -56,7 +56,7 @@ pub enum Fields {
 }
 
 impl Fields {
-    /// Every shape a surface may have, so a surface that has to cover them all —
+    /// Every count a surface may have, so a surface that has to cover them all —
     /// the keys each answers, and the hints each lists — cannot then miss one.
     pub const ALL: &'static [Fields] = &[Fields::One, Fields::Several];
 
@@ -68,6 +68,68 @@ impl Fields {
             _ => Fields::Several,
         }
     }
+}
+
+/// How many lines a field holds, which is the axis deciding whether a line break
+/// is content or a key doing something else.
+///
+/// Invariant: a one-line field never holds a line break, whichever door text
+/// arrives through — a keystroke, or an external editor's result. A field that
+/// holds many keeps them, and is moved through by line as well as by character.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lines {
+    /// One line, so a line break is not content and there is no line to move to.
+    One,
+    /// As many as the reader writes, so a line break is a character like any
+    /// other and the cursor moves between lines.
+    Many,
+}
+
+impl Lines {
+    /// Every kind a field may be, so a surface that has to cover them all — the
+    /// keys each answers, and what each does with a line break — cannot miss one.
+    pub const ALL: &'static [Lines] = &[Lines::One, Lines::Many];
+}
+
+/// An open surface as the key map is told it: how many fields it holds, and how
+/// many lines the field the keyboard is in holds.
+///
+/// Invariant: the key map needs both halves, because the reflex key's meaning
+/// turns on both — it accepts a surface with one field, moves on through a form,
+/// and is a newline in a field that holds many lines however many fields there
+/// are, where accepting is the save key's alone. Neither half is enough by
+/// itself: a count alone would submit a body buffer on the reader's first
+/// paragraph break, and a kind alone would submit a form half filled in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shape {
+    /// How many fields the surface holds.
+    pub fields: Fields,
+    /// How many lines the focused field holds. The focused one, because a key is
+    /// answered by the field it lands in and a surface may hold both kinds.
+    pub lines: Lines,
+}
+
+impl Shape {
+    /// Every shape a surface may have: every field count against every field
+    /// kind, so a surface covering them all cannot miss a combination.
+    pub const ALL: &'static [Shape] = &[
+        Shape {
+            fields: Fields::One,
+            lines: Lines::One,
+        },
+        Shape {
+            fields: Fields::One,
+            lines: Lines::Many,
+        },
+        Shape {
+            fields: Fields::Several,
+            lines: Lines::One,
+        },
+        Shape {
+            fields: Fields::Several,
+            lines: Lines::Many,
+        },
+    ];
 }
 
 /// The answers a dialog admits, which are exactly the answers it lists.
@@ -203,6 +265,10 @@ pub enum Action {
     /// buffer thrown away.
     Delete,
     /// Put a character into the open field, where the cursor is.
+    ///
+    /// A line break is a character like any other in a field that holds many
+    /// lines, and is dropped by a field that holds one — the field enforces that,
+    /// so no route into a one-line value can put a break in it.
     Insert(char),
     /// Delete the character before the cursor.
     DeleteBefore,
@@ -212,10 +278,19 @@ pub enum Action {
     MoveLeft,
     /// Move the field cursor one character right.
     MoveRight,
-    /// Move the field cursor to the start of its content.
+    /// Move the field cursor to the start of the line it is on, which in a field
+    /// holding one line is the start of its content.
     MoveToStart,
-    /// Move the field cursor to the end of its content.
+    /// Move the field cursor to the end of the line it is on, which in a field
+    /// holding one line is the end of its content.
     MoveToEnd,
+    /// Move the field cursor to the same column of the line above, or leave it
+    /// where it is when there is no line above — a field holding one line
+    /// included.
+    MoveUp,
+    /// Move the field cursor to the same column of the line below, or leave it
+    /// where it is when there is no line below.
+    MoveDown,
     /// Put the keyboard in the next field of the open surface.
     NextField,
     /// Put the keyboard in the previous field of the open surface.
@@ -259,6 +334,33 @@ mod tests {
             }
         }
         assert_eq!(Fields::ALL.len(), 2);
+        for lines in Lines::ALL {
+            match lines {
+                Lines::One | Lines::Many => {}
+            }
+        }
+        assert_eq!(Lines::ALL.len(), 2);
+    }
+
+    #[test]
+    fn every_field_count_against_every_field_kind_is_a_shape_a_surface_may_have() {
+        // Derived from the two axes rather than counted, so an axis that gains a
+        // case fails here instead of leaving a combination the key map is never
+        // asked about and no surface test ever walks.
+        let combinations: Vec<Shape> = Fields::ALL
+            .iter()
+            .copied()
+            .flat_map(|fields| {
+                Lines::ALL
+                    .iter()
+                    .copied()
+                    .map(move |lines| Shape { fields, lines })
+            })
+            .collect();
+        assert_eq!(Shape::ALL.len(), combinations.len());
+        for shape in combinations {
+            assert!(Shape::ALL.contains(&shape), "{shape:?} is not listed");
+        }
     }
 
     #[test]
@@ -290,5 +392,7 @@ mod tests {
         assert_eq!(EditingAction::for_intent(Action::Insert('a')), None);
         assert_eq!(EditingAction::for_intent(Action::NextField), None);
         assert_eq!(EditingAction::for_intent(Action::PreviousField), None);
+        assert_eq!(EditingAction::for_intent(Action::MoveUp), None);
+        assert_eq!(EditingAction::for_intent(Action::MoveDown), None);
     }
 }

@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, Modal, Surface};
+use crate::app::{App, Modal, Placement, Surface};
 use crate::data::{ReadOnly, Row, RowKind, Selection};
 use crate::keymap;
 use crate::theme::{glyph, Theme};
@@ -108,7 +108,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_breadcrumb(f, chunks[0], app, theme);
 
     let body = chunks[1];
+    // Where the preview was drawn, because a surface may render there: the pane is
+    // the whole body while the preview fills the width and the right-hand pane
+    // otherwise, so a surface that renders in the pane follows the pane rather than
+    // holding a second opinion about the layout.
+    let preview_area;
     if app.zoomed() {
+        preview_area = body;
         app.set_divider_column(None);
         app.sync_preview(preview_wrap_width(body.width));
         let title = app.preview_title();
@@ -123,6 +129,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 Constraint::Percentage(100 - app.nav_percent()),
             ])
             .split(body);
+        preview_area = panes[1];
         // The divider is where the two pane borders meet, which is the column a
         // drag has to grab.
         app.set_divider_column(Some(panes[1].x));
@@ -144,7 +151,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // the buffer it asks about rather than replacing it, so the buffer is still
     // there to land back in.
     if let Some(surface) = app.surface() {
-        draw_surface(f, theme, surface);
+        draw_surface(f, theme, surface, preview_area);
     }
 
     match app.modal() {
@@ -162,8 +169,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
-/// An editing surface: a float carrying its fields, centred and above everything,
-/// reflowing nothing underneath — the same geometry as a dialog, because a reader
+/// An editing surface: its fields, drawn where the surface says and above
+/// everything, reflowing nothing underneath.
+///
+/// Where it goes is the surface's own say and never read off what it holds — see
+/// [`surface_area`]. A float has the same geometry as a dialog, because a reader
 /// looks for both in the same place.
 ///
 /// It lists no keys of its own: the hint strip carries them, and unlike a dialog a
@@ -171,11 +181,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 ///
 /// The terminal's own cursor is placed in the focused field, because a text field
 /// with no cursor does not say where the next character lands.
-fn draw_surface(f: &mut Frame, theme: Theme, surface: &Surface) {
-    let area = f.area();
-    let width = DIALOG_WIDTH.min(area.width);
+fn draw_surface(f: &mut Frame, theme: Theme, surface: &Surface, pane: Rect) {
     let fields = surface.fields();
-    let popup = centred(area, width, fields.len() as u16 + 2);
+    let popup = surface_area(surface.placement(), f.area(), pane, fields.len());
+    let width = popup.width;
     let label_width = fields
         .iter()
         .map(|field| field.label().chars().count())
@@ -214,7 +223,21 @@ fn draw_surface(f: &mut Frame, theme: Theme, surface: &Surface) {
     }
 }
 
-/// The columns a field's value may use: the float less its borders, the leading
+/// The cells a surface draws in, which the surface itself decides.
+///
+/// A float is centred on the whole terminal and as tall as its fields need, like
+/// every other float. A surface that renders in the pane takes the pane exactly, so
+/// the frozen row stays visible in the navigation pane beside it — and it follows
+/// the pane wherever the pane is, rather than answering the separate question of
+/// whether an open surface may fill the width.
+fn surface_area(placement: Placement, screen: Rect, pane: Rect, fields: usize) -> Rect {
+    match placement {
+        Placement::Float => centred(screen, DIALOG_WIDTH, fields as u16 + 2),
+        Placement::Pane => pane,
+    }
+}
+
+/// The columns a field's value may use: the surface less its borders, the leading
 /// indent, the label column and the gap after it.
 fn value_width(width: u16, label_width: usize) -> usize {
     (width as usize)
@@ -441,7 +464,7 @@ fn footer(app: &App, width: u16) -> Span<'static> {
                 // holds, so the strip asks the surface for its shape exactly as the
                 // key map does: the strip and the keys cannot then disagree.
                 (Some(surface), _) => (
-                    keymap::footer_hints_surface(surface.shape()),
+                    keymap::footer_hints_surface(surface.shape().fields),
                     keymap::FOOTER_ESSENTIAL_SURFACE,
                 ),
                 (None, true) => (app.editing_hints(), keymap::FOOTER_ESSENTIAL_EDITING),
@@ -1176,6 +1199,62 @@ mod tests {
         let (tail, at) = field_window(long, long.chars().count(), 10);
         assert!(long.ends_with(&tail), "{tail:?}");
         assert_eq!(at, tail.chars().count(), "the cursor sits after the text");
+    }
+
+    #[test]
+    fn a_surface_draws_where_it_says_and_the_centred_float_is_one_answer_of_more_than_one() {
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+        let pane = Rect {
+            x: 30,
+            y: 1,
+            width: 50,
+            height: 22,
+        };
+        // Exhaustive over the answers, so a further answer has to say here where it
+        // draws rather than inheriting whatever the last arm did.
+        for placement in Placement::ALL.iter().copied() {
+            let area = surface_area(placement, screen, pane, 1);
+            match placement {
+                // Centred on the whole terminal and as tall as its fields need,
+                // wherever the panes happen to be: a reader looks for a float in the
+                // same place whatever raised it.
+                Placement::Float => {
+                    assert_eq!((area.width, area.height), (DIALOG_WIDTH, 3));
+                    assert_eq!(area.x, (screen.width - area.width) / 2);
+                    assert_eq!(area.y, (screen.height - area.height) / 2);
+                    assert_ne!(area, pane, "a float is not the pane");
+                }
+                // The pane exactly, so the navigation pane keeps the frozen row
+                // visible beside it.
+                Placement::Pane => assert_eq!(area, pane),
+            }
+        }
+        // The pane answer follows the pane rather than a shape of its own: it is the
+        // pane's width and the pane's place, whichever those are.
+        let wide = Rect {
+            x: 0,
+            y: 1,
+            width: 80,
+            height: 22,
+        };
+        assert_eq!(surface_area(Placement::Pane, screen, wide, 1), wide);
+        // A float is as tall as the fields it holds, and bounded by the screen like
+        // every other float — a surface drawn off the edge would take the field the
+        // reader is typing into with it.
+        assert_eq!(surface_area(Placement::Float, screen, pane, 3).height, 5);
+        let tiny = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 4,
+        };
+        let float = surface_area(Placement::Float, tiny, pane, 8);
+        assert_eq!((float.width, float.height), (tiny.width, tiny.height));
     }
 
     #[test]
