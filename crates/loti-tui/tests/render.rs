@@ -12,7 +12,7 @@ use loti_core::store::{self, Store};
 use loti_core::Actor;
 use loti_tui::action::{Action, Answers};
 use loti_tui::app::{App, Modal};
-use loti_tui::data::{ReadOnly, RowKind};
+use loti_tui::data::{ReadOnly, RowKind, Selection};
 use loti_tui::theme::Theme;
 use loti_tui::ui;
 use ratatui::backend::TestBackend;
@@ -33,7 +33,12 @@ fn fixture() -> (tempfile::TempDir, Store) {
             name: "The browser".into(),
             summary: "A full-screen view".into(),
             labels: vec![],
-            body: "Some **body** text.\n".into(),
+            // More than one line, and one line wider than any pane here: a
+            // buffer that collapsed a body's breaks, or that showed only what
+            // fits across, is told from a correct one by a body with both.
+            body: "Some **body** text.\n\nA second paragraph, long enough that no \
+                   pane of any terminal in these tests holds it across.\n"
+                .into(),
         },
     )
     .unwrap();
@@ -1618,6 +1623,279 @@ fn a_blocker_removal_asks_naming_it_and_the_notice_names_it_once_it_is_gone() {
         !lines.iter().skip(1).any(|l| l.contains("Remove blocker")),
         "the float outlived the write: {lines:#?}"
     );
+}
+
+/// Stand on the epic's own row, on the roster, which is where its body is edited:
+/// the body of the row the mode froze, not of a collection under it.
+fn to_the_epic_row(app: &mut App) {
+    app.apply(Action::CursorFirst).unwrap();
+}
+
+/// Open the body buffer the way a reader does: freeze the epic's row and press the
+/// letter that edits its long-form text.
+fn open_the_body_buffer(app: &mut App) {
+    freeze_the_epics_row(app);
+    app.apply(Action::Body).unwrap();
+    assert!(app.surface().is_some(), "the body key opened no buffer");
+}
+
+/// Freeze the epic's row, which is the frame a buffer is opened over.
+fn freeze_the_epics_row(app: &mut App) {
+    to_the_epic_row(app);
+    app.apply(Action::EnterEditing).unwrap();
+}
+
+/// The body the store holds for the epic, through the seam an editing surface
+/// opens on — never a string spelled out here, so a fixture change cannot turn a
+/// test about the buffer into a test about the fixture.
+fn stored_body(store: &Store) -> String {
+    loti_tui::data::edit_target(store, &Selection::Epic("browser".into()))
+        .expect("the epic can be read for editing")
+        .body
+}
+
+/// The column the pane divider is drawn at, read off the frame: the navigation
+/// pane's cells are everything left of it.
+fn divider_column(app: &App) -> usize {
+    usize::from(nav_pane_width(app))
+}
+
+#[test]
+fn the_body_buffer_draws_in_the_preview_pane_at_the_split_the_reader_set() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    // A split the reader chose, so a buffer that widened the pane or reset the
+    // divider is told from one that drew where the panes already were.
+    app.apply(Action::ShrinkNav).unwrap();
+    let split = app.nav_percent();
+    let divider = divider_column(&app);
+    // The frame the buffer is opened over: the mode is already on, so what changes
+    // from here is the buffer and nothing the mode did to the rows.
+    freeze_the_epics_row(&mut app);
+    let (before, _) = draw(&mut app);
+
+    app.apply(Action::Body).unwrap();
+    let (mut terminal, _) = draw(&mut app);
+    let (before, after) = (cells(&before), cells(&terminal));
+
+    // The buffer is the preview pane's own cells, corner to corner: its frame is
+    // where the pane's frame was, so the panes stay exactly as the reader arranged
+    // them and the navigation pane keeps the frozen row visible beside it.
+    let last_column = after[0].len() - 1;
+    let last_row = after.len() - 2;
+    let pane = (divider, 1, last_column + 1 - divider, last_row);
+    let float = box_lines(&after, pane);
+    assert!(
+        float[0].starts_with('\u{250c}') && float[0].ends_with('\u{2510}'),
+        "the buffer's top is not the pane's top: {float:#?}"
+    );
+    assert!(
+        float[float.len() - 1].starts_with('\u{2514}')
+            && float[float.len() - 1].ends_with('\u{2518}'),
+        "the buffer's bottom is not the pane's bottom: {float:#?}"
+    );
+    // And it says what it is editing on that frame, since the pane is not the row.
+    assert!(float[0].contains("body of browser"), "{float:#?}");
+
+    // Nothing outside the pane changed: the navigation pane's cells are what they
+    // were, so the divider did not move and the frozen row is untouched. Bounded
+    // above the hint strip, which legitimately changes because the keys that apply
+    // are now the buffer's own.
+    let body = ..after.len() - 1;
+    let region @ (x, y, _, height) = changed_box(&before[body], &after[body]);
+    assert!(
+        x >= divider,
+        "the buffer changed the navigation pane: {region:?}"
+    );
+    assert!(y >= 1 && y + height <= last_row, "{region:?}");
+    for (row, was) in after[body].iter().zip(&before[body]) {
+        assert_eq!(row[..divider], was[..divider], "the navigation pane moved");
+    }
+    assert_eq!(app.nav_percent(), split, "the buffer moved the divider");
+    assert!(!app.zoomed(), "the buffer took the whole width");
+    let width = float[0].chars().count();
+
+    // The lines the reader wrote are the lines drawn, in order and one per line: a
+    // renderer emitting one screen line per field would show the whole document on
+    // the first of them with its breaks gone.
+    let stored = stored_body(&store);
+    let written: Vec<&str> = stored.split('\n').collect();
+    assert!(
+        written.len() > 2 && written[1].is_empty(),
+        "the fixture body cannot tell a break from a space: {stored:?}"
+    );
+    let head = |line: &str| line.chars().take(20).collect::<String>();
+    assert!(
+        float[1].contains("body"),
+        "the field is not named: {float:#?}"
+    );
+    assert!(float[1].contains(&head(written[0])), "{float:#?}");
+    // The blank line the reader left is a blank line on screen, not a join.
+    assert!(
+        float[2]
+            .trim_matches(|c| c == ' ' || c == '\u{2502}')
+            .is_empty(),
+        "the blank line between the paragraphs went: {float:#?}"
+    );
+    assert!(float[3].contains(&head(written[2])), "{float:#?}");
+    // A line wider than the pane is clipped rather than wrapped, so the line below
+    // it is still the reader's next line and not the tail of this one.
+    assert!(
+        written[2].chars().count() > width,
+        "the fixture body fits the pane, so nothing here is about clipping"
+    );
+    assert!(
+        !float[4].contains(&head(written[2])),
+        "a long line wrapped into the line below it: {float:#?}"
+    );
+    // The frozen row is still there to be seen, barred and named, which is the
+    // whole reason the buffer draws in the pane rather than over everything.
+    // Bounded to the navigation pane: the buffer beside it holds the same lines.
+    let rows: Vec<String> = after.iter().map(|row| row[..divider].concat()).collect();
+    assert!(
+        rows.iter()
+            .any(|row| row.contains('\u{258c}') && row.contains("browser")),
+        "the frozen row is not on screen: {rows:#?}"
+    );
+
+    // A buffer with no cursor does not say where the next character lands, and this
+    // one lands at the top of the document: the reader reads it before changing it.
+    let cursor = terminal.get_cursor_position().unwrap();
+    assert_eq!(
+        usize::from(cursor.y),
+        2,
+        "the cursor is not on the first line"
+    );
+    assert_eq!(
+        after[usize::from(cursor.y)][usize::from(cursor.x)],
+        written[0].chars().next().unwrap().to_string(),
+        "the cursor is not at the start of the text"
+    );
+}
+
+#[test]
+fn a_saved_body_leaves_the_mode_and_the_notice_names_the_entity() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    freeze_the_epics_row(&mut app);
+    let (_t, frozen) = draw(&mut app);
+    // The row offers the letter, and the strip teaches it: a letter a reader cannot
+    // discover is a letter nobody presses.
+    assert!(frozen[23].contains("b body"), "{:?}", frozen[23]);
+
+    app.apply(Action::Body).unwrap();
+    // A line break is content in a buffer that holds many lines, so what a reader
+    // types with the reflex key lands in the text.
+    for c in "# a heading".chars() {
+        app.apply(Action::Insert(c)).unwrap();
+    }
+    app.apply(Action::Insert('\n')).unwrap();
+    app.apply(Action::Accept).unwrap();
+    let (_t, lines) = draw(&mut app);
+
+    // The mode indicator going, the buffer going and the notice arriving are one
+    // frame, which is what reads as "that finished".
+    assert!(!lines[0].contains("EDITING"), "{:?}", lines[0]);
+    // Everything above the strip, because the notice on the strip's own line names
+    // the entity deliberately: what must be gone is the buffer.
+    assert!(
+        !lines[1..23].iter().any(|l| l.contains("body of browser")),
+        "the buffer outlived the write: {lines:#?}"
+    );
+    assert!(
+        lines[23].contains("body of browser saved"),
+        "{:?}",
+        lines[23]
+    );
+    // What was typed, in front of what was there, and nothing normalised on the
+    // way: the store holds the text the reader left.
+    let written = stored_body(&store);
+    assert!(
+        written.starts_with("# a heading\nSome **body** text."),
+        "{written:?}"
+    );
+    // The pane the buffer covered is the epic's document again, titled with the
+    // reference it shows rather than with the action that is over.
+    assert!(lines[1].contains(" browser "), "{:?}", lines[1]);
+}
+
+#[test]
+fn a_change_under_the_buffer_asks_before_it_overwrites_and_keeps_the_text_either_way() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    open_the_body_buffer(&mut app);
+    for c in "mine".chars() {
+        app.apply(Action::Insert(c)).unwrap();
+    }
+    let (buffer, _) = draw(&mut app);
+
+    // Somebody else writes while the reader is composing theirs, which is the one
+    // window the store's own lock cannot cover.
+    ops::edit_epic(
+        &store,
+        "browser",
+        ops::EpicEdits {
+            body: Some("theirs\n".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    app.apply(Action::Accept).unwrap();
+    let (asked, lines) = draw(&mut app);
+
+    let (buffer, asked) = (cells(&buffer), cells(&asked));
+    let float = box_lines(&asked, changed_box(&buffer, &asked));
+    // A question, not a report: it names the entity, because the buffer covers the
+    // pane and the frozen row is dim beside it.
+    assert!(
+        float.iter().any(|l| l.contains("browser changed since")),
+        "{float:#?}"
+    );
+    assert_eq!(dialog_answer_set(&app), Answers::Conflict);
+    for answer in listed_answers(&app) {
+        assert!(
+            float.iter().any(|l| l.contains(&answer)),
+            "{answer:?} is not listed: {float:#?}"
+        );
+    }
+    // Its own letter, not the one a deletion habit presses — what goes here is
+    // somebody else's text — and the reflex key is listed nowhere.
+    assert!(
+        float.iter().any(|l| l.contains("o overwrite anyway")),
+        "{float:#?}"
+    );
+    // Bounded to the line the answers are on, because the question's own prose
+    // shares every other line with it.
+    let answers = float
+        .iter()
+        .find(|l| l.contains("Esc back to the buffer"))
+        .expect("the question lists its way out");
+    assert!(
+        !answers.contains("Enter") && !answers.contains("d "),
+        "the question offers a key that must not answer it: {answers:?}"
+    );
+    // A question is a dialog and never a notice, and nothing has been written.
+    assert!(lines[23].contains("Ctrl-S save"), "{:?}", lines[23]);
+    assert_eq!(stored_body(&store), "theirs\n");
+
+    // The way out is never destructive: it lands back in the buffer exactly as it
+    // was, so the reader can leave with their text through the editor instead.
+    app.apply(Action::Unwind).unwrap();
+    let (again, _) = draw(&mut app);
+    assert_eq!(cells(&again), buffer);
+    assert_eq!(stored_body(&store), "theirs\n", "getting out wrote");
+
+    // And going ahead writes over what landed, ends the session and says so.
+    app.apply(Action::Accept).unwrap();
+    app.apply(Action::Overwrite).unwrap();
+    let (_t, done) = draw(&mut app);
+    assert!(
+        stored_body(&store).starts_with("mine"),
+        "{:?}",
+        stored_body(&store)
+    );
+    assert!(!done[0].contains("EDITING"), "{:?}", done[0]);
+    assert!(done[23].contains("body of browser saved"), "{:?}", done[23]);
 }
 
 #[test]

@@ -143,6 +143,12 @@ pub enum Answers {
     /// destroys something: the way out answers it safely, and the key that
     /// normally means "yes, go on" is bound to nothing here at all.
     Destructive,
+    /// A question about text that moved on under the reader: going ahead throws
+    /// away somebody else's change, getting out keeps the buffer and decides
+    /// nothing. A letter of its own rather than the destructive one, because what
+    /// goes is not what the reader is looking at — and the reflex key is bound to
+    /// nothing here either, for the same reason it is on a deletion.
+    Conflict,
     /// Nothing is at stake — the dialog reports rather than asks — so it is
     /// dismissed rather than answered, and either dismissing key does it.
     Acknowledge,
@@ -151,7 +157,27 @@ pub enum Answers {
 impl Answers {
     /// Every set a dialog may ask for. A surface that has to cover them all —
     /// the letters, and the answers each set lists — cannot then miss one.
-    pub const ALL: &'static [Answers] = &[Answers::Destructive, Answers::Acknowledge];
+    pub const ALL: &'static [Answers] = &[
+        Answers::Destructive,
+        Answers::Conflict,
+        Answers::Acknowledge,
+    ];
+
+    /// The intent that goes ahead with this set's question, and `None` for a set
+    /// that only reports — such a dialog has a way out and nothing to go ahead
+    /// with, so nothing it was raised for can be performed by mistake.
+    ///
+    /// Invariant: a set and the intent that answers it meet here, so the state
+    /// machine that performs an answer names no intent of its own and an
+    /// affirmative answer belonging to one set can never answer another set's
+    /// question. The key map spells the letter; what the letter means is here.
+    pub fn affirmative(self) -> Option<Action> {
+        match self {
+            Answers::Destructive => Some(Action::Delete),
+            Answers::Conflict => Some(Action::Overwrite),
+            Answers::Acknowledge => None,
+        }
+    }
 }
 
 /// The words a dialog gives its own answers, one per answer its set admits.
@@ -185,13 +211,20 @@ pub enum EditingAction {
     Add,
     /// Delete what the frozen row names, behind a confirmation.
     Delete,
+    /// Edit the long-form text of what the frozen row names: an epic's or a
+    /// node's body.
+    Body,
 }
 
 impl EditingAction {
     /// Every editing action, so a surface covering all of them cannot miss one.
     /// Its length is pinned by a test, because a variant left out here would be
     /// an action with no hint and no key.
-    pub const ALL: &'static [EditingAction] = &[EditingAction::Add, EditingAction::Delete];
+    pub const ALL: &'static [EditingAction] = &[
+        EditingAction::Add,
+        EditingAction::Delete,
+        EditingAction::Body,
+    ];
 
     /// The intent a key carries for this action. The state machine reads an
     /// intent, so the two vocabularies meet here and nowhere else.
@@ -199,6 +232,7 @@ impl EditingAction {
         match self {
             EditingAction::Add => Action::Add,
             EditingAction::Delete => Action::Delete,
+            EditingAction::Body => Action::Body,
         }
     }
 
@@ -264,6 +298,14 @@ pub enum Action {
     /// answers everything destructive, so it is learned once — a label removed, a
     /// buffer thrown away.
     Delete,
+    /// Edit the body of what editing mode is acting on, which opens a buffer on
+    /// the text as the store holds it now.
+    Body,
+    /// Write anyway, over a change that landed under the open buffer. The
+    /// affirmative answer of the one question whose two answers both lose
+    /// something, which is why it is not the destructive letter: what this throws
+    /// away is somebody else's text rather than the reader's own.
+    Overwrite,
     /// Put a character into the open field, where the cursor is.
     ///
     /// A line break is a character like any other in a field that holds many
@@ -318,16 +360,16 @@ mod tests {
         // and the counts make leaving it out of the list a failure here.
         for action in EditingAction::ALL {
             match action {
-                EditingAction::Add | EditingAction::Delete => {}
+                EditingAction::Add | EditingAction::Delete | EditingAction::Body => {}
             }
         }
-        assert_eq!(EditingAction::ALL.len(), 2);
+        assert_eq!(EditingAction::ALL.len(), 3);
         for answers in Answers::ALL {
             match answers {
-                Answers::Destructive | Answers::Acknowledge => {}
+                Answers::Destructive | Answers::Conflict | Answers::Acknowledge => {}
             }
         }
-        assert_eq!(Answers::ALL.len(), 2);
+        assert_eq!(Answers::ALL.len(), 3);
         for fields in Fields::ALL {
             match fields {
                 Fields::One | Fields::Several => {}
@@ -394,5 +436,29 @@ mod tests {
         assert_eq!(EditingAction::for_intent(Action::PreviousField), None);
         assert_eq!(EditingAction::for_intent(Action::MoveUp), None);
         assert_eq!(EditingAction::for_intent(Action::MoveDown), None);
+        assert_eq!(EditingAction::for_intent(Action::Overwrite), None);
+    }
+
+    #[test]
+    fn no_two_answer_sets_are_answered_by_the_same_intent() {
+        // The set is what decides whether an intent answers the open dialog, so two
+        // sets sharing an affirmative intent would let one dialog's answer perform
+        // the other's — a reader answering a question about their own text would be
+        // throwing away somebody else's.
+        let affirmative: Vec<Action> = Answers::ALL
+            .iter()
+            .copied()
+            .filter_map(Answers::affirmative)
+            .collect();
+        for (index, intent) in affirmative.iter().enumerate() {
+            assert!(
+                !affirmative[index + 1..].contains(intent),
+                "{intent:?} answers two sets"
+            );
+        }
+        // And a set that only reports is answered by nothing at all: there is
+        // nothing to go ahead with, so no intent may go ahead with it.
+        assert_eq!(Answers::Acknowledge.affirmative(), None);
+        assert!(!affirmative.is_empty(), "no set can be answered at all");
     }
 }

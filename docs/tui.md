@@ -101,3 +101,10 @@ then**. If an agent changes a ticket while you are looking at it, press `r` to
 re-read. A reload keeps each level's cursor on the same ticket even if siblings
 were added or removed around it, and if a level has disappeared entirely it drops
 you at the deepest one that still exists.
+
+One read is not on that list: opening an editing buffer on text the store already
+holds re-reads that one entity at that moment, so you start from the current text
+rather than from a preview that may be minutes old. The save then applies only
+while the entity has not changed since that read; if it has, the browser asks
+whether to overwrite the change or go back to your text, and writes nothing until
+you answer.

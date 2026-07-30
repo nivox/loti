@@ -82,6 +82,7 @@ pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
         // from a write.
         (KeyCode::Char('a'), false) if matches!(mode, Mode::Editing) => Action::Add,
         (KeyCode::Char('d'), false) if matches!(mode, Mode::Editing) => Action::Delete,
+        (KeyCode::Char('b'), false) if matches!(mode, Mode::Editing) => Action::Body,
 
         // Session. `F1` is a help key beside `?` everywhere, because inside a
         // field `?` is a literal character and a reader must not have to learn a
@@ -165,18 +166,40 @@ fn surface_action(key: KeyEvent, shape: Shape) -> Option<Action> {
     })
 }
 
-/// The letters one set of dialog answers is given, which are exactly the answers
-/// that set lists.
+/// The letter one set of dialog answers goes ahead by, and `None` for a set that
+/// only reports — such a dialog has nothing to go ahead with, so it has no letter
+/// for doing so.
 ///
-/// `d` answers anything destructive and `Esc` is the one answer that is never
-/// destructive, here as everywhere else. On a destructive question `Enter` is
-/// bound to nothing at all: a reader arrives at one in a hurry, so a reflex press
-/// must not be the thing that destroys something. Where nothing is at stake
-/// `Enter` dismisses alongside `Esc`, because a second key is then kindness.
+/// `d` answers anything destructive, learned once. Overwriting a change that
+/// landed under the reader's buffer takes a letter of its own, because it is the
+/// one question where going ahead destroys somebody else's text rather than the
+/// reader's, and one letter for both would make the habit built on deletions
+/// answer a question about somebody else's work.
+fn affirmative_key(answers: Answers) -> Option<char> {
+    match answers {
+        Answers::Destructive => Some('d'),
+        Answers::Conflict => Some('o'),
+        Answers::Acknowledge => None,
+    }
+}
+
+/// The intent a key carries at one set of dialog answers, which are exactly the
+/// answers that set lists.
+///
+/// The affirmative letter is this map's and what it means is the set's, so a key
+/// pressed at one question can never perform another's answer. `Esc` is the one
+/// answer that is never destructive, here as everywhere else, and on a question
+/// `Enter` is bound to nothing at all: a reader arrives at one in a hurry, so a
+/// reflex press must not be the thing that destroys something. Where nothing is at
+/// stake `Enter` dismisses alongside `Esc`, because a second key is then kindness.
 fn dialog_action(key: KeyEvent, answers: Answers) -> Option<Action> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if let (KeyCode::Char(c), false) = (key.code, ctrl) {
+        if affirmative_key(answers) == Some(c) {
+            return answers.affirmative();
+        }
+    }
     Some(match (key.code, ctrl) {
-        (KeyCode::Char('d'), false) if matches!(answers, Answers::Destructive) => Action::Delete,
         (KeyCode::Enter, _) if matches!(answers, Answers::Acknowledge) => Action::Unwind,
         (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => Action::Unwind,
         _ => return None,
@@ -196,16 +219,16 @@ fn dialog_action(key: KeyEvent, answers: Answers) -> Option<Action> {
 /// does not answer would seal the reader in.
 pub fn dialog_answers(answers: Answers, words: AnswerWords) -> Vec<String> {
     let dismissal = format!("Esc {}", words.dismissal);
-    match answers {
-        Answers::Destructive => words
+    match affirmative_key(answers) {
+        Some(letter) => words
             .affirmative
             .into_iter()
-            .map(|word| format!("d {word}"))
+            .map(|word| format!("{letter} {word}"))
             .chain(std::iter::once(dismissal))
             .collect(),
         // Nothing is at stake, so both dismissing keys are listed on the one
         // answer they share.
-        Answers::Acknowledge => vec![format!("Esc / Enter {}", words.dismissal)],
+        None => vec![format!("Esc / Enter {}", words.dismissal)],
     }
 }
 
@@ -232,8 +255,8 @@ pub const HELP: &[(&str, &str)] = &[
     ("< / > / =", "narrow / widen / reset the panes"),
     ("z", "preview fills the width; mouse released"),
     ("e", "editing mode, on the highlighted row"),
-    ("a", "editing mode: add a label or a blocker, in a dialog"),
-    ("d", "editing mode: remove or delete the row, confirmed"),
+    ("a / d", "editing mode: add a member / remove it, confirmed"),
+    ("b", "editing mode: the body, as text in the preview pane"),
     (
         "Ctrl-S / Enter",
         "save; Enter unless it is a newline or the next field",
@@ -283,6 +306,7 @@ pub const FOOTER_ESSENTIAL: &[&str] = &["q quit", "? keys"];
 pub const FOOTER_HINTS_EDITING: &[(EditingAction, &str)] = &[
     (EditingAction::Add, "a add"),
     (EditingAction::Delete, "d remove"),
+    (EditingAction::Body, "b body"),
 ];
 
 /// The droppable hints of an open surface, ranked rather than in key order: they
@@ -796,6 +820,95 @@ mod tests {
             Some(Action::Unwind)
         );
         assert_eq!(action_for(ctrl('c'), destructive), Some(Action::Unwind));
+    }
+
+    #[test]
+    fn each_answer_set_goes_ahead_by_its_own_letter_and_no_other_sets() {
+        // The letter is this map's and its meaning is the set's, so the two cannot
+        // drift: a set whose letter carried another set's intent would let a reader
+        // answering one question perform the other's answer.
+        for answers in Answers::ALL.iter().copied() {
+            let mode = Mode::Dialog(answers);
+            let affirmative = dialog_answers(answers, words())
+                .into_iter()
+                .find(|answer| answer.ends_with(words().affirmative.unwrap()));
+            match (answers.affirmative(), affirmative) {
+                (Some(intent), Some(answer)) => {
+                    assert_eq!(
+                        action_for(key_named(leading(&answer)), mode),
+                        Some(intent),
+                        "{answers:?} lists {answer:?}"
+                    );
+                    // And that letter reaches no other set: every other dialog
+                    // either binds it to nothing or binds it to its own answer.
+                    for other in Answers::ALL.iter().copied().filter(|o| *o != answers) {
+                        assert_ne!(
+                            action_for(key_named(leading(&answer)), Mode::Dialog(other)),
+                            Some(intent),
+                            "{answers:?}'s answer also answers {other:?}"
+                        );
+                    }
+                }
+                // A set that only reports lists no way to go ahead and has no
+                // intent that would: the two halves agree that there is nothing to
+                // answer.
+                (None, None) => {}
+                (intent, answer) => {
+                    panic!("{answers:?} lists {answer:?} and performs {intent:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn overwriting_a_change_underneath_the_buffer_is_not_the_destructive_letter() {
+        // Both answers to a conflict lose something, so the letter a habit built on
+        // deletions presses must not be the one that throws away somebody else's
+        // text — and the reflex key answers nothing here either.
+        let conflict = Mode::Dialog(Answers::Conflict);
+        assert_eq!(
+            action_for(plain(KeyCode::Char('o')), conflict),
+            Some(Action::Overwrite)
+        );
+        assert_eq!(action_for(plain(KeyCode::Char('d')), conflict), None);
+        assert_eq!(action_for(plain(KeyCode::Enter), conflict), None);
+        // The way out, which keeps the buffer and decides nothing.
+        for key in [plain(KeyCode::Esc), ctrl('c')] {
+            assert_eq!(action_for(key, conflict), Some(Action::Unwind), "{key:?}");
+        }
+        // And the letter is the conflict's alone: nowhere else does it overwrite,
+        // and in a field it is a character like any other.
+        for mode in [Mode::Browse, Mode::Editing] {
+            assert_ne!(
+                action_for(plain(KeyCode::Char('o')), mode),
+                Some(Action::Overwrite),
+                "{mode:?}"
+            );
+        }
+        assert_eq!(
+            action_for(plain(KeyCode::Char('o')), one_line(Fields::One)),
+            Some(Action::Insert('o'))
+        );
+    }
+
+    #[test]
+    fn the_body_letter_opens_the_long_form_text_inside_the_mode_only() {
+        // Browse mode is where a reader's fingers rest, so the letter that opens a
+        // buffer on stored text is bound inside the mode and nowhere else.
+        assert_eq!(
+            action_for(plain(KeyCode::Char('b')), Mode::Editing),
+            Some(Action::Body)
+        );
+        assert_eq!(action_for(plain(KeyCode::Char('b')), Mode::Browse), None);
+        // Inside a field it is a character, and the motion it is spelled with keeps
+        // its own meaning there.
+        for mode in surface_modes() {
+            assert_eq!(
+                action_for(ctrl('b'), mode),
+                Some(Action::MoveLeft),
+                "{mode:?}"
+            );
+        }
     }
 
     #[test]

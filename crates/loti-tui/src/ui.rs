@@ -12,7 +12,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, Modal, Placement, Surface};
+use crate::action::Lines;
+use crate::app::{App, Field, Modal, Placement, Surface};
 use crate::data::{ReadOnly, Row, RowKind, Selection};
 use crate::keymap;
 use crate::theme::{glyph, Theme};
@@ -191,19 +192,34 @@ fn draw_surface(f: &mut Frame, theme: Theme, surface: &Surface, pane: Rect) {
         .max()
         .unwrap_or(0);
     let value_width = value_width(width, label_width);
-    let lines: Vec<Line> = fields
-        .iter()
-        .map(|field| {
-            let (shown, _) = field_window(field.value(), field.cursor(), value_width);
-            Line::from(vec![
+    let kinds: Vec<Lines> = fields.iter().map(Field::lines).collect();
+    let heights = field_heights(&kinds, popup.height.saturating_sub(2) as usize);
+    let mut lines: Vec<Line> = Vec::new();
+    let mut cursor: Option<(usize, usize)> = None;
+    for (index, (field, height)) in fields.iter().zip(&heights).enumerate() {
+        let (shown, (row, column)) =
+            field_view(field.value(), field.cursor(), value_width, *height);
+        if index == surface.focus() {
+            cursor = Some((lines.len() + row, column));
+        }
+        for (offset, text) in shown.into_iter().enumerate() {
+            // The label names the field once, on its first line: a field that holds
+            // many lines is one field however many lines it takes, and a name
+            // repeated down the margin would read as one field per line. The column
+            // is kept blank on the rest, so a field below it stays aligned.
+            let label = match offset {
+                0 => field.label(),
+                _ => "",
+            };
+            lines.push(Line::from(vec![
                 Span::styled(
-                    format!(" {:<label_width$}  ", field.label()),
+                    format!(" {label:<label_width$}  "),
                     Style::default().fg(theme.muted()),
                 ),
-                Span::raw(shown),
-            ])
-        })
-        .collect();
+                Span::raw(text),
+            ]));
+        }
+    }
     f.render_widget(Clear, popup);
     f.render_widget(
         Paragraph::new(lines).block(
@@ -214,22 +230,45 @@ fn draw_surface(f: &mut Frame, theme: Theme, surface: &Surface, pane: Rect) {
         ),
         popup,
     );
-    if let Some(field) = fields.get(surface.focus()) {
-        let (_, cursor) = field_window(field.value(), field.cursor(), value_width);
+    if let Some((row, column)) = cursor {
         f.set_cursor_position((
-            popup.x + 1 + 1 + label_width as u16 + 2 + cursor as u16,
-            popup.y + 1 + surface.focus() as u16,
+            popup.x + 1 + 1 + label_width as u16 + 2 + column as u16,
+            popup.y + 1 + row as u16,
         ));
     }
 }
 
+/// How many screen lines each field of a surface is drawn on.
+///
+/// A field that holds one line takes one. What is left of the surface goes to the
+/// fields that hold many, so a body is drawn as the lines the reader wrote instead
+/// of with its breaks collapsed into one — which is the whole difference between a
+/// text area and a long single line. Every field keeps at least one line however
+/// short the surface is: a field with no line on screen has nowhere to put its
+/// cursor.
+fn field_heights(kinds: &[Lines], interior: usize) -> Vec<usize> {
+    let many = kinds
+        .iter()
+        .filter(|lines| matches!(lines, Lines::Many))
+        .count();
+    let spare = interior.saturating_sub(kinds.len() - many);
+    kinds
+        .iter()
+        .map(|lines| match lines {
+            Lines::One => 1,
+            Lines::Many => (spare / many.max(1)).max(1),
+        })
+        .collect()
+}
+
 /// The cells a surface draws in, which the surface itself decides.
 ///
-/// A float is centred on the whole terminal and as tall as its fields need, like
-/// every other float. A surface that renders in the pane takes the pane exactly, so
-/// the frozen row stays visible in the navigation pane beside it — and it follows
-/// the pane wherever the pane is, rather than answering the separate question of
-/// whether an open surface may fill the width.
+/// A float is centred on the whole terminal and as tall as its fields need, one
+/// line each: a field that holds many lines wants a viewport rather than a line,
+/// and the pane is where such a field is drawn. A surface that renders in the pane
+/// takes the pane exactly, so the frozen row stays visible in the navigation pane
+/// beside it — and it follows the pane wherever the pane is, rather than answering
+/// the separate question of whether an open surface may fill the width.
 fn surface_area(placement: Placement, screen: Rect, pane: Rect, fields: usize) -> Rect {
     match placement {
         Placement::Float => centred(screen, DIALOG_WIDTH, fields as u16 + 2),
@@ -245,24 +284,73 @@ fn value_width(width: u16, label_width: usize) -> usize {
         .max(1)
 }
 
-/// The part of a one-line value a field this wide shows, and where the cursor
-/// falls inside it.
+/// How far across a line of this length is scrolled to keep `cursor` in a field
+/// this wide: not at all while the line fits, and otherwise as little as puts the
+/// cursor on the last column the field has.
 ///
-/// A field holds one line, so content wider than the field scrolls rather than
-/// wrapping — and the part shown always contains the cursor, or a reader typing at
-/// the end of a long value would be typing off the screen. One column is kept for
-/// the cursor itself, which has to sit somewhere when it is past the last
-/// character.
-fn field_window(value: &str, cursor: usize, width: usize) -> (String, usize) {
-    let chars: Vec<char> = value.chars().collect();
+/// Content wider than the field scrolls rather than wrapping — so the part shown
+/// always contains the cursor, or a reader typing at the end of a long line would be
+/// typing off the screen.
+fn scrolled_to(cursor: usize, length: usize, width: usize) -> usize {
     let width = width.max(1);
-    if chars.len() < width {
-        return (value.to_string(), cursor.min(chars.len()));
+    if length < width {
+        return 0;
     }
-    let last_start = chars.len() + 1 - width;
-    let start = cursor.saturating_sub(width - 1).min(last_start);
-    let end = (start + width - 1).min(chars.len());
-    (chars[start..end].iter().collect(), cursor - start)
+    cursor.saturating_sub(width - 1).min(length + 1 - width)
+}
+
+/// The part of one line a field this wide shows, starting at `left`. One column is
+/// kept for the cursor itself, which has to sit somewhere when it is past the last
+/// character of the line.
+fn line_window(line: &str, left: usize, width: usize) -> String {
+    line.chars()
+        .skip(left)
+        .take(width.max(1).saturating_sub(1))
+        .collect()
+}
+
+/// The rectangle of a value a field this size shows, and where the cursor falls
+/// inside it as `(row, column)`.
+///
+/// A field's own line breaks are the lines drawn, so a field holding many of them
+/// is drawn as the text the reader wrote — the whole point of a text area, and what
+/// a renderer emitting one screen line per field cannot show at all. Neither axis
+/// wraps: the window scrolls to keep the cursor inside the field, down to the line
+/// the cursor is on and across by that line's own column, and every line scrolls
+/// across together so the lines of a paragraph stay aligned under one another.
+///
+/// A field holding one line has exactly one, so this is the single-line window with
+/// one row in it.
+fn field_view(
+    value: &str,
+    cursor: usize,
+    width: usize,
+    height: usize,
+) -> (Vec<String>, (usize, usize)) {
+    let lines: Vec<&str> = value.split('\n').collect();
+    let (row, column) = cursor_line_and_column(value, cursor);
+    let height = height.max(1);
+    // The cursor's line is the last one shown once the value is taller than the
+    // field, and the top of the value is shown while it is not.
+    let top = (row + 1).saturating_sub(height);
+    let left = scrolled_to(column, lines[row].chars().count(), width);
+    let shown = lines
+        .iter()
+        .skip(top)
+        .take(height)
+        .map(|line| line_window(line, left, width))
+        .collect();
+    (shown, (row - top, column - left))
+}
+
+/// Where a character offset sits in a value, as the line it is on and the column
+/// along that line — which is what a drawn field is laid out in, while a field
+/// counts its cursor in characters from the start.
+fn cursor_line_and_column(value: &str, cursor: usize) -> (usize, usize) {
+    let before: Vec<char> = value.chars().take(cursor).collect();
+    let row = before.iter().filter(|c| **c == '\n').count();
+    let column = before.iter().rev().take_while(|c| **c != '\n').count();
+    (row, column)
 }
 
 /// A dialog: centred on the whole terminal, above everything, and it never
@@ -1174,10 +1262,25 @@ mod tests {
         assert!(rendered(0).is_empty());
     }
 
+    /// The one line a field of one line shows, and where the cursor falls in it:
+    /// such a field has exactly one line, so its window is the general one with a
+    /// single row in it.
+    fn one_line_window(value: &str, cursor: usize, width: usize) -> (String, usize) {
+        let (shown, (row, column)) = field_view(value, cursor, width, 1);
+        assert_eq!(
+            shown.len(),
+            1,
+            "a one-line value drew {} lines",
+            shown.len()
+        );
+        assert_eq!(row, 0, "a one-line value put the cursor on row {row}");
+        (shown[0].clone(), column)
+    }
+
     #[test]
     fn a_field_shows_the_part_of_its_content_the_cursor_is_in() {
         // Content that fits is shown whole, with the cursor where it is.
-        assert_eq!(field_window("short", 2, 20), ("short".to_string(), 2));
+        assert_eq!(one_line_window("short", 2, 20), ("short".to_string(), 2));
 
         // A field holds one line, so content wider than the field scrolls: what is
         // shown always contains the cursor, or a reader typing at the end of a long
@@ -1185,7 +1288,7 @@ mod tests {
         let long = "a label somebody pasted a whole sentence into";
         for cursor in 0..=long.chars().count() {
             for width in 1..12usize {
-                let (shown, at) = field_window(long, cursor, width);
+                let (shown, at) = one_line_window(long, cursor, width);
                 assert!(shown.chars().count() < width.max(2), "{width}: {shown:?}");
                 assert!(at <= shown.chars().count(), "{width}/{cursor}: {at}");
                 assert!(at < width, "{width}/{cursor}: the cursor is off the field");
@@ -1195,10 +1298,93 @@ mod tests {
         }
         // At the start the window starts at the start; at the end it ends there, so
         // what the reader last typed is what they can see.
-        assert_eq!(field_window(long, 0, 10).0, "a label s");
-        let (tail, at) = field_window(long, long.chars().count(), 10);
+        assert_eq!(one_line_window(long, 0, 10).0, "a label s");
+        let (tail, at) = one_line_window(long, long.chars().count(), 10);
         assert!(long.ends_with(&tail), "{tail:?}");
         assert_eq!(at, tail.chars().count(), "the cursor sits after the text");
+    }
+
+    #[test]
+    fn a_field_that_holds_many_lines_draws_them_as_lines_and_follows_the_cursor_down() {
+        let value = "first\nsecond\nthird\nfourth";
+        // Room for every line: the breaks are the lines drawn, which is the whole
+        // difference between a text area and one long line.
+        let (shown, at) = field_view(value, 0, 20, 4);
+        assert_eq!(shown, vec!["first", "second", "third", "fourth"]);
+        assert_eq!(at, (0, 0));
+
+        // Room for two: the top of the value while the cursor is inside the window,
+        // and then the cursor's own line at the bottom as it moves past it.
+        let at_line = |line: usize| -> usize {
+            // The offset of the start of a line, counted in characters as a field
+            // counts its cursor.
+            value
+                .split('\n')
+                .take(line)
+                .map(|l| l.chars().count() + 1)
+                .sum()
+        };
+        assert_eq!(
+            field_view(value, at_line(1), 20, 2),
+            (vec!["first".to_string(), "second".to_string()], (1, 0))
+        );
+        assert_eq!(
+            field_view(value, at_line(3), 20, 2),
+            (vec!["third".to_string(), "fourth".to_string()], (1, 0))
+        );
+        // And back up: the window follows the cursor rather than staying where it
+        // scrolled to, so a reader who moves up sees the line they moved onto.
+        assert_eq!(
+            field_view(value, at_line(0), 20, 2),
+            (vec!["first".to_string(), "second".to_string()], (0, 0))
+        );
+
+        // Across, the lines scroll together: a common left column keeps the lines of
+        // a paragraph under one another, and the cursor's own line is what decides
+        // how far. A line shorter than the offset shows nothing rather than a run
+        // taken from somewhere else in it.
+        let wide = "a line long enough to scroll\nshort";
+        let (shown, at) = field_view(wide, "a line long enough to scroll".chars().count(), 10, 2);
+        assert_eq!(shown[0], "to scroll");
+        assert_eq!(at, (0, shown[0].chars().count()));
+        assert!(
+            "short".ends_with(&shown[1]) || shown[1].is_empty(),
+            "the second line is not a run of itself: {shown:?}"
+        );
+
+        // Every window fits the field it was asked for, whatever the cursor is doing
+        // in it: a line past the right-hand edge or a row past the bottom would be
+        // drawn over the border.
+        for cursor in 0..=value.chars().count() {
+            for height in 1..6usize {
+                for width in 1..12usize {
+                    let (shown, (row, column)) = field_view(value, cursor, width, height);
+                    assert!(shown.len() <= height, "{height}: {shown:?}");
+                    assert!(row < shown.len(), "{cursor}/{height}: row {row}");
+                    assert!(column < width.max(1), "{cursor}/{width}: column {column}");
+                    for line in &shown {
+                        assert!(line.chars().count() < width.max(2), "{width}: {line:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_field_that_holds_many_lines_is_given_what_the_surface_has_left_over() {
+        // One field holding many lines takes the whole interior: a body drawn on one
+        // screen line is a body with its breaks collapsed.
+        assert_eq!(field_heights(&[Lines::Many], 20), vec![20]);
+        // Beside a field that holds one line, that line comes off the top first.
+        assert_eq!(field_heights(&[Lines::One, Lines::Many], 20), vec![1, 19]);
+        // A surface of one-line fields is what it always was: a line each.
+        assert_eq!(field_heights(&[Lines::One, Lines::One], 20), vec![1, 1]);
+        // And every field keeps a line however short the surface is: a field with no
+        // line on screen has nowhere to put its cursor.
+        for interior in 0..4usize {
+            let heights = field_heights(&[Lines::One, Lines::Many], interior);
+            assert!(heights.iter().all(|h| *h >= 1), "{interior}: {heights:?}");
+        }
     }
 
     #[test]

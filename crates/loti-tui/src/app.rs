@@ -60,6 +60,10 @@ const EDITING_STOPPED_READ_ONLY: &str = "the store can no longer be written — 
 const CONFIRM_TITLE: &str = " confirm ";
 /// See [`CONFIRM_TITLE`].
 const REFUSAL_TITLE: &str = " the store refused the change ";
+/// See [`CONFIRM_TITLE`]. A conflict is a question rather than a report: the
+/// entity moved on under the open buffer, and only the reader can say whether
+/// what they wrote should replace what landed.
+const CONFLICT_TITLE: &str = " the entity changed while you were editing ";
 /// See [`CONFIRM_TITLE`].
 const REQUIRED_TITLE: &str = " a required field is empty ";
 /// See [`CONFIRM_TITLE`]. The browser hands the terminal over for an external
@@ -78,6 +82,10 @@ const LABEL_FIELD: &str = "label";
 /// out, so the field says so: what the reader types is a token the store
 /// resolves, not prose.
 const BLOCKER_FIELD: &str = "blocker reference";
+/// See [`LABEL_FIELD`]. The long-form text of an epic or a node, named as the
+/// store names it — the warning that asks about discarding it, and the buffer's
+/// own column, say the same word the command line does.
+const BODY_FIELD: &str = "body";
 
 /// A transient one-line notice, holding the hint strip's line until its deadline
 /// passes.
@@ -126,6 +134,15 @@ enum Offer {
     Ask(Dialog),
     /// A surface to fill in and accept.
     Fill(Surface),
+    /// A surface whose starting text is the entity's own, so it cannot be built
+    /// without reading the entity.
+    ///
+    /// A variant of its own because this offer is asked on every frame — the hint
+    /// strip asks it — and a read per frame would be a read the reader never asked
+    /// for. So the offer says which text is wanted and the read happens when the
+    /// letter is pressed, which is also the moment the freshness rule names: the
+    /// buffer starts from the current text and the stamp is as fresh as the edit.
+    Compose(LongForm),
     /// Nothing for the browser to do, and the notice that says so — naming the
     /// command line, where the job the browser does not do is done instead.
     ///
@@ -133,6 +150,18 @@ enum Offer {
     /// reader who presses the letter anyway gets an answer better than "not an
     /// editing action" rather than being left to guess where else to look.
     Signpost(String),
+}
+
+/// Which whole-field replacement a surface composes, of the ones a re-read has to
+/// fetch first.
+///
+/// Invariant: whatever is named here is read through the core seam when the letter
+/// is pressed and written back with the stamp of that read, so no free-form
+/// replacement can be composed from a preview the browser rendered minutes ago.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LongForm {
+    /// The markdown body, as long as the reader writes it.
+    Body,
 }
 
 /// A dialog: what it says, how it may be answered, what its answers are called,
@@ -259,6 +288,42 @@ impl Dialog {
         }
     }
 
+    /// The question a write refused for a stale precondition raises: the entity
+    /// moved on since the buffer was opened, so writing now replaces whatever
+    /// landed.
+    ///
+    /// A question rather than the store's own words, unlike every other refusal:
+    /// what the store reports is two stamps failing to match, and what the reader
+    /// has to decide is whose text survives. Both answers lose something, so
+    /// neither is a default — the way out keeps the buffer and decides nothing,
+    /// which is the one answer that is never destructive anywhere in the browser.
+    ///
+    /// It names the entity, because the buffer covers the pane and the frozen row
+    /// is dim beside it.
+    fn conflict(reference: &str, write: data::Write, done: String) -> Self {
+        Self {
+            title: CONFLICT_TITLE,
+            message: format!(
+                "{reference} changed since this buffer was opened. \
+                 Writing now replaces that change; nothing has been written yet."
+            ),
+            answers: Answers::Conflict,
+            affirmative: Some(Answer {
+                word: "overwrite anyway",
+                // Without the precondition it was refused for: the reader has seen
+                // that the entity moved on and said to write anyway.
+                performs: Performs::Write {
+                    write: write.overwriting(),
+                    done,
+                },
+            }),
+            dismissal: Dismissal {
+                word: "back to the buffer",
+                performs: None,
+            },
+        }
+    }
+
     /// A refusal, in the store's own words.
     fn refusal(message: String) -> Self {
         Self::report(
@@ -351,14 +416,30 @@ impl Field {
     /// An empty field, which is where every surface starts: nothing the browser
     /// puts there itself could be text the reader meant to write.
     fn new(label: &'static str, required: bool, lines: Lines) -> Self {
-        Self {
+        Self::filled(label, required, lines, String::new())
+    }
+
+    /// A field starting from text the store holds, which is where a field that
+    /// replaces an existing value starts: a buffer opened on an empty body would
+    /// make every save a deletion.
+    ///
+    /// The text goes through the same sieve a keystroke does, so a one-line field
+    /// cannot be seeded with a line break either, and the field is not dirty: the
+    /// reader has typed nothing, so the way out has nothing to warn about. The
+    /// cursor starts at the top rather than at the end, because the reader reads
+    /// the document before changing it and a cursor at the end of a long body would
+    /// open the buffer scrolled past everything in it.
+    fn filled(label: &'static str, required: bool, lines: Lines, value: String) -> Self {
+        let mut field = Self {
             label,
             value: String::new(),
             cursor: 0,
             required,
             lines,
             dirty: false,
-        }
+        };
+        field.value = value.chars().filter(|c| field.accepts(*c)).collect();
+        field
     }
 
     /// What the field is called.
@@ -585,6 +666,13 @@ enum Commit {
     /// row names. The browser judges nothing about the reference: what it names,
     /// and whether that may block this, come back from the store.
     AddBlocker(Selection),
+    /// Replace the body of the epic or node the frozen row names, guarded by the
+    /// stamp its text was read at.
+    ///
+    /// The stamp is captured when the buffer opens and travels unread from there to
+    /// the write: the window it guards is the edit itself, which is exactly the
+    /// window the browser cannot see into.
+    SetBody(Selection, data::Stamp),
 }
 
 impl Surface {
@@ -611,6 +699,24 @@ impl Surface {
             focus: 0,
             placement: Placement::Float,
             commit: Commit::AddBlocker(list),
+        }
+    }
+
+    /// The surface that edits a body: one field holding as many lines as the reader
+    /// writes, drawn in the preview pane so the frozen row stays visible beside it,
+    /// at whatever split the reader set.
+    ///
+    /// It starts from the text the read returned and carries that read's stamp, so
+    /// the buffer is the current document rather than a rendered preview of an older
+    /// one. The field is not required: a body may legitimately be emptied, and what
+    /// makes one acceptable is the store's rule.
+    fn body(target: data::EditTarget) -> Self {
+        Self {
+            title: format!(" body of {} ", target.selection.reference()),
+            fields: vec![Field::filled(BODY_FIELD, false, Lines::Many, target.body)],
+            focus: 0,
+            placement: Placement::Pane,
+            commit: Commit::SetBody(target.selection, target.stamp),
         }
     }
 
@@ -716,6 +822,20 @@ impl Surface {
                     // bare number is not: by the time it is read the surface that
                     // held the reference is gone.
                     format!("blocker {} added", data::blocker_name(list, &reference)),
+                )
+            }
+            Commit::SetBody(target, stamp) => {
+                let reference = target.reference();
+                (
+                    data::Write::SetBody {
+                        target: target.clone(),
+                        body: self.fields[0].value.clone(),
+                        expect: Some(*stamp),
+                    },
+                    // The notice names the entity: the buffer that held the text is
+                    // gone by the time it is read, and the row it belonged to is one
+                    // of several that look alike.
+                    format!("body of {reference} saved"),
                 )
             }
         }
@@ -902,7 +1022,10 @@ impl App {
     /// nothing raises a notice saying why, which is what nothing happening looks
     /// like everywhere else in the mode.
     fn offers(&self, action: EditingAction) -> bool {
-        matches!(self.offer(action), Some(Offer::Ask(_) | Offer::Fill(_)))
+        matches!(
+            self.offer(action),
+            Some(Offer::Ask(_) | Offer::Fill(_) | Offer::Compose(_))
+        )
     }
 
     /// What an editing action opens on the frozen row, or `None` where the row does
@@ -965,6 +1088,16 @@ impl App {
                         container.cli_noun(),
                         container.selection().reference(),
                     )))
+                }
+                _ => None,
+            },
+            // Only an epic and a node have a body of their own: a collection and its
+            // members are edited by their own operations, so no row of one offers the
+            // letter. The text itself is not fetched here — the hint strip asks this
+            // on every frame, and a read belongs to the keypress.
+            EditingAction::Body => match target {
+                Selection::Epic(_) | Selection::Node(_) => {
+                    Some(Offer::Compose(LongForm::Body))
                 }
                 _ => None,
             },
@@ -1085,6 +1218,8 @@ impl App {
             // these intents while browsing.
             Action::Add
             | Action::Delete
+            | Action::Body
+            | Action::Overwrite
             | Action::Accept
             | Action::ExternalEditor
             | Action::Insert(_)
@@ -1181,15 +1316,29 @@ impl App {
         }
         // A dialog admits its listed answers and nothing else: nothing underneath
         // it may move while it is open.
-        match action {
-            // The affirmative answer performs whatever the dialog carries, so no
-            // one operation is named here and a further kind of question needs no
-            // arm of its own.
-            Action::Delete => self.answer(),
-            // A refused write leaves the editing session standing: only a
-            // successful write ends it, so dismissing lands back in the mode.
-            Action::Unwind => self.dismiss(),
-            _ => {}
+        //
+        // Which intent goes ahead is the open dialog's answer set to say, so no
+        // intent is named here: a second question with a second affirmative answer
+        // is a set that names its own intent, and one dialog's answer can never
+        // perform another's — the letter that throws a label away is not the letter
+        // that overwrites somebody else's text.
+        if self.dialog_answers().and_then(Answers::affirmative) == Some(action) {
+            self.answer();
+            return;
+        }
+        // A refused write leaves the editing session standing: only a successful
+        // write ends it, so dismissing lands back in the mode.
+        if matches!(action, Action::Unwind) {
+            self.dismiss();
+        }
+    }
+
+    /// The answers the open dialog admits, or `None` when what is open is not a
+    /// dialog.
+    fn dialog_answers(&self) -> Option<Answers> {
+        match &self.modal {
+            Some(Modal::Dialog(dialog)) => Some(dialog.answers),
+            Some(Modal::Help) | None => None,
         }
     }
 
@@ -1253,18 +1402,30 @@ impl App {
     /// ended the session — would leave the reader believing nothing happened; the
     /// re-read that follows it cannot fail for exactly that reason.
     fn commit(&mut self, write: &data::Write, done: String) {
-        match data::perform(&self.store, write) {
+        let refusal = match data::perform(&self.store, write) {
             Ok(()) => {
                 self.surface = None;
                 self.editing = None;
                 self.reload();
                 self.flash(done);
+                return;
+            }
+            Err(refusal) => refusal,
+        };
+        let dialog = match refusal {
+            // The one refusal the reader is asked about rather than told: the entity
+            // moved on under the buffer, and which text survives is theirs to
+            // decide. Told apart by what the seam classified, never by reading a
+            // message.
+            data::Refusal::Conflict => {
+                Dialog::conflict(&write.target().reference(), write.clone(), done)
             }
             // The store's own words, so the browser and the CLI teach the same
             // rule in the same words and the browser cannot go stale when a
             // store rule gains a nuance.
-            Err(e) => self.modal = Some(Modal::Dialog(Box::new(Dialog::refusal(e.to_string())))),
-        }
+            data::Refusal::Rule(message) => Dialog::refusal(message),
+        };
+        self.modal = Some(Modal::Dialog(Box::new(dialog)));
     }
 
     /// Carry out an intent while a surface is open.
@@ -1410,12 +1571,39 @@ impl App {
             _ => match EditingAction::for_intent(action).and_then(|a| self.offer(a)) {
                 Some(Offer::Ask(dialog)) => self.modal = Some(Modal::Dialog(Box::new(dialog))),
                 Some(Offer::Fill(surface)) => self.surface = Some(surface),
+                Some(Offer::Compose(text)) => self.compose(text),
                 // Nothing is written and nothing opens: the row said where the job
                 // is done instead, which is the same channel as any other reason
                 // nothing happened.
                 Some(Offer::Signpost(notice)) => self.flash(notice),
                 None => self.flash(NOT_AN_EDITING_ACTION),
             },
+        }
+    }
+
+    /// Open a buffer on text the store holds, re-read at this instant.
+    ///
+    /// The read happens here rather than when the mode was entered or when the
+    /// cursor last moved: the buffer must start from the current text, and the stamp
+    /// it carries has to be as fresh as the edit is, or the window a conflict is
+    /// reported for would be "since you last pressed a motion key" — minutes of
+    /// browsing before any typing began.
+    ///
+    /// A read that fails leaves the mode standing and says what could not be read:
+    /// the entity may have gone between the letter being offered and pressed, which
+    /// is the same class of thing as any other part of a store the browser cannot
+    /// read.
+    fn compose(&mut self, text: LongForm) {
+        let Some(target) = self.editing.clone() else {
+            return;
+        };
+        match data::edit_target(&self.store, &target) {
+            Ok(target) => {
+                self.surface = Some(match text {
+                    LongForm::Body => Surface::body(target),
+                })
+            }
+            Err(e) => self.store_unreadable(e.to_string()),
         }
     }
 
@@ -1753,6 +1941,22 @@ mod tests {
         assert_eq!(app.modal(), None, "the store refused {reference:?}");
     }
 
+    /// Freeze the epic's own row, on the roster, which is where its body is
+    /// edited: the body of the row the mode acts on, not of a collection under it.
+    fn freeze_the_epics_row(app: &mut App) {
+        to_the_roster(app);
+        app.apply(Action::CursorFirst).unwrap();
+        app.apply(Action::EnterEditing).unwrap();
+    }
+
+    /// Open the body buffer, the way a reader does: freeze the epic's row and press
+    /// the letter that edits its long-form text.
+    fn open_the_body_buffer(app: &mut App) {
+        freeze_the_epics_row(app);
+        app.apply(Action::Body).unwrap();
+        assert!(app.surface().is_some(), "the body key opened no buffer");
+    }
+
     /// Open the label surface, the way a reader does: freeze the label set's row
     /// and press the letter that adds a member to it.
     fn open_the_label_surface(app: &mut App) {
@@ -1809,6 +2013,19 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    /// The store's own words for a write it refuses by rule, taken from the seam
+    /// that produces them so a test about a verbatim refusal never spells the
+    /// message out.
+    ///
+    /// A conflict is not one of these: the reader is asked about that one in the
+    /// browser's own words, so it must not stand in for a refusal shown verbatim.
+    fn store_refusal(store: &Store, write: &data::Write, why: &str) -> String {
+        match data::perform(store, write) {
+            Err(data::Refusal::Rule(words)) => words,
+            other => panic!("{why}: {other:?}"),
+        }
     }
 
     /// Type into the open field, one keystroke per character, as a reader does.
@@ -2552,8 +2769,11 @@ mod tests {
 
         // A ticket cannot be deleted at all — the store has no such operation, so
         // resolution is `closed` — which makes the letter as unknown on this row
-        // as any key the mode does not admit, and the strip lists nothing.
-        assert!(app.editing_hints().is_empty());
+        // as any key the mode does not admit, and the strip does not list it
+        // among the actions the row does offer.
+        assert!(!app
+            .editing_hints()
+            .contains(&hint_for(EditingAction::Delete)));
         app.apply(Action::Delete).unwrap();
         assert_eq!(app.modal(), None, "a row that offers nothing asked nothing");
         assert_eq!(app.flash_message(), Some(NOT_AN_EDITING_ACTION));
@@ -2697,9 +2917,11 @@ mod tests {
         // Verbatim, so the browser and the CLI teach the same rule in the same
         // words: compared against the message the seam itself produces, never a
         // string spelled out here, which is what a reworded refusal would pass.
-        let refusal = data::perform(&fx.store, &data::Write::RemoveLabel(target))
-            .expect_err("the store refuses a label removal on a missing entity")
-            .to_string();
+        let refusal = store_refusal(
+            &fx.store,
+            &data::Write::RemoveLabel(target),
+            "the store refuses a label removal on a missing entity",
+        );
         assert_eq!(
             app.modal(),
             Some(&Modal::Dialog(Box::new(Dialog::refusal(refusal))))
@@ -3442,23 +3664,254 @@ mod tests {
     }
 
     #[test]
-    fn a_surface_opens_at_the_split_the_reader_set_and_never_widens_itself() {
-        let (_fx, mut app) = app();
-        // A split the reader chose, so a surface that widened or reset it is
-        // distinguishable from one that left it alone.
-        app.apply(Action::ShrinkNav).unwrap();
-        let split = app.nav_percent();
-        assert_ne!(split, DEFAULT_NAV_PERCENT);
+    fn the_body_buffer_opens_on_the_text_the_store_holds_at_that_moment() {
+        let (fx, mut app) = app();
+        freeze_the_epics_row(&mut app);
 
+        // A write lands after the mode was entered and before the letter was
+        // pressed. The buffer has to start from this, not from the text the preview
+        // beside it was rendered from: without a read here the conflict window would
+        // be "since the cursor last moved" — minutes of browsing before any typing.
+        fx.rewrite_the_epics_body("theirs, after the mode was entered\n");
+        app.apply(Action::Body).unwrap();
+        assert_eq!(field_value(&app), fx.epic_body());
+        // One field holding many lines, which is the whole of what the key map is
+        // told: it is what makes the reflex key a line break here and the save key
+        // the only way to accept.
+        assert_eq!(app.mode(), surface_mode(Fields::One, Lines::Many));
+        // Nothing has been typed, so the way out has nothing to warn about: text
+        // the store already held is not text the reader wrote.
+        assert!(!app.surface().unwrap().fields()[0].is_dirty());
+
+        // And the stamp the buffer carries is that read's, not one from an earlier
+        // listing: accepting at once is not a conflict, though the entity moved on
+        // between the mode being entered and the buffer being opened.
+        app.apply(Action::Accept).unwrap();
+        assert_eq!(
+            app.modal(),
+            None,
+            "the buffer's own read was refused as stale"
+        );
+    }
+
+    #[test]
+    fn a_ticket_offers_its_own_body_and_the_buffer_says_which_row_it_is_editing() {
+        let (fx, mut app) = app();
+        app.apply(Action::Descend).unwrap(); // into the epic
+        to_work_row(&mut app);
+        app.apply(Action::EnterEditing).unwrap();
+        // A node has a body of its own, so its row offers the letter and the strip
+        // lists it.
+        assert!(app.editing_hints().contains(&hint_for(EditingAction::Body)));
+        hints_and_keys_agree(&mut app);
+
+        app.apply(Action::Body).unwrap();
+        let surface = app.surface().expect("the letter opened a buffer");
+        // The buffer names the row it is editing, because the pane is not the row
+        // and the frozen row is dim beside it — and it holds the node's own text,
+        // not the epic's, which is the difference a wrongly addressed read would
+        // hide.
+        let (_, reference) = fx.node_reference_forms();
+        assert!(
+            surface.title().contains(&reference),
+            "{:?}",
+            surface.title()
+        );
+        assert_eq!(field_value(&app), "node body\n");
+        assert_ne!(field_value(&app), fx.epic_body());
+
+        // A collection and its members are edited by their own operations, so no row
+        // of one offers the letter: it is as unknown there as any key the mode never
+        // binds.
+        app.apply(Action::Unwind).unwrap();
+        app.apply(Action::Unwind).unwrap();
+        to_a_label_row(&mut app);
+        app.apply(Action::EnterEditing).unwrap();
+        app.clear_flash();
+        app.apply(Action::Body).unwrap();
+        assert!(app.surface().is_none(), "a label row opened a body buffer");
+        assert_eq!(app.flash_message(), Some(NOT_AN_EDITING_ACTION));
+        assert!(!app.editing_hints().contains(&hint_for(EditingAction::Body)));
+    }
+
+    #[test]
+    fn a_body_that_cannot_be_read_is_reported_and_the_mode_stays_on() {
+        let (fx, mut app) = app();
+        freeze_the_epics_row(&mut app);
+
+        // The entity can go between the letter being offered and being pressed, and
+        // a buffer cannot open on text nothing could read — so the read's failure is
+        // reported as any other unreadable part of a store is, and the mode stands.
+        fx.remove_the_epics_file();
+        app.apply(Action::Body).unwrap();
+        assert!(
+            app.surface().is_none(),
+            "a buffer opened on text that could not be read"
+        );
+        let Some(Modal::Dialog(dialog)) = app.modal() else {
+            panic!("a failed read said nothing: {:?}", app.modal())
+        };
+        assert!(dialog.message().contains(&fx.epic), "{dialog:?}");
+        // Nothing is at stake in reading it, so it is dismissed rather than
+        // answered, and a failure is never a transient notice.
+        assert_eq!(dialog.answers(), Answers::Acknowledge);
+        assert_eq!(app.flash_message(), None);
+
+        app.apply(Action::Unwind).unwrap();
+        assert!(app.editing_target().is_some(), "the mode ended");
+        assert_eq!(app.mode(), Mode::Editing);
+    }
+
+    #[test]
+    fn the_way_out_of_a_body_with_typing_in_it_names_the_field_and_keeps_the_text() {
+        let (fx, mut app) = app();
+        let before = fx.epic_body();
+        open_the_body_buffer(&mut app);
+        type_into(&mut app, "a first line");
+
+        // The text is the only copy of what the reader wrote, so the way out asks —
+        // naming the field, because the buffer covers the pane and the frozen row is
+        // dim beside it.
+        app.apply(Action::Unwind).unwrap();
+        let Some(Modal::Dialog(dialog)) = app.modal() else {
+            panic!("a dirty buffer was thrown away unasked: {:?}", app.modal())
+        };
+        assert!(dialog.message().contains(BODY_FIELD), "{dialog:?}");
+        assert_eq!(dialog.answers(), Answers::Destructive);
+
+        // The answer that is never destructive lands back in the buffer with the
+        // text exactly as it was.
+        app.apply(Action::Unwind).unwrap();
+        assert!(field_value(&app).starts_with("a first line"));
+        assert_eq!(app.mode(), surface_mode(Fields::One, Lines::Many));
+
+        // And the destructive letter throws away the buffer and only the buffer:
+        // nothing reached the store, and the mode stays on its frozen row.
+        app.apply(Action::Unwind).unwrap();
+        app.apply(Action::Delete).unwrap();
+        assert!(app.surface().is_none());
+        assert_eq!(app.mode(), Mode::Editing);
+        assert_eq!(fx.epic_body(), before, "discarding wrote something");
+    }
+
+    #[test]
+    fn a_body_emptied_in_the_buffer_is_written_as_empty_and_never_called_required() {
+        let (fx, mut app) = app();
+        open_the_body_buffer(&mut app);
+        let held = field_value(&app);
+        assert!(!held.is_empty(), "the fixture's body is already empty");
+
+        // Deleting forwards from where the buffer opens takes the breaks with the
+        // characters, so the whole document goes. Bounded by what was there, so a
+        // delete that stopped removing anything fails here instead of spinning.
+        for _ in 0..held.chars().count() {
+            app.apply(Action::DeleteAfter).unwrap();
+        }
+        assert_eq!(field_value(&app), "", "the buffer would not empty");
+
+        // Emptying a body is a thing a reader may mean, so the save goes through:
+        // no field is missing, and what makes a body acceptable is the store's
+        // rule and not this surface's.
+        app.apply(Action::Accept).unwrap();
+        assert_eq!(app.modal(), None, "an emptied body was called required");
+        assert!(app.surface().is_none(), "the buffer outlived its own save");
+        assert_eq!(fx.epic_body(), "", "emptying the buffer wrote nothing");
+    }
+
+    #[test]
+    fn a_body_refused_for_a_conflict_asks_and_keeps_the_buffer_whichever_way_it_ends() {
+        let (fx, mut app) = app();
+        open_the_body_buffer(&mut app);
+        type_into(&mut app, "mine");
+
+        // Somebody else writes while the reader is composing theirs, which is the
+        // one window the store's own lock cannot cover.
+        fx.rewrite_the_epics_body("theirs\n");
+        app.apply(Action::Accept).unwrap();
+        // Asked rather than told: this is the one refusal with something for the
+        // reader to decide, so the keyboard is under the conflict's own answers and
+        // not under the ones a report is dismissed by.
+        assert_eq!(app.mode(), Mode::Dialog(Answers::Conflict));
+        assert_eq!(app.flash_message(), None, "a failure is never a notice");
+
+        // The way out keeps the buffer, the text and the session: only a successful
+        // write ends one, so the reader can still carry their text out through the
+        // external editor.
+        app.apply(Action::Unwind).unwrap();
+        assert_eq!(app.modal(), None);
+        assert!(field_value(&app).starts_with("mine"));
+        assert_eq!(app.mode(), surface_mode(Fields::One, Lines::Many));
+        assert!(
+            app.editing_target().is_some(),
+            "a refusal ended the session"
+        );
+
+        // And it decided nothing: the same save asks the same question again rather
+        // than going through on the strength of having been asked once.
+        app.apply(Action::Accept).unwrap();
+        assert_eq!(app.mode(), Mode::Dialog(Answers::Conflict));
+
+        // Going ahead ends the session, surface and all, which is what only a
+        // successful write does.
+        app.apply(Action::Overwrite).unwrap();
+        assert_eq!(app.modal(), None);
+        assert!(app.surface().is_none());
+        assert_eq!(app.editing_target(), None);
+        assert_eq!(app.mode(), Mode::Browse);
+    }
+
+    #[test]
+    fn an_affirmative_answer_that_belongs_to_another_question_performs_nothing() {
+        let (fx, mut app) = app();
+        let before = fx.epic_labels();
+
+        // Every dialog carries the answers of its own set, and an intent reaches the
+        // state machine without passing the key map — a mouse wheel does. So a
+        // question must not be answered by another question's affirmative intent:
+        // the letter that throws a label away is not the letter that overwrites
+        // somebody else's text, and a dialog that only reports has nothing to go
+        // ahead with at all.
+        to_a_label_row(&mut app);
+        app.apply(Action::EnterEditing).unwrap();
+        app.apply(Action::Delete).unwrap();
+        let asked = app.modal().cloned().expect("a question is open");
+        app.apply(Action::Overwrite).unwrap();
+        assert_eq!(app.modal(), Some(&asked), "the question was answered");
+        assert_eq!(fx.epic_labels(), before, "something was written");
+        app.apply(Action::Unwind).unwrap();
+        app.apply(Action::Unwind).unwrap();
+
+        // A report has no affirmative answer at all, so neither intent performs
+        // anything at one and it stands until it is dismissed.
         open_the_label_surface(&mut app);
+        app.apply(Action::Accept).unwrap();
+        let reported = app.modal().cloned().expect("a report is open");
+        assert_eq!(app.mode(), Mode::Dialog(Answers::Acknowledge));
+        for action in [Action::Delete, Action::Overwrite] {
+            app.apply(action).unwrap();
+            assert_eq!(app.modal(), Some(&reported), "{action:?} answered a report");
+        }
+        assert_eq!(fx.epic_labels(), before, "something was written");
+        app.apply(Action::Unwind).unwrap();
+        app.apply(Action::Unwind).unwrap();
+        app.apply(Action::Unwind).unwrap();
 
-        // An editing surface draws where the reader has the panes, and the
-        // navigation pane is left as it was: widening the preview to admit a
-        // buffer would move the divider out from under the reader at the one
-        // moment they were concentrating on something else, and closing the
-        // surface would then have to decide whether to put it back.
-        assert_eq!(app.nav_percent(), split, "the surface moved the divider");
-        assert!(!app.zoomed(), "the surface took the whole width");
+        // And the other way round: the destructive letter does not answer the
+        // question about somebody else's text.
+        let body = fx.epic_body();
+        open_the_body_buffer(&mut app);
+        type_into(&mut app, "mine");
+        fx.rewrite_the_epics_body("theirs\n");
+        app.apply(Action::Accept).unwrap();
+        let asked = app.modal().cloned().expect("a question is open");
+        app.apply(Action::Delete).unwrap();
+        assert_eq!(app.modal(), Some(&asked), "the question was answered");
+        assert_eq!(fx.epic_body(), "theirs\n", "something was written");
+        assert_ne!(
+            fx.epic_body(),
+            body,
+            "the fixture cannot tell the two apart"
+        );
     }
 
     #[test]
@@ -3701,12 +4154,11 @@ mod tests {
         let (fx, mut app) = app();
         let before = fx.node_blockers();
         let refusal_for = |reference: &str| {
-            data::perform(
+            store_refusal(
                 &fx.store,
                 &data::Write::AddBlocker(fx.blocked_by_selection(), reference.to_string()),
+                "the store judges what may block what",
             )
-            .expect_err("the store judges what may block what")
-            .to_string()
         };
 
         // The browser judges nothing about the reference: a blocker that does not
@@ -3923,9 +4375,11 @@ mod tests {
         // Verbatim, so the browser and the CLI teach the same rule in the same
         // words: compared against the message the seam itself produces, never a
         // string spelled out here, which is what a reworded refusal would pass.
-        let refusal = data::perform(&fx.store, &data::Write::DeleteAsset(target))
-            .expect_err("the store refuses an asset deletion on a missing entity")
-            .to_string();
+        let refusal = store_refusal(
+            &fx.store,
+            &data::Write::DeleteAsset(target),
+            "the store refuses an asset deletion on a missing entity",
+        );
         assert_eq!(
             app.modal(),
             Some(&Modal::Dialog(Box::new(Dialog::refusal(refusal))))

@@ -733,6 +733,72 @@ pub enum Write {
     RemoveBlocker(Selection),
     /// Take one asset off the container it hangs on, index entry and bytes alike.
     DeleteAsset(Selection),
+    /// Replace the whole body of the epic or node the row names.
+    ///
+    /// A whole-field replacement, so it is the one write here that can silently
+    /// discard text somebody else wrote — which is what the stamp is for.
+    SetBody {
+        /// The epic or node whose body is replaced.
+        target: Selection,
+        /// The replacement, exactly as the reader left it: what makes a body
+        /// acceptable is the store's rule, and the browser normalises none of it.
+        body: String,
+        /// The stamp the replaced text was read at, applied only while the entity
+        /// still carries it. `None` names no precondition — last write wins — which
+        /// is what a reader chooses by answering a conflict with overwrite, and
+        /// nothing else in the browser chooses for them.
+        expect: Option<Stamp>,
+    },
+}
+
+impl Write {
+    /// What the write is aimed at, which is how the reader addresses what it
+    /// changes: a question raised about a write names this rather than re-deriving
+    /// a reference of its own.
+    pub fn target(&self) -> &Selection {
+        match self {
+            Write::AddLabel(target, _)
+            | Write::RemoveLabel(target)
+            | Write::AddBlocker(target, _)
+            | Write::RemoveBlocker(target)
+            | Write::DeleteAsset(target)
+            | Write::SetBody { target, .. } => target,
+        }
+    }
+
+    /// The same write with its precondition dropped, which is what overwriting a
+    /// conflict performs: the reader has seen that the entity moved on and said to
+    /// write anyway, so naming a stamp again would refuse for the same reason.
+    ///
+    /// A write that names no stamp cannot conflict, so for every other write this
+    /// is the write itself.
+    pub fn overwriting(&self) -> Write {
+        match self {
+            Write::SetBody { target, body, .. } => Write::SetBody {
+                target: target.clone(),
+                body: body.clone(),
+                expect: None,
+            },
+            other => other.clone(),
+        }
+    }
+}
+
+/// Why the store would not take a write.
+///
+/// Invariant: the one refusal the browser reacts to differently is told apart
+/// here and nowhere else — the surface that reacts to it matches on this rather
+/// than reading a message — and every other refusal travels in the store's own
+/// words, verbatim, because those words are what the reader is shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// The entity moved on since the stamp the write named, so nothing was
+    /// written. The reader is asked about this one rather than told: only they can
+    /// decide whether their text should replace the change that landed under it.
+    Conflict,
+    /// Every other refusal, in the store's own words, so the browser and the
+    /// command line teach the same rule in the same words.
+    Rule(String),
 }
 
 /// Carry out a write, returning the store's own refusal when it refuses.
@@ -740,13 +806,95 @@ pub enum Write {
 /// The browser never judges a write itself: only the store can, so the action is
 /// offered, attempted, and whatever comes back is shown — which is why nothing
 /// here pre-checks a store rule.
-pub fn perform(store: &Store, write: &Write) -> Result<()> {
+pub fn perform(store: &Store, write: &Write) -> Result<(), Refusal> {
     match write {
         Write::AddLabel(selection, label) => add_label(store, selection, label),
         Write::RemoveLabel(selection) => remove_label(store, selection),
         Write::AddBlocker(selection, reference) => add_blocker(store, selection, reference),
         Write::RemoveBlocker(selection) => remove_blocker(store, selection),
         Write::DeleteAsset(selection) => delete_asset(store, selection),
+        Write::SetBody {
+            target,
+            body,
+            expect,
+        } => set_body(store, target, body, *expect),
+    }
+}
+
+/// The refusal an operation's failure is reported as: a stale precondition, or
+/// the store's own words for everything else.
+///
+/// The classification is made on the store's own error type rather than on its
+/// message, so a reworded refusal cannot silently stop being a conflict.
+///
+/// The store refuses a target that is not there under the lock the same way it
+/// refuses a stale stamp, but every operation the browser calls checks existence
+/// before taking the lock, so what reaches a reader as a question is a stamp that
+/// moved and a target that is gone is refused by name.
+fn refusal(error: ops::OpError) -> Refusal {
+    match error {
+        ops::OpError::Store(loti_core::store::StoreError::Conflict { .. }) => Refusal::Conflict,
+        other => Refusal::Rule(other.to_string()),
+    }
+}
+
+/// A refusal the browser itself makes: a write aimed at a row that cannot take
+/// it, which is a caller that has lost track of what its row points at rather
+/// than anything the store was asked.
+fn misdirected(message: String) -> Refusal {
+    Refusal::Rule(message)
+}
+
+/// Replace an epic's or a node's body with the text the reader left, applying
+/// only while the entity still carries the stamp that text was read at.
+///
+/// This is the one write the browser makes that replaces a whole field, so it is
+/// the one that can discard text somebody else wrote: the stamp is the store's
+/// precondition, checked under the lock, and a mismatch writes nothing. Whether
+/// the body is acceptable at all is the store's rule; the text is written exactly
+/// as the reader left it, trailing newline and all, as the command line writes
+/// what it is given.
+fn set_body(
+    store: &Store,
+    selection: &Selection,
+    body: &str,
+    expect: Option<Stamp>,
+) -> Result<(), Refusal> {
+    let expect_updated = expect.map(|stamp| stamp.0);
+    match selection {
+        Selection::Epic(id) => ops::edit_epic(
+            store,
+            id,
+            ops::EpicEdits {
+                body: Some(body.to_string()),
+                expect_updated,
+                ..Default::default()
+            },
+        )
+        .map(|_| ())
+        .map_err(refusal),
+        Selection::Node(r) => ops::edit_node(
+            store,
+            r,
+            ops::NodeEdits {
+                body: Some(body.to_string()),
+                expect_updated,
+                ..Default::default()
+            },
+        )
+        .map(|_| ())
+        .map_err(refusal),
+        // Only an epic and a node have a body of their own, and only their rows
+        // offer the action, so any other selection is a caller that has lost track
+        // of what its row points at.
+        Selection::Collection(..)
+        | Selection::Label(..)
+        | Selection::Comment(..)
+        | Selection::Asset(..)
+        | Selection::Blocker(..) => Err(misdirected(format!(
+            "{} has no body of its own",
+            selection.reference()
+        ))),
     }
 }
 
@@ -760,14 +908,16 @@ pub fn perform(store: &Store, write: &Write) -> Result<()> {
 /// No stamp guards this write, for the same reason a removal carries none: a
 /// stamp is the precondition of a free-form replacement, and adding one member to
 /// a set cannot silently discard text someone else wrote.
-fn add_label(store: &Store, selection: &Selection, label: &str) -> Result<()> {
+fn add_label(store: &Store, selection: &Selection, label: &str) -> Result<(), Refusal> {
     // Only the label set's own row offers an addition, so any other selection is a
     // caller that has lost track of what its row points at.
     let Selection::Collection(container, Collection::Labels) = selection else {
-        anyhow::bail!("{} is not a label set", selection.reference())
+        return Err(misdirected(format!(
+            "{} is not a label set",
+            selection.reference()
+        )));
     };
-    ops::add_labels(store, &container.target(), &[label.to_string()])
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    ops::add_labels(store, &container.target(), &[label.to_string()]).map_err(refusal)?;
     Ok(())
 }
 
@@ -784,14 +934,16 @@ fn add_label(store: &Store, selection: &Selection, label: &str) -> Result<()> {
 /// No stamp guards this write: a stamp is the precondition of a free-form
 /// replacement, and removing one member of a set cannot silently discard text
 /// someone else wrote.
-fn remove_label(store: &Store, selection: &Selection) -> Result<()> {
+fn remove_label(store: &Store, selection: &Selection) -> Result<(), Refusal> {
     // Only a label row offers removal, so any other selection is a caller that
     // has lost track of what its row points at.
     let Selection::Label(container, label) = selection else {
-        anyhow::bail!("{} is not a label", selection.reference())
+        return Err(misdirected(format!(
+            "{} is not a label",
+            selection.reference()
+        )));
     };
-    ops::remove_labels(store, &container.target(), std::slice::from_ref(label))
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    ops::remove_labels(store, &container.target(), std::slice::from_ref(label)).map_err(refusal)?;
     Ok(())
 }
 
@@ -806,10 +958,9 @@ fn remove_label(store: &Store, selection: &Selection) -> Result<()> {
 /// No stamp guards this write, for the same reason a label addition carries none:
 /// a stamp is the precondition of a free-form replacement, and adding one entry
 /// to a list cannot silently discard text someone else wrote.
-fn add_blocker(store: &Store, selection: &Selection, reference: &str) -> Result<()> {
-    let (node, blocker) = blocked_and_blocking(selection, reference)?;
-    ops::add_blocked_by(store, &node, std::slice::from_ref(&blocker))
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+fn add_blocker(store: &Store, selection: &Selection, reference: &str) -> Result<(), Refusal> {
+    let (node, blocker) = blocked_and_blocking(selection, reference).map_err(misdirected)?;
+    ops::add_blocked_by(store, &node, std::slice::from_ref(&blocker)).map_err(refusal)?;
     Ok(())
 }
 
@@ -819,14 +970,16 @@ fn add_blocker(store: &Store, selection: &Selection, reference: &str) -> Result<
 /// reference is typed to remove one: the row carries both the node that is
 /// blocked and the node blocking it, so there is nothing here to re-derive and no
 /// second chance to name the wrong entry.
-fn remove_blocker(store: &Store, selection: &Selection) -> Result<()> {
+fn remove_blocker(store: &Store, selection: &Selection) -> Result<(), Refusal> {
     // Only a blocker row offers removal, so any other selection is a caller that
     // has lost track of what its row points at.
     let Selection::Blocker(Container::Node(node), blocker) = selection else {
-        anyhow::bail!("{} is not a node's blocker", selection.reference())
+        return Err(misdirected(format!(
+            "{} is not a node's blocker",
+            selection.reference()
+        )));
     };
-    ops::remove_blocked_by(store, node, std::slice::from_ref(blocker))
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    ops::remove_blocked_by(store, node, std::slice::from_ref(blocker)).map_err(refusal)?;
     Ok(())
 }
 
@@ -843,13 +996,16 @@ fn remove_blocker(store: &Store, selection: &Selection) -> Result<()> {
 /// No stamp guards this write, for the same reason a label removal carries none:
 /// a stamp is the precondition of a free-form replacement, and taking one member
 /// out of a collection cannot silently discard text someone else wrote.
-fn delete_asset(store: &Store, selection: &Selection) -> Result<()> {
+fn delete_asset(store: &Store, selection: &Selection) -> Result<(), Refusal> {
     // Only an asset row offers a deletion, so any other selection is a caller
     // that has lost track of what its row points at.
     let Selection::Asset(container, name) = selection else {
-        anyhow::bail!("{} is not an asset", selection.reference())
+        return Err(misdirected(format!(
+            "{} is not an asset",
+            selection.reference()
+        )));
     };
-    ops::delete_asset(store, &container.target(), name).map_err(|e| anyhow::anyhow!("{e}"))?;
+    ops::delete_asset(store, &container.target(), name).map_err(refusal)?;
     Ok(())
 }
 
@@ -859,11 +1015,18 @@ fn delete_asset(store: &Store, selection: &Selection) -> Result<()> {
 /// An epic is not a unit of work that can be blocked, so it carries no dependency
 /// list and is never offered one: any selection that is not a node's dependency
 /// list is a caller that has lost track of what its row points at.
-fn blocked_and_blocking(selection: &Selection, reference: &str) -> Result<(NodeRef, NodeRef)> {
+fn blocked_and_blocking(
+    selection: &Selection,
+    reference: &str,
+) -> Result<(NodeRef, NodeRef), String> {
     let Selection::Collection(Container::Node(node), Collection::BlockedBy) = selection else {
-        anyhow::bail!("{} is not a dependency list", selection.reference())
+        return Err(format!(
+            "{} is not a dependency list",
+            selection.reference()
+        ));
     };
-    Ok((node.clone(), resolve_blocker(&node.epic_id, reference)?))
+    let blocker = resolve_blocker(&node.epic_id, reference)?;
+    Ok((node.clone(), blocker))
 }
 
 /// The node a typed blocker reference names: a bare number is a node of the
@@ -875,12 +1038,12 @@ fn blocked_and_blocking(selection: &Selection, reference: &str) -> Result<(NodeR
 /// text. Whether the node it names exists is not asked here — a refusal comes
 /// back from the store, in the store's words, and so does the refusal of a
 /// reference that is no reference at all.
-fn resolve_blocker(epic_id: &str, reference: &str) -> Result<NodeRef> {
+fn resolve_blocker(epic_id: &str, reference: &str) -> Result<NodeRef, String> {
     let reference = reference.trim();
     if let Ok(number) = reference.parse::<u64>() {
         return Ok(NodeRef::new(epic_id, number));
     }
-    NodeRef::parse(reference).map_err(|e| anyhow::anyhow!("{e}"))
+    NodeRef::parse(reference).map_err(|e| e.to_string())
 }
 
 /// How a blocker written from a typed reference is named to the reader: the
@@ -1103,7 +1266,13 @@ pub(crate) mod fixture {
                     epic_id: epic.clone(),
                     name: "A feature".into(),
                     summary: "Epic scope".into(),
-                    body: "epic body\n".into(),
+                    // More than one line, and one line longer than a pane is
+                    // wide: a buffer that collapsed a body's breaks, or that
+                    // showed only what fits across, is told from a correct one
+                    // by a body that has both.
+                    body: "epic body\n\nA second paragraph, long enough that no \
+                           pane of any test terminal here holds it across.\n"
+                        .into(),
                     labels: vec![],
                 },
             )
@@ -1130,6 +1299,30 @@ pub(crate) mod fixture {
         /// The epic as a selection, which is how a surface addresses it.
         pub(crate) fn epic_selection(&self) -> Selection {
             Selection::Epic(self.epic.clone())
+        }
+
+        /// The epic's body as the store holds it, so a test about a buffer opened
+        /// on stored text asserts against the store rather than against a constant
+        /// that a richer fixture would leave behind.
+        pub(crate) fn epic_body(&self) -> String {
+            ops::read_epic(&self.store, &self.epic).unwrap().body
+        }
+
+        /// Replace the epic's body behind the browser's back, as a concurrent
+        /// writer composing their own would.
+        ///
+        /// Through the operation layer, so it moves the `updated` stamp exactly as
+        /// any other write does — which is what a precondition is compared against.
+        pub(crate) fn rewrite_the_epics_body(&self, body: &str) {
+            ops::edit_epic(
+                &self.store,
+                &self.epic,
+                ops::EpicEdits {
+                    body: Some(body.to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         }
 
         /// The labels the epic carries, as the store holds them. A test asserts
@@ -1404,6 +1597,18 @@ mod tests {
     use super::fixture::Fixture;
     use super::*;
     use loti_core::ops::{EpicEdits, NodeEdits};
+
+    /// The words a refusal is shown in.
+    ///
+    /// A conflict has none: it is the one refusal the reader is asked about rather
+    /// than told, in the browser's own words, so a test reading a refusal's words
+    /// must not silently accept one in its place.
+    fn refusal_words(refused: Refusal) -> String {
+        match refused {
+            Refusal::Rule(words) => words,
+            Refusal::Conflict => panic!("refused as a conflict rather than by a rule"),
+        }
+    }
 
     /// The work rows of a level, dropping the collection rows every epic and node
     /// level leads with.
@@ -1975,9 +2180,10 @@ mod tests {
         // and with nothing written on the way to refusing. Checked through the
         // seam the browser itself writes through, so a wrongly wired dialog meets
         // the same guard.
-        let err = perform(&fx.store, &Write::RemoveLabel(fx.epic_selection()))
-            .expect_err("an epic is not one of its own labels")
-            .to_string();
+        let err = refusal_words(
+            perform(&fx.store, &Write::RemoveLabel(fx.epic_selection()))
+                .expect_err("an epic is not one of its own labels"),
+        );
         assert!(err.contains(&fx.epic), "{err}");
         assert_eq!(fx.epic_labels(), before[1..].to_vec());
     }
@@ -2016,12 +2222,13 @@ mod tests {
             Selection::Label(Container::Epic(fx.epic.clone()), expected[0].clone()),
             Selection::Collection(Container::Epic(fx.epic.clone()), Collection::Comments),
         ] {
-            let err = perform(
-                &fx.store,
-                &Write::AddLabel(wrong.clone(), "unwanted".into()),
-            )
-            .expect_err("only a label set takes a label")
-            .to_string();
+            let err = refusal_words(
+                perform(
+                    &fx.store,
+                    &Write::AddLabel(wrong.clone(), "unwanted".into()),
+                )
+                .expect_err("only a label set takes a label"),
+            );
             assert!(err.contains(&fx.epic), "{wrong:?}: {err}");
             assert_eq!(fx.epic_labels(), expected, "{wrong:?} wrote something");
         }
@@ -2102,9 +2309,10 @@ mod tests {
             (own_number, NodeRef::new(&fx.epic, fx.node.number)),
             (own_reference, NodeRef::new(&fx.epic, fx.node.number)),
         ] {
-            let shown = perform(&fx.store, &Write::AddBlocker(list.clone(), typed.clone()))
-                .expect_err("the store judges what may block what")
-                .to_string();
+            let shown = refusal_words(
+                perform(&fx.store, &Write::AddBlocker(list.clone(), typed.clone()))
+                    .expect_err("the store judges what may block what"),
+            );
             let its_own = ops::add_blocked_by(&fx.store, &fx.node, std::slice::from_ref(&blocker))
                 .expect_err("the store judges what may block what")
                 .to_string();
@@ -2114,9 +2322,10 @@ mod tests {
 
         // A reference that is no reference at all is refused by the parser that
         // owns that rule, and reaches the reader in its words too.
-        let shown = perform(&fx.store, &Write::AddBlocker(list, "one/two/three".into()))
-            .expect_err("a reference is <epic-id>/<number>")
-            .to_string();
+        let shown = refusal_words(
+            perform(&fx.store, &Write::AddBlocker(list, "one/two/three".into()))
+                .expect_err("a reference is <epic-id>/<number>"),
+        );
         assert_eq!(
             shown,
             NodeRef::parse("one/two/three").unwrap_err().to_string()
@@ -2159,9 +2368,10 @@ mod tests {
                 NodeRef::parse(&whole).unwrap(),
             ),
         ] {
-            let err = perform(&fx.store, &Write::RemoveBlocker(wrong.clone()))
-                .expect_err("only a blocker row takes a removal")
-                .to_string();
+            let err = refusal_words(
+                perform(&fx.store, &Write::RemoveBlocker(wrong.clone()))
+                    .expect_err("only a blocker row takes a removal"),
+            );
             assert!(err.contains(&fx.epic), "{wrong:?}: {err}");
             assert_eq!(fx.node_blockers(), survivors, "{wrong:?} wrote something");
         }
@@ -2225,9 +2435,10 @@ mod tests {
             fx.epic_selection(),
             Selection::Collection(container, Collection::Assets),
         ] {
-            let err = perform(&fx.store, &Write::DeleteAsset(wrong.clone()))
-                .expect_err("only an asset row takes a deletion")
-                .to_string();
+            let err = refusal_words(
+                perform(&fx.store, &Write::DeleteAsset(wrong.clone()))
+                    .expect_err("only an asset row takes a deletion"),
+            );
             assert!(err.contains(&fx.epic), "{wrong:?}: {err}");
             assert_eq!(fx.epic_assets(), survivors, "{wrong:?} wrote something");
         }
@@ -2247,9 +2458,10 @@ mod tests {
         // under the write, as a concurrent writer closing the effort out would take
         // it.
         fx.remove_the_epics_file();
-        let shown = perform(&fx.store, &Write::DeleteAsset(selection))
-            .expect_err("the store refuses a deletion on a missing entity")
-            .to_string();
+        let shown = refusal_words(
+            perform(&fx.store, &Write::DeleteAsset(selection))
+                .expect_err("the store refuses a deletion on a missing entity"),
+        );
         let its_own = ops::delete_asset(&fx.store, &Target::Epic(fx.epic.clone()), &asset)
             .expect_err("the store refuses a deletion on a missing entity")
             .to_string();
@@ -2282,9 +2494,10 @@ mod tests {
             .contains(&Collection::BlockedBy));
         let epics_list =
             Selection::Collection(Container::Epic(fx.epic.clone()), Collection::BlockedBy);
-        let err = perform(&fx.store, &Write::AddBlocker(epics_list, "1".into()))
-            .expect_err("an epic has no dependency list")
-            .to_string();
+        let err = refusal_words(
+            perform(&fx.store, &Write::AddBlocker(epics_list, "1".into()))
+                .expect_err("an epic has no dependency list"),
+        );
         assert!(err.contains(&fx.epic), "{err}");
         assert_eq!(fx.epic_labels(), before, "something else was written");
     }
@@ -2420,6 +2633,201 @@ mod tests {
         // the existence refusal, with no path in it at all.
         assert_eq!(err, format!("node {r} does not exist"));
         assert!(!err.contains(".md"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn a_body_is_written_verbatim_under_the_stamp_its_text_was_read_at() {
+        let fx = Fixture::build();
+        let target = edit_target(&fx.store, &fx.epic_selection()).unwrap();
+        let name = ops::read_epic(&fx.store, &fx.epic)
+            .unwrap()
+            .frontmatter
+            .name;
+
+        // Nothing has changed since the read, so the precondition holds and the
+        // text lands exactly as the reader left it: line breaks, blank lines and a
+        // last line with no break after it. Whether a body is acceptable is the
+        // store's rule and the browser normalises none of it.
+        let written = "# mine\n\nwith a blank line above, and no break after this";
+        perform(
+            &fx.store,
+            &Write::SetBody {
+                target: fx.epic_selection(),
+                body: written.to_string(),
+                expect: Some(target.stamp),
+            },
+        )
+        .unwrap();
+        assert_eq!(fx.epic_body(), written);
+        // The body and nothing else: a whole-field replacement that took anything
+        // else with it would be a save that quietly reverted something.
+        assert_eq!(
+            ops::read_epic(&fx.store, &fx.epic)
+                .unwrap()
+                .frontmatter
+                .name,
+            name
+        );
+
+        // A node is addressed differently from an epic, so a write aimed at the
+        // wrong one of the two would pass everything above.
+        let node = Selection::Node(fx.node.clone());
+        let stamp = edit_target(&fx.store, &node).unwrap().stamp;
+        perform(
+            &fx.store,
+            &Write::SetBody {
+                target: node,
+                body: "the ticket's own\n".to_string(),
+                expect: Some(stamp),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ops::read_node(&fx.store, &fx.node).unwrap().body,
+            "the ticket's own\n"
+        );
+        assert_eq!(fx.epic_body(), written, "the epic's body was written too");
+    }
+
+    #[test]
+    fn a_body_write_naming_a_stamp_the_entity_has_moved_past_is_refused_as_a_conflict() {
+        let fx = Fixture::build();
+        let stamp = edit_target(&fx.store, &fx.epic_selection()).unwrap().stamp;
+
+        // Somebody else writes while the reader is composing theirs, which is the
+        // one window no lock can cover: the stamp is what closes it.
+        fx.rewrite_the_epics_body("theirs\n");
+        let refused = perform(
+            &fx.store,
+            &Write::SetBody {
+                target: fx.epic_selection(),
+                body: "mine\n".to_string(),
+                expect: Some(stamp),
+            },
+        )
+        .expect_err("a stale stamp is refused");
+        // Refused *as a conflict*, not merely refused: the browser asks about this
+        // one and reports every other, so a refusal for an unrelated reason
+        // arriving here would put the wrong question on screen.
+        assert_eq!(refused, Refusal::Conflict);
+        assert_eq!(fx.epic_body(), "theirs\n", "a refused write wrote");
+
+        // And the same write with the precondition dropped applies over it, which
+        // is what a reader asks for by answering the question with overwrite.
+        perform(
+            &fx.store,
+            &Write::SetBody {
+                target: fx.epic_selection(),
+                body: "mine\n".to_string(),
+                expect: Some(stamp),
+            }
+            .overwriting(),
+        )
+        .unwrap();
+        assert_eq!(fx.epic_body(), "mine\n");
+    }
+
+    #[test]
+    fn a_change_to_anything_else_on_the_entity_refuses_a_body_write_too() {
+        let fx = Fixture::build();
+        let stamp = edit_target(&fx.store, &fx.epic_selection()).unwrap().stamp;
+        let before = fx.epic_body();
+
+        // The precondition is the entity's, not the field's: a comment arriving
+        // mid-edit refuses a body save. Accepted deliberately — per-field stamps
+        // would buy precision for a lot of machinery, and a refusal costs the
+        // reader one answer.
+        ops::add_comment(
+            &fx.store,
+            &Target::Epic(fx.epic.clone()),
+            loti_core::Actor::Human,
+            "arrived mid-edit\n".to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            perform(
+                &fx.store,
+                &Write::SetBody {
+                    target: fx.epic_selection(),
+                    body: "mine\n".to_string(),
+                    expect: Some(stamp),
+                },
+            ),
+            Err(Refusal::Conflict)
+        );
+        assert_eq!(fx.epic_body(), before);
+    }
+
+    #[test]
+    fn only_an_epic_or_a_node_has_a_body_to_write() {
+        let fx = Fixture::build();
+        let before = fx.epic_body();
+        // A collection and its members are edited by their own operations, so any
+        // other selection is a caller that has lost track of what its row points
+        // at — refused by name, with nothing written on the way to refusing.
+        for wrong in [
+            Selection::Collection(Container::Epic(fx.epic.clone()), Collection::Labels),
+            Selection::Label(
+                Container::Epic(fx.epic.clone()),
+                fx.epic_labels()[0].clone(),
+            ),
+            Selection::Asset(
+                Container::Epic(fx.epic.clone()),
+                fx.epic_assets()[0].clone(),
+            ),
+        ] {
+            let err = refusal_words(
+                perform(
+                    &fx.store,
+                    &Write::SetBody {
+                        target: wrong.clone(),
+                        body: "nowhere\n".to_string(),
+                        expect: None,
+                    },
+                )
+                .expect_err("only an epic or a node has a body"),
+            );
+            assert!(err.contains(&fx.epic), "{wrong:?}: {err}");
+            assert_eq!(fx.epic_body(), before, "{wrong:?} wrote something");
+        }
+    }
+
+    #[test]
+    fn every_write_says_what_it_is_aimed_at_and_only_a_stamped_one_drops_a_precondition() {
+        let fx = Fixture::build();
+        let stamp = edit_target(&fx.store, &fx.epic_selection()).unwrap().stamp;
+        let body = Write::SetBody {
+            target: fx.epic_selection(),
+            body: "mine\n".to_string(),
+            expect: Some(stamp),
+        };
+        // Every write names the row it is aimed at, so a question raised about one
+        // names the entity rather than re-deriving a reference of its own.
+        for write in [
+            Write::AddLabel(fx.blocked_by_selection(), "x".into()),
+            Write::RemoveLabel(fx.epic_selection()),
+            Write::AddBlocker(fx.blocked_by_selection(), "1".into()),
+            Write::RemoveBlocker(fx.epic_selection()),
+            Write::DeleteAsset(fx.epic_selection()),
+            body.clone(),
+        ] {
+            // Dropping the precondition changes the precondition and nothing else:
+            // a write that came back aimed somewhere else would overwrite the
+            // wrong entity with the reader's text.
+            assert_eq!(write.overwriting().target(), write.target(), "{write:?}");
+        }
+        // The stamped write loses its stamp, and a write that never carried one is
+        // unchanged: it cannot conflict, so there is nothing to drop.
+        assert_eq!(
+            body.overwriting(),
+            Write::SetBody {
+                target: fx.epic_selection(),
+                body: "mine\n".to_string(),
+                expect: None,
+            }
+        );
+        let unstamped = Write::RemoveLabel(fx.epic_selection());
+        assert_eq!(unstamped.overwriting(), unstamped);
     }
 
     #[test]
