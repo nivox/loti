@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, Modal};
+use crate::app::{App, Modal, Surface};
 use crate::data::{Row, RowKind, Selection};
 use crate::keymap;
 use crate::theme::{glyph, Theme};
@@ -85,6 +85,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         chunks[2],
     );
 
+    // The surface is drawn under whatever was raised about it: a warning covers
+    // the buffer it asks about rather than replacing it, so the buffer is still
+    // there to land back in.
+    if let Some(surface) = app.surface() {
+        draw_surface(f, theme, surface);
+    }
+
     match app.modal() {
         Some(Modal::Help) => draw_help(f, f.area(), theme),
         // One widget for every dialog: it draws what the dialog carries, so a
@@ -94,10 +101,90 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             theme,
             dialog.title(),
             dialog.message(),
-            keymap::dialog_answers(dialog.answers()),
+            &keymap::dialog_answers(dialog.answers(), dialog.words()),
         ),
         None => {}
     }
+}
+
+/// An editing surface: a float carrying its fields, centred and above everything,
+/// reflowing nothing underneath — the same geometry as a dialog, because a reader
+/// looks for both in the same place.
+///
+/// It lists no keys of its own: the hint strip carries them, and unlike a dialog a
+/// surface is not a question with answers but a buffer with a mode's worth of keys.
+///
+/// The terminal's own cursor is placed in the focused field, because a text field
+/// with no cursor does not say where the next character lands.
+fn draw_surface(f: &mut Frame, theme: Theme, surface: &Surface) {
+    let area = f.area();
+    let width = DIALOG_WIDTH.min(area.width);
+    let fields = surface.fields();
+    let popup = centred(area, width, fields.len() as u16 + 2);
+    let label_width = fields
+        .iter()
+        .map(|field| field.label().chars().count())
+        .max()
+        .unwrap_or(0);
+    let value_width = value_width(width, label_width);
+    let lines: Vec<Line> = fields
+        .iter()
+        .map(|field| {
+            let (shown, _) = field_window(field.value(), field.cursor(), value_width);
+            Line::from(vec![
+                Span::styled(
+                    format!(" {:<label_width$}  ", field.label()),
+                    Style::default().fg(theme.muted()),
+                ),
+                Span::raw(shown),
+            ])
+        })
+        .collect();
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.notice()))
+                .title(surface.title().to_string()),
+        ),
+        popup,
+    );
+    if let Some(field) = fields.get(surface.focus()) {
+        let (_, cursor) = field_window(field.value(), field.cursor(), value_width);
+        f.set_cursor_position((
+            popup.x + 1 + 1 + label_width as u16 + 2 + cursor as u16,
+            popup.y + 1 + surface.focus() as u16,
+        ));
+    }
+}
+
+/// The columns a field's value may use: the float less its borders, the leading
+/// indent, the label column and the gap after it.
+fn value_width(width: u16, label_width: usize) -> usize {
+    (width as usize)
+        .saturating_sub(2 + 1 + label_width + 2)
+        .max(1)
+}
+
+/// The part of a one-line value a field this wide shows, and where the cursor
+/// falls inside it.
+///
+/// A field holds one line, so content wider than the field scrolls rather than
+/// wrapping — and the part shown always contains the cursor, or a reader typing at
+/// the end of a long value would be typing off the screen. One column is kept for
+/// the cursor itself, which has to sit somewhere when it is past the last
+/// character.
+fn field_window(value: &str, cursor: usize, width: usize) -> (String, usize) {
+    let chars: Vec<char> = value.chars().collect();
+    let width = width.max(1);
+    if chars.len() < width {
+        return (value.to_string(), cursor.min(chars.len()));
+    }
+    let last_start = chars.len() + 1 - width;
+    let start = cursor.saturating_sub(width - 1).min(last_start);
+    let end = (start + width - 1).min(chars.len());
+    (chars[start..end].iter().collect(), cursor - start)
 }
 
 /// A dialog: centred on the whole terminal, above everything, and it never
@@ -111,7 +198,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 /// It lists its own answers, so the way out of it never depends on the hint strip
 /// — which a notice, or a narrow terminal, may have taken. Its text wraps inside
 /// the float, because a store refusal is as long as the store made it.
-fn draw_dialog(f: &mut Frame, theme: Theme, title: &str, message: &str, answers: &[&str]) {
+fn draw_dialog(f: &mut Frame, theme: Theme, title: &str, message: &str, answers: &[String]) {
     let area = f.area();
     let width = DIALOG_WIDTH.min(area.width);
     let text_width = dialog_text_width(width);
@@ -158,7 +245,7 @@ fn dialog_text_width(width: u16) -> usize {
 /// separator is the first thing surrendered.
 fn dialog_lines<'a>(
     text: &[String],
-    answers: &[&str],
+    answers: &[String],
     width: usize,
     height: usize,
     theme: Theme,
@@ -291,10 +378,17 @@ fn footer(app: &App, width: u16) -> Span<'static> {
         None => {
             // Editing mode's droppable hints are the actions the frozen row
             // offers, which only the state machine knows; browse mode's are the
-            // same on every row.
-            let (hints, essential) = match app.editing_target().is_some() {
-                true => (app.editing_hints(), keymap::FOOTER_ESSENTIAL_EDITING),
-                false => (keymap::FOOTER_HINTS.to_vec(), keymap::FOOTER_ESSENTIAL),
+            // same on every row. An open surface has no row offering anything: the
+            // keys that apply are its own, and the way out is out of the buffer
+            // rather than out of the mode.
+            let (hints, essential) = match (app.surface().is_some(), app.editing_target().is_some())
+            {
+                (true, _) => (
+                    keymap::FOOTER_HINTS_SURFACE.to_vec(),
+                    keymap::FOOTER_ESSENTIAL_SURFACE,
+                ),
+                (false, true) => (app.editing_hints(), keymap::FOOTER_ESSENTIAL_EDITING),
+                (false, false) => (keymap::FOOTER_HINTS.to_vec(), keymap::FOOTER_ESSENTIAL),
             };
             Span::styled(
                 format!(" {}", hint_strip(columns, &hints, essential)),
@@ -817,13 +911,19 @@ mod tests {
 
     #[test]
     fn the_overlay_is_wide_enough_for_every_binding_it_lists() {
-        let width = help_width(200) as usize;
-        for (keys, what) in keymap::HELP {
-            let row = help_key_width() + 2 + what.chars().count();
-            assert!(
-                row + 2 <= width,
-                "{keys:?} / {what:?} needs {row} columns inside a {width}-wide overlay"
-            );
+        // On a terminal with room to spare, and on the ordinary eighty- and
+        // hundred-column ones too: the overlay is bounded by the screen, so a
+        // description longer than that is clipped, and half a binding teaches a key
+        // that does something else.
+        for available in [80, 100, 200] {
+            let width = help_width(available) as usize;
+            for (keys, what) in keymap::HELP {
+                let row = help_key_width() + 2 + what.chars().count();
+                assert!(
+                    row + 2 <= width,
+                    "{keys:?} / {what:?} needs {row} columns inside a {width}-wide overlay"
+                );
+            }
         }
     }
 
@@ -844,10 +944,10 @@ mod tests {
         }
     }
 
-    /// Both strips a mode can ask for: the essential pair travels with the
+    /// Every strip a mode can ask for: the essential pair travels with the
     /// droppable hints it is appended to. Editing mode's are taken at their
     /// widest — every action any row offers — since a row shows a subset.
-    fn strips() -> [(Vec<&'static str>, &'static [&'static str]); 2] {
+    fn strips() -> [(Vec<&'static str>, &'static [&'static str]); 3] {
         [
             (keymap::FOOTER_HINTS.to_vec(), keymap::FOOTER_ESSENTIAL),
             (
@@ -856,6 +956,10 @@ mod tests {
                     .map(|(_, hint)| *hint)
                     .collect(),
                 keymap::FOOTER_ESSENTIAL_EDITING,
+            ),
+            (
+                keymap::FOOTER_HINTS_SURFACE.to_vec(),
+                keymap::FOOTER_ESSENTIAL_SURFACE,
             ),
         ]
     }
@@ -923,7 +1027,7 @@ mod tests {
     fn a_dialog_too_tall_for_the_screen_gives_up_its_message_not_its_answers() {
         let theme = Theme::with_color(false);
         let text: Vec<String> = (0..6).map(|n| format!("line {n}")).collect();
-        let answers = ["Esc cancel"];
+        let answers = ["Esc cancel".to_string()];
         let rendered = |height: usize| -> Vec<String> {
             dialog_lines(&text, &answers, 20, height, theme)
                 .iter()
@@ -962,6 +1066,33 @@ mod tests {
         }
         // Room for nothing: a border with a stray line in it says less than none.
         assert!(rendered(0).is_empty());
+    }
+
+    #[test]
+    fn a_field_shows_the_part_of_its_content_the_cursor_is_in() {
+        // Content that fits is shown whole, with the cursor where it is.
+        assert_eq!(field_window("short", 2, 20), ("short".to_string(), 2));
+
+        // A field holds one line, so content wider than the field scrolls: what is
+        // shown always contains the cursor, or a reader typing at the end of a long
+        // value would be typing off the screen.
+        let long = "a label somebody pasted a whole sentence into";
+        for cursor in 0..=long.chars().count() {
+            for width in 1..12usize {
+                let (shown, at) = field_window(long, cursor, width);
+                assert!(shown.chars().count() < width.max(2), "{width}: {shown:?}");
+                assert!(at <= shown.chars().count(), "{width}/{cursor}: {at}");
+                assert!(at < width, "{width}/{cursor}: the cursor is off the field");
+                // The window is a run of the value, never a re-arrangement of it.
+                assert!(long.contains(&shown), "{shown:?}");
+            }
+        }
+        // At the start the window starts at the start; at the end it ends there, so
+        // what the reader last typed is what they can see.
+        assert_eq!(field_window(long, 0, 10).0, "a label s");
+        let (tail, at) = field_window(long, long.chars().count(), 10);
+        assert!(long.ends_with(&tail), "{tail:?}");
+        assert_eq!(at, tail.chars().count(), "the cursor sits after the text");
     }
 
     #[test]

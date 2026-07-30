@@ -576,6 +576,9 @@ pub fn edit_target(store: &Store, selection: &Selection) -> Result<EditTarget> {
 /// name when it is not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Write {
+    /// Put one label on the container whose label set the row names, with the
+    /// text the reader typed.
+    AddLabel(Selection, String),
     /// Take one label off the container it sits on.
     RemoveLabel(Selection),
 }
@@ -587,8 +590,30 @@ pub enum Write {
 /// here pre-checks a store rule.
 pub fn perform(store: &Store, write: &Write) -> Result<()> {
     match write {
+        Write::AddLabel(selection, label) => add_label(store, selection, label),
         Write::RemoveLabel(selection) => remove_label(store, selection),
     }
+}
+
+/// Put one label on a container's label set.
+///
+/// The text is written exactly as it was typed: whether a given string is a label
+/// the store will take is the store's rule, and the browser reimplements none of
+/// them — an already-present label is the store's own no-op, not a refusal the
+/// browser invents.
+///
+/// No stamp guards this write, for the same reason a removal carries none: a
+/// stamp is the precondition of a free-form replacement, and adding one member to
+/// a set cannot silently discard text someone else wrote.
+fn add_label(store: &Store, selection: &Selection, label: &str) -> Result<()> {
+    // Only the label set's own row offers an addition, so any other selection is a
+    // caller that has lost track of what its row points at.
+    let Selection::Collection(container, Collection::Labels) = selection else {
+        anyhow::bail!("{} is not a label set", selection.reference())
+    };
+    ops::add_labels(store, &container.target(), &[label.to_string()])
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
 }
 
 /// Take one label off the container it sits on.
@@ -1447,6 +1472,51 @@ mod tests {
             .to_string();
         assert!(err.contains(&fx.epic), "{err}");
         assert_eq!(fx.epic_labels(), before[1..].to_vec());
+    }
+
+    #[test]
+    fn a_label_addition_writes_what_was_typed_and_refuses_anything_else() {
+        let fx = Fixture::build();
+        let before = fx.epic_labels();
+        let set = Selection::Collection(Container::Epic(fx.epic.clone()), Collection::Labels);
+
+        // Verbatim, spacing included: whether a string is a label the store will
+        // take is the store's rule, so the browser passes the text through rather
+        // than tidying it into something the reader did not type.
+        perform(
+            &fx.store,
+            &Write::AddLabel(set.clone(), " a new label ".into()),
+        )
+        .unwrap();
+        let mut expected = before.clone();
+        expected.push(" a new label ".to_string());
+        assert_eq!(fx.epic_labels(), expected);
+
+        // A label the set already holds is the store's own no-op, not a refusal
+        // the browser invents on its behalf.
+        perform(&fx.store, &Write::AddLabel(set, before[0].clone())).unwrap();
+        assert_eq!(fx.epic_labels(), expected);
+
+        // Only the label set's own row offers an addition, so any other selection
+        // is a caller that has lost track of what its row points at — refused by
+        // name, through the seam the browser itself writes through, and with
+        // nothing written on the way to refusing. A member of the set is refused
+        // too, though it names the same container: a label is added from the set's
+        // row, and a row pointing at one member is not that row.
+        for wrong in [
+            fx.epic_selection(),
+            Selection::Label(Container::Epic(fx.epic.clone()), expected[0].clone()),
+            Selection::Collection(Container::Epic(fx.epic.clone()), Collection::Comments),
+        ] {
+            let err = perform(
+                &fx.store,
+                &Write::AddLabel(wrong.clone(), "unwanted".into()),
+            )
+            .expect_err("only a label set takes a label")
+            .to_string();
+            assert!(err.contains(&fx.epic), "{wrong:?}: {err}");
+            assert_eq!(fx.epic_labels(), expected, "{wrong:?} wrote something");
+        }
     }
 
     #[test]

@@ -20,12 +20,15 @@ pub mod nav;
 pub mod theme;
 pub mod ui;
 
+use std::env;
+use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::panic;
 use std::path::Path;
+use std::process::Command;
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseButton, MouseEventKind,
 };
@@ -33,7 +36,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::Terminal;
 
 use crate::app::App;
@@ -96,6 +99,208 @@ fn restore() {
     let mut stdout = io::stdout();
     let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
     let _ = stdout.flush();
+}
+
+/// One way the browser holds the terminal, and whether it is holding it.
+///
+/// Named as data because an external editor inherits the terminal: whatever the
+/// browser is still holding is something the editor's own input has to fight, so
+/// what is let go of has to be a rule that can be read off rather than a sequence
+/// buried in a call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hold {
+    /// The screen the browser draws on, which the editor must not draw over.
+    AlternateScreen(bool),
+    /// Keys delivered unprocessed, which an editor sets up for itself.
+    RawMode(bool),
+    /// Mouse reports delivered as events. An editor that inherits capture reads
+    /// those reports as input and what the reader typed is corrupted.
+    MouseCapture(bool),
+}
+
+/// Everything let go of before an external editor runs: the alternate screen, raw
+/// mode **and mouse capture**, none of which an editor can work around.
+const RELEASED_FOR_THE_EDITOR: &[Hold] = &[
+    Hold::MouseCapture(false),
+    Hold::AlternateScreen(false),
+    Hold::RawMode(false),
+];
+
+/// Everything taken back once the editor has exited, in the order the browser
+/// takes it at startup.
+///
+/// Invariant: exactly what [`RELEASED_FOR_THE_EDITOR`] gave up, so a round-trip
+/// cannot leave the browser running with less of the terminal than it began with.
+const RECLAIMED_AFTER_THE_EDITOR: &[Hold] = &[
+    Hold::RawMode(true),
+    Hold::AlternateScreen(true),
+    Hold::MouseCapture(true),
+];
+
+/// The terminal work an external-editor round-trip has done on its behalf.
+///
+/// A seam rather than direct calls, so what the round-trip performs — and in which
+/// order — can be read off and checked: the browser's implementation drives the
+/// real terminal, and a test's records what it was asked for.
+trait Handoff {
+    /// Let go of, or take back, one part of the terminal.
+    fn hold(&mut self, step: Hold) -> Result<()>;
+
+    /// Repaint from scratch. The editor drew over the screen it was given, so
+    /// nothing the browser last drew can be assumed to still be there and a frame
+    /// diffed against it would leave the leftovers on screen.
+    fn repaint(&mut self) -> Result<()>;
+}
+
+/// A terminal the round-trip performs on for real. Generic over the backend and
+/// over where the control sequences go, because neither can be looked at on the
+/// browser's own terminal — and an implementation nothing can look at is one that
+/// can be gutted while a seam's own tests stay green.
+struct Screen<'t, B: Backend, W: Write>(&'t mut Terminal<B>, W);
+
+impl<B: Backend, W: Write> Handoff for Screen<'_, B, W> {
+    fn hold(&mut self, step: Hold) -> Result<()> {
+        hold_step(step, &mut self.1)
+    }
+
+    fn repaint(&mut self) -> Result<()> {
+        self.0.clear()?;
+        Ok(())
+    }
+}
+
+/// Let go of, or take back, one part of the terminal, writing whatever control
+/// sequences that takes to `out`.
+///
+/// Raw mode is the one step that writes nothing: it is a mode of the terminal
+/// device rather than a sequence sent to it, so it is set through the device and
+/// not through `out`.
+fn hold_step(step: Hold, out: &mut impl Write) -> Result<()> {
+    match step {
+        Hold::AlternateScreen(true) => execute!(out, EnterAlternateScreen)?,
+        Hold::AlternateScreen(false) => execute!(out, LeaveAlternateScreen)?,
+        Hold::RawMode(true) => enable_raw_mode()?,
+        Hold::RawMode(false) => disable_raw_mode()?,
+        Hold::MouseCapture(true) => execute!(out, EnableMouseCapture)?,
+        Hold::MouseCapture(false) => execute!(out, DisableMouseCapture)?,
+    }
+    Ok(())
+}
+
+/// Give the terminal away, run `editor`, and take the terminal back.
+///
+/// Invariant: every part named by [`RELEASED_FOR_THE_EDITOR`] is let go of before
+/// the editor runs, one step per part, and every part named by
+/// [`RECLAIMED_AFTER_THE_EDITOR`] is taken back afterwards **whatever the editor
+/// did** — which is why the editor's outcome is carried past the reclaim rather
+/// than propagated at once: a failure that returned early would leave the browser
+/// drawing with raw mode off onto a screen it no longer owns.
+fn around_the_editor<T>(
+    handoff: &mut impl Handoff,
+    editor: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    for step in RELEASED_FOR_THE_EDITOR {
+        handoff.hold(*step)?;
+    }
+    let outcome = editor();
+    for step in RECLAIMED_AFTER_THE_EDITOR {
+        handoff.hold(*step)?;
+    }
+    handoff.repaint()?;
+    outcome
+}
+
+/// Hand `text` to the reader's editor and bring back what they saved, or `None`
+/// where the editor exited unsuccessfully — which is how an editor says the edit
+/// was abandoned, and leaves the buffer as it was.
+fn edit_externally(terminal: &mut Tui, text: &str) -> Result<Option<String>> {
+    // Looked up before anything is given away: a setting that is not there is not
+    // worth blanking the reader's screen for.
+    let editor = editor_setting(env::var("VISUAL").ok(), env::var("EDITOR").ok())?;
+    around_the_editor(&mut Screen(terminal, io::stdout()), || {
+        run_editor(&editor, text)
+    })
+}
+
+/// The editor the reader asked for, out of the two settings that can name one.
+///
+/// `visual` wins where both name an editor, and a setting holding nothing but
+/// whitespace counts as unset — that is what every tool a reader compares this to
+/// does with a variable that is exported empty, so refusing on one would be a
+/// difference they cannot see on screen.
+///
+/// Neither set is refused rather than guessed at: an editor chosen on the reader's
+/// behalf could be one they cannot get out of, and this hands over the whole
+/// terminal.
+fn editor_setting(visual: Option<String>, editor: Option<String>) -> Result<String> {
+    [visual, editor]
+        .into_iter()
+        .flatten()
+        .find(|setting| !setting.trim().is_empty())
+        .ok_or_else(|| anyhow!("no editor is set: set EDITOR (or VISUAL) to the editor you want"))
+}
+
+/// Run `editor` over a file holding `text`, and read back what it saved.
+fn run_editor(editor: &str, text: &str) -> Result<Option<String>> {
+    // An editor setting may carry flags, so the first word is the program and the
+    // rest are arguments. Quoting is not honoured: a path with spaces in it belongs
+    // in a wrapper script rather than in a variable this splits.
+    let mut words = editor.split_whitespace();
+    let program = words
+        .next()
+        .ok_or_else(|| anyhow!("the editor setting is blank"))?;
+
+    // A fixed suffix, because an editor picks its mode from the name and a random
+    // temp name would leave it guessing. Markdown is the syntax of the long-form
+    // fields this round-trip exists for; a single-line field carries no markup and
+    // loses nothing by being shown in that mode.
+    let file = tempfile::Builder::new()
+        .prefix("loti-")
+        .suffix(".md")
+        .tempfile()
+        .context("creating the file to hand to the editor")?;
+    fs::write(file.path(), text).context("writing the text for the editor")?;
+
+    let status = Command::new(program)
+        .args(words)
+        .arg(file.path())
+        .status()
+        .with_context(|| format!("running the editor {program}"))?;
+    if !status.success() {
+        // An editor that exits unsuccessfully has abandoned the edit — `:cq` is how
+        // that is said — so what it left in the file is not what the reader meant.
+        return Ok(None);
+    }
+    let edited = fs::read_to_string(file.path()).context("reading the text back")?;
+    Ok(Some(edited))
+}
+
+/// A failure together with every cause under it.
+///
+/// The outermost context names only what the browser was attempting — which editor
+/// it tried to run — and the cause beneath it is the part the reader can act on: a
+/// program that is not installed, a name with a typo in it, a file that could not be
+/// written. A dialog is raised only for something that must be acted on, so it
+/// carries the whole chain rather than the attempt alone.
+fn failure_and_causes(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
+/// Take an editor round-trip's outcome back to the surface it was called from.
+///
+/// A failure to run an editor is reported to the reader rather than ending the
+/// session: the buffer it was called from is still open and still theirs.
+fn editor_outcome(app: &mut App, outcome: Result<Option<String>>) {
+    match outcome {
+        Ok(Some(edited)) => app.editor_returned(&edited),
+        // The editor abandoned the edit, so the buffer keeps what it had.
+        Ok(None) => {}
+        Err(e) => app.editor_failed(failure_and_causes(&e)),
+    }
 }
 
 /// How often the loop wakes with no input to read.
@@ -178,5 +383,415 @@ fn event_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
             },
             _ => {}
         }
+
+        // Only the loop owns the terminal, so an editor can only be run from here.
+        if let Some(text) = app.take_editor_handoff() {
+            editor_outcome(&mut app, edit_externally(terminal, &text));
+            // The terminal was handed back with everything reclaimed, whatever the
+            // divider state was before, and the whole screen has to be repainted.
+            captured = true;
+            app.request_redraw();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use ratatui::backend::TestBackend;
+    use ratatui::widgets::Paragraph;
+
+    use crate::action::Action;
+    use crate::app::Modal;
+
+    use super::*;
+
+    /// Which part of the terminal a hold is about, without whether it is held: two
+    /// lists are compared for covering the same parts, not the same states.
+    fn part(hold: Hold) -> &'static str {
+        match hold {
+            Hold::AlternateScreen(_) => "alternate screen",
+            Hold::RawMode(_) => "raw mode",
+            Hold::MouseCapture(_) => "mouse capture",
+        }
+    }
+
+    fn held(hold: Hold) -> bool {
+        match hold {
+            Hold::AlternateScreen(held) | Hold::RawMode(held) | Hold::MouseCapture(held) => held,
+        }
+    }
+
+    #[test]
+    fn an_external_editor_is_given_the_whole_terminal_and_handed_it_all_back() {
+        // Mouse capture is the one a reader would blame on their editor rather than
+        // on the browser: an editor that inherits it reads the terminal's mouse
+        // reports as typed input. So it is named here beside the other two.
+        for released in [
+            Hold::MouseCapture(false),
+            Hold::AlternateScreen(false),
+            Hold::RawMode(false),
+        ] {
+            assert!(
+                RELEASED_FOR_THE_EDITOR.contains(&released),
+                "{released:?} is still held while the editor runs"
+            );
+        }
+        // A release list that held something, or a reclaim list that released
+        // something, would be a handover in name only.
+        assert!(RELEASED_FOR_THE_EDITOR.iter().copied().all(|h| !held(h)));
+        assert!(RECLAIMED_AFTER_THE_EDITOR.iter().copied().all(held));
+
+        // The same parts both ways: a round-trip cannot leave the browser running
+        // with less of the terminal than it began with.
+        let mut released: Vec<&str> = RELEASED_FOR_THE_EDITOR.iter().copied().map(part).collect();
+        let mut reclaimed: Vec<&str> = RECLAIMED_AFTER_THE_EDITOR
+            .iter()
+            .copied()
+            .map(part)
+            .collect();
+        released.sort_unstable();
+        reclaimed.sort_unstable();
+        assert_eq!(released, reclaimed);
+        // And no part named twice, so neither list can cover a missing part by
+        // repeating another one.
+        released.dedup();
+        assert_eq!(released.len(), RELEASED_FOR_THE_EDITOR.len());
+    }
+
+    /// One thing a round-trip asked of the terminal, or of the editor.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Asked {
+        Hold(Hold),
+        Editor,
+        Repaint,
+    }
+
+    /// A terminal that performs nothing and remembers everything, so the order the
+    /// round-trip does things in is a value a test can look at.
+    #[derive(Clone, Default)]
+    struct Recorder(Rc<RefCell<Vec<Asked>>>);
+
+    impl Recorder {
+        fn note(&self, asked: Asked) {
+            self.0.borrow_mut().push(asked);
+        }
+
+        fn asked(&self) -> Vec<Asked> {
+            self.0.borrow().clone()
+        }
+
+        fn at(&self, asked: &Asked) -> usize {
+            self.asked()
+                .iter()
+                .position(|other| other == asked)
+                .unwrap_or_else(|| panic!("{asked:?} never happened: {:?}", self.asked()))
+        }
+    }
+
+    impl Handoff for Recorder {
+        fn hold(&mut self, step: Hold) -> Result<()> {
+            self.note(Asked::Hold(step));
+            Ok(())
+        }
+
+        fn repaint(&mut self) -> Result<()> {
+            self.note(Asked::Repaint);
+            Ok(())
+        }
+    }
+
+    /// Everything taken back after the editor, ending in the repaint.
+    fn reclaiming() -> Vec<Asked> {
+        RECLAIMED_AFTER_THE_EDITOR
+            .iter()
+            .copied()
+            .map(Asked::Hold)
+            .chain([Asked::Repaint])
+            .collect()
+    }
+
+    #[test]
+    fn the_editor_runs_with_none_of_the_terminal_held_and_every_part_comes_back() {
+        let terminal = Recorder::default();
+        let editor = terminal.clone();
+        let saved = around_the_editor(&mut terminal.clone(), || {
+            editor.note(Asked::Editor);
+            Ok("saved")
+        })
+        .unwrap();
+        assert_eq!(saved, "saved");
+
+        let ran = terminal.at(&Asked::Editor);
+        // Anything still held is something the editor's own input has to fight: an
+        // inherited mouse capture is read as typed characters, and an editor drawing
+        // inside the alternate screen with raw mode on is the corruption the
+        // round-trip exists to avoid.
+        for step in RELEASED_FOR_THE_EDITOR {
+            assert!(
+                terminal.at(&Asked::Hold(*step)) < ran,
+                "{step:?} was still held while the editor ran"
+            );
+        }
+        // And nothing is taken back while the editor is still using it.
+        for step in RECLAIMED_AFTER_THE_EDITOR {
+            assert!(
+                terminal.at(&Asked::Hold(*step)) > ran,
+                "{step:?} was taken back before the editor was done with it"
+            );
+        }
+        // The repaint comes last, once the alternate screen is back: a frame diffed
+        // against what the editor left on screen keeps the editor's leftovers.
+        assert!(
+            terminal.at(&Asked::Repaint) > terminal.at(&Asked::Hold(Hold::AlternateScreen(true)))
+        );
+
+        // One step per part, and no step twice: a part released twice would hide a
+        // part never released at all.
+        let expected: Vec<Asked> = RELEASED_FOR_THE_EDITOR
+            .iter()
+            .copied()
+            .map(Asked::Hold)
+            .chain([Asked::Editor])
+            .chain(reclaiming())
+            .collect();
+        assert_eq!(terminal.asked(), expected);
+    }
+
+    #[test]
+    fn an_editor_that_could_not_run_still_gets_the_whole_terminal_handed_back() {
+        let terminal = Recorder::default();
+        let editor = terminal.clone();
+        let failure = around_the_editor(&mut terminal.clone(), || {
+            editor.note(Asked::Editor);
+            Err::<(), _>(anyhow!("no editor is set"))
+        })
+        .expect_err("the editor's failure is the round-trip's failure");
+        assert!(
+            failure.to_string().contains("no editor is set"),
+            "{failure}"
+        );
+
+        // This is the reachable path — an editor that is not installed, a temp file
+        // that could not be written — so it is the one that must not leave a
+        // half-given-away terminal: the outcome is reported only after everything is
+        // taken back, never instead of taking it back.
+        let asked = terminal.asked();
+        let ran = terminal.at(&Asked::Editor);
+        assert_eq!(asked[ran + 1..], reclaiming()[..]);
+    }
+
+    #[test]
+    fn taking_the_screen_back_repaints_it_rather_than_drawing_over_the_editor() {
+        // What the editor drew is still there when the browser gets the screen back,
+        // so the repaint throws the whole screen away: a frame diffed against a
+        // buffer the editor overwrote leaves the editor's own lines showing.
+        let mut terminal = Terminal::new(TestBackend::new(12, 1)).unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(Paragraph::new("leftovers"), frame.area()))
+            .unwrap();
+        let on_screen = |terminal: &Terminal<TestBackend>| -> String {
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect()
+        };
+        assert!(on_screen(&terminal).contains("leftovers"));
+
+        Screen(&mut terminal, Vec::new()).repaint().unwrap();
+        assert!(
+            !on_screen(&terminal).contains("leftovers"),
+            "the screen the editor drew on was kept: {:?}",
+            on_screen(&terminal)
+        );
+    }
+
+    #[test]
+    fn each_part_of_the_screen_is_let_go_of_and_taken_back_by_a_sequence_of_its_own() {
+        // Raw mode is absent on purpose: it is a mode of the terminal device rather
+        // than a sequence sent to it, and a test has no terminal device to set.
+        let mut sent: Vec<(Hold, Vec<u8>)> = Vec::new();
+        for step in [
+            Hold::AlternateScreen(false),
+            Hold::AlternateScreen(true),
+            Hold::MouseCapture(false),
+            Hold::MouseCapture(true),
+        ] {
+            let mut out = Vec::new();
+            hold_step(step, &mut out).unwrap();
+            // A step that writes nothing leaves that part exactly as it was while
+            // the screen goes on looking right.
+            assert!(!out.is_empty(), "{step:?} sent the terminal nothing");
+            for (other, sequence) in &sent {
+                assert_ne!(*sequence, out, "{step:?} sends what {other:?} sends");
+            }
+            sent.push((step, out));
+        }
+
+        // And the terminal the browser really performs on sends exactly that, for
+        // every step: a seam whose own implementation is unobservable can be gutted
+        // while the tests that read the seam stay green.
+        let mut terminal = Terminal::new(TestBackend::new(4, 1)).unwrap();
+        for (step, sequence) in &sent {
+            let mut screen = Screen(&mut terminal, Vec::new());
+            screen.hold(*step).unwrap();
+            assert_eq!(
+                &screen.1, sequence,
+                "the real terminal does not perform {step:?}"
+            );
+        }
+
+        // Polarity, against the terminal protocol rather than against the code that
+        // implements it: releasing a part must send what turns it off, and taking it
+        // back what turns it on. Inverted, the round-trip would enable mouse capture
+        // on the way into the editor — whose input is then read as typed characters.
+        let sequence = |step: Hold| -> String {
+            let mut out = Vec::new();
+            hold_step(step, &mut out).unwrap();
+            String::from_utf8(out).expect("a control sequence is text")
+        };
+        assert!(sequence(Hold::AlternateScreen(true)).ends_with("h"));
+        assert!(sequence(Hold::AlternateScreen(false)).ends_with("l"));
+        assert!(sequence(Hold::MouseCapture(true)).ends_with("h"));
+        assert!(sequence(Hold::MouseCapture(false)).ends_with("l"));
+    }
+
+    #[test]
+    fn what_the_editor_saved_reaches_the_field_and_an_abandoned_edit_leaves_it_alone() {
+        // Driven through the wiring the loop uses, not through the surface's own
+        // method: an outcome arm that drops the reader's text loses it silently, and
+        // the surface cannot tell the difference between a blank return and none.
+        let fx = data::fixture::Fixture::build();
+        let open = |fx: &data::fixture::Fixture| {
+            let mut app = App::new(fx.store.clone(), Theme::with_color(false)).unwrap();
+            app.apply(Action::Descend).unwrap();
+            app.apply(Action::EnterEditing).unwrap();
+            app.apply(Action::Add).unwrap();
+            app
+        };
+
+        let mut app = open(&fx);
+        editor_outcome(&mut app, Ok(Some("carried".into())));
+        let surface = app.surface().expect("the buffer is still open");
+        assert_eq!(surface.fields()[surface.focus()].value(), "carried");
+        // Text arriving from the editor is a change like any other, so leaving
+        // without saving has to warn rather than throw it away in silence.
+        assert!(surface.fields()[surface.focus()].is_dirty());
+
+        // An editor that exited unsuccessfully is how a reader abandons an edit, so
+        // the buffer keeps exactly what it had — including having been untouched.
+        let mut app = open(&fx);
+        editor_outcome(&mut app, Ok(None));
+        let surface = app.surface().expect("the buffer is still open");
+        assert_eq!(surface.fields()[surface.focus()].value(), "");
+        assert!(!surface.fields()[surface.focus()].is_dirty());
+        assert!(app.modal().is_none(), "{:?}", app.modal());
+    }
+
+    #[test]
+    fn the_editor_setting_prefers_visual_and_counts_a_blank_one_as_unset() {
+        let setting = |visual: Option<&str>, editor: Option<&str>| {
+            editor_setting(visual.map(String::from), editor.map(String::from))
+        };
+
+        // `VISUAL` names the full-screen editor and `EDITOR` the line editor to fall
+        // back to, and this hands over the whole screen: so `VISUAL` wins wherever
+        // both name one.
+        assert_eq!(setting(Some("nvim"), Some("ed")).unwrap(), "nvim");
+        assert_eq!(setting(None, Some("ed")).unwrap(), "ed");
+        assert_eq!(setting(Some("nvim"), None).unwrap(), "nvim");
+
+        // A variable exported empty is what the tools a reader compares this to
+        // treat as unset, so it falls through to the other one instead of refusing.
+        assert_eq!(setting(Some(""), Some("ed")).unwrap(), "ed");
+        assert_eq!(setting(Some("   "), Some("ed")).unwrap(), "ed");
+
+        // With neither naming an editor it is refused rather than guessed at: an
+        // editor chosen on the reader's behalf could be one they cannot get out of,
+        // and the refusal has to say which variables to set.
+        for (visual, editor) in [(None, None), (Some(""), Some("   "))] {
+            let refusal = setting(visual, editor)
+                .expect_err("an editor is never chosen for the reader")
+                .to_string();
+            assert!(refusal.contains("EDITOR"), "{refusal}");
+            assert!(refusal.contains("VISUAL"), "{refusal}");
+        }
+    }
+
+    #[test]
+    fn a_failed_editor_tells_the_reader_why_in_the_dialog_it_raises() {
+        let (_dir, store) = data::fixture::empty_store();
+        let mut app = App::new(store, Theme::with_color(false)).unwrap();
+
+        // The likeliest failure by far is a setting with a typo in it or an editor
+        // that is not installed. What the browser was attempting names the program
+        // and nothing else; only the cause under it says what went wrong, and a
+        // dialog is reserved for what the reader has to act on.
+        let failure = run_editor("loti-no-such-editor", "kept")
+            .expect_err("a missing program is not a saved edit");
+        let cause = failure
+            .chain()
+            .last()
+            .expect("the system said why")
+            .to_string();
+        assert_ne!(
+            cause,
+            failure.to_string(),
+            "this failure carries no cause, so it cannot show one reaching the dialog"
+        );
+
+        editor_outcome(&mut app, run_editor("loti-no-such-editor", "kept"));
+        let Some(Modal::Dialog(dialog)) = app.modal() else {
+            panic!("a failed editor said nothing: {:?}", app.modal())
+        };
+        assert!(
+            dialog.message().contains("loti-no-such-editor"),
+            "{dialog:?}"
+        );
+        assert!(dialog.message().contains(&cause), "{dialog:?}");
+    }
+
+    #[test]
+    fn an_editor_gets_the_text_in_a_file_and_what_it_saved_comes_back() {
+        // A file is the only interface every editor has, and `touch` is an editor
+        // that saves what it was given: what comes back is what went in, so the text
+        // really made the round trip rather than being re-read from the buffer.
+        assert_eq!(
+            run_editor("touch", "a line\n").unwrap().as_deref(),
+            Some("a line\n")
+        );
+
+        // A setting may carry flags, and they reach the editor: this one empties the
+        // file, which is a reader deleting everything and saving.
+        assert_eq!(
+            run_editor("truncate --size 0", "gone").unwrap().as_deref(),
+            Some("")
+        );
+
+        // An editor that exits unsuccessfully has abandoned the edit, so nothing
+        // comes back and the buffer keeps what it had.
+        assert_eq!(run_editor("false", "kept").unwrap(), None);
+
+        // An editor that cannot be run at all is a failure to report, not an empty
+        // result that would silently blank the field.
+        let failure = run_editor("loti-no-such-editor", "kept")
+            .expect_err("a missing program is not a saved edit")
+            .to_string();
+        assert!(failure.contains("loti-no-such-editor"), "{failure}");
+    }
+
+    #[test]
+    fn a_blank_editor_setting_is_refused_rather_than_guessed_at() {
+        // An editor chosen on the reader's behalf could be one they cannot get out
+        // of, and this hands over the whole terminal.
+        let refusal = run_editor("   ", "kept")
+            .expect_err("a blank setting names no program")
+            .to_string();
+        assert!(refusal.contains("blank"), "{refusal}");
     }
 }

@@ -19,6 +19,13 @@ pub enum Mode {
     Browse,
     /// Editing mode, with the selection frozen on one row.
     Editing,
+    /// An editing surface is open, and every key belongs to the field it holds.
+    ///
+    /// No browse binding survives here: the paging keys a preview owns are the
+    /// field's while it is open, and a letter is a character rather than an
+    /// action, so nothing typed into a field can move, reload or edit anything
+    /// underneath it.
+    Surface,
     /// A dialog is open, admitting the set of answers it lists and nothing else.
     ///
     /// The set travels with the dialog rather than being a mode of its own, so a
@@ -48,6 +55,23 @@ impl Answers {
     pub const ALL: &'static [Answers] = &[Answers::Destructive, Answers::Acknowledge];
 }
 
+/// The words a dialog gives its own answers, one per answer its set admits.
+///
+/// Invariant: the answer set decides which keys are bound and the dialog decides
+/// what they are called, because two dialogs share a key and mean different
+/// things by it — the letter that removes a label is the letter that throws a
+/// buffer away. Neither half names the other's business: a word here never spells
+/// a key, and the key map never invents the prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnswerWords {
+    /// What going ahead does, and `None` for a dialog that only reports: such a
+    /// dialog has a way out and no answer, so there is nothing to word.
+    pub affirmative: Option<&'static str>,
+    /// What getting out does. Every dialog has a way out, so this is never
+    /// absent.
+    pub dismissal: &'static str,
+}
+
 /// An action editing mode offers on the row it froze, as opposed to the keys the
 /// mode itself answers — the way out, help and a reload.
 ///
@@ -58,6 +82,8 @@ impl Answers {
 /// compiler then demands an offer and an answer for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditingAction {
+    /// Add a member to the container the frozen row names.
+    Add,
     /// Delete what the frozen row names, behind a confirmation.
     Delete,
 }
@@ -66,12 +92,13 @@ impl EditingAction {
     /// Every editing action, so a surface covering all of them cannot miss one.
     /// Its length is pinned by a test, because a variant left out here would be
     /// an action with no hint and no key.
-    pub const ALL: &'static [EditingAction] = &[EditingAction::Delete];
+    pub const ALL: &'static [EditingAction] = &[EditingAction::Add, EditingAction::Delete];
 
     /// The intent a key carries for this action. The state machine reads an
     /// intent, so the two vocabularies meet here and nowhere else.
     pub fn intent(self) -> Action {
         match self {
+            EditingAction::Add => Action::Add,
             EditingAction::Delete => Action::Delete,
         }
     }
@@ -130,10 +157,33 @@ pub enum Action {
     Reload,
     /// Enter editing mode on the highlighted row.
     EnterEditing,
+    /// Add a member to the container editing mode is acting on, which opens a
+    /// surface to fill in.
+    Add,
     /// Delete the row editing mode is acting on, which asks first. On the dialog
     /// that asks, the same intent is the answer that goes ahead: one letter
-    /// answers everything destructive, so it is learned once.
+    /// answers everything destructive, so it is learned once — a label removed, a
+    /// buffer thrown away.
     Delete,
+    /// Put a character into the open field, where the cursor is.
+    Insert(char),
+    /// Delete the character before the cursor.
+    DeleteBefore,
+    /// Delete the character under the cursor.
+    DeleteAfter,
+    /// Move the field cursor one character left.
+    MoveLeft,
+    /// Move the field cursor one character right.
+    MoveRight,
+    /// Move the field cursor to the start of its content.
+    MoveToStart,
+    /// Move the field cursor to the end of its content.
+    MoveToEnd,
+    /// Accept the open surface: write what its fields hold.
+    Accept,
+    /// Hand the open field's content to the external editor and take the result
+    /// back.
+    ExternalEditor,
     /// Toggle the key-binding overlay.
     ToggleHelp,
     /// Leave the browser.
@@ -152,10 +202,10 @@ mod tests {
         // and the counts make leaving it out of the list a failure here.
         for action in EditingAction::ALL {
             match action {
-                EditingAction::Delete => {}
+                EditingAction::Add | EditingAction::Delete => {}
             }
         }
-        assert_eq!(EditingAction::ALL.len(), 1);
+        assert_eq!(EditingAction::ALL.len(), 2);
         for answers in Answers::ALL {
             match answers {
                 Answers::Destructive | Answers::Acknowledge => {}
@@ -172,8 +222,11 @@ mod tests {
             assert_eq!(EditingAction::for_intent(action.intent()), Some(*action));
         }
         // And an intent that is not an editing action asks for none: the mode's
-        // own keys are answered by the mode, not offered by a row.
+        // own keys are answered by the mode, not offered by a row, and a key that
+        // belongs to an open field is answered by the field.
         assert_eq!(EditingAction::for_intent(Action::Unwind), None);
         assert_eq!(EditingAction::for_intent(Action::Quit), None);
+        assert_eq!(EditingAction::for_intent(Action::Accept), None);
+        assert_eq!(EditingAction::for_intent(Action::Insert('a')), None);
     }
 }

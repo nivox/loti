@@ -12,7 +12,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::action::{Action, Answers, EditingAction, Mode};
+use crate::action::{Action, AnswerWords, Answers, EditingAction, Mode};
 
 /// The intent a key press carries in a mode, or `None` if it is not bound there.
 pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
@@ -21,6 +21,12 @@ pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
     // pressed at a question.
     if let Mode::Dialog(answers) = mode {
         return dialog_action(key, answers);
+    }
+    // An open surface takes the whole keyboard, so nothing below is consulted:
+    // a letter typed into a field is a character, never the action that letter
+    // carries one layer up.
+    if let Mode::Surface = mode {
+        return surface_action(key);
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     Some(match (key.code, ctrl) {
@@ -34,9 +40,9 @@ pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
         // direction for a key a habit presses.
         (KeyCode::Char('c'), true) => match mode {
             Mode::Browse => Action::Quit,
-            // A dialog's own answers are settled before this table is reached, so
-            // only browsing and editing arrive here.
-            Mode::Editing | Mode::Dialog(_) => Action::Unwind,
+            // A dialog's answers and a surface's keys are settled before this
+            // table is reached, so only browsing and editing arrive here.
+            Mode::Editing | Mode::Surface | Mode::Dialog(_) => Action::Unwind,
         },
 
         // Preview paging. Bound before the plain motions so Ctrl-D/Ctrl-U are
@@ -74,12 +80,55 @@ pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
         // mode only: browse mode is where a reader's fingers rest, and a letter
         // that removed something from there would be one stray keystroke away
         // from a write.
+        (KeyCode::Char('a'), false) if matches!(mode, Mode::Editing) => Action::Add,
         (KeyCode::Char('d'), false) if matches!(mode, Mode::Editing) => Action::Delete,
 
-        // Session.
+        // Session. `F1` is a help key beside `?` everywhere, because inside a
+        // field `?` is a literal character and a reader must not have to learn a
+        // second help key on arriving there.
         (KeyCode::Char('e'), false) => Action::EnterEditing,
         (KeyCode::Char('r'), false) => Action::Reload,
-        (KeyCode::Char('?'), false) => Action::ToggleHelp,
+        (KeyCode::Char('?'), false) | (KeyCode::F(1), _) => Action::ToggleHelp,
+
+        _ => return None,
+    })
+}
+
+/// The intent a key carries inside an open surface, where every key belongs to
+/// the field.
+///
+/// Nothing browse mode binds survives: the paging keys that scroll a preview are
+/// the field's while it is open, and a letter is a character rather than the
+/// action that letter carries one layer up. A key this table does not bind is
+/// ignored rather than handed to the level underneath.
+fn surface_action(key: KeyEvent) -> Option<Action> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    Some(match (key.code, ctrl) {
+        // Raw mode is already on, which clears `IXON`, so Ctrl-S arrives as a key
+        // press instead of being eaten as flow control.
+        (KeyCode::Char('s'), true) => Action::Accept,
+        // A one-field surface is finished by the reflex key too: there is no next
+        // field for it to move to.
+        (KeyCode::Enter, _) => Action::Accept,
+        (KeyCode::Char('g'), true) => Action::ExternalEditor,
+        (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => Action::Unwind,
+        // The one help key that can be pressed inside a field.
+        (KeyCode::F(1), _) => Action::ToggleHelp,
+
+        // The emacs motions, with the arrows and the line keys beside them. A
+        // single-line field's start and end are its line's, so the keys that page
+        // a preview while browsing move within the field here.
+        (KeyCode::Char('a'), true) | (KeyCode::Home, _) => Action::MoveToStart,
+        (KeyCode::Char('e'), true) | (KeyCode::End, _) => Action::MoveToEnd,
+        (KeyCode::Char('b'), true) | (KeyCode::Left, _) => Action::MoveLeft,
+        (KeyCode::Char('f'), true) | (KeyCode::Right, _) => Action::MoveRight,
+
+        // Ctrl-H is unavailable as a binding of its own: terminals send 0x08 for
+        // Backspace, so it cannot be told apart from the key that deletes a
+        // character.
+        (KeyCode::Backspace, _) => Action::DeleteBefore,
+        (KeyCode::Delete, _) => Action::DeleteAfter,
+        (KeyCode::Char(c), false) => Action::Insert(c),
 
         _ => return None,
     })
@@ -103,16 +152,29 @@ fn dialog_action(key: KeyEvent, answers: Answers) -> Option<Action> {
     })
 }
 
-/// The answers a dialog lists, in the order it lists them, for the set the dialog
-/// asked for. A dialog says how to answer it, so the way out of one never depends
-/// on the hint strip a notice or a narrow terminal may have taken.
+/// The answers a dialog lists, in the order it lists them: the keys of the set it
+/// asked for, each carrying the word that dialog gave it. A dialog says how to
+/// answer it, so the way out of one never depends on the hint strip a notice or a
+/// narrow terminal may have taken.
 ///
-/// Every answer leads with the key that gives it, and that key is bound in the
-/// same set: a dialog naming a letter it does not answer would seal the reader in.
-pub fn dialog_answers(answers: Answers) -> &'static [&'static str] {
+/// Two halves, deliberately: the set decides which keys are bound and listed, and
+/// the dialog decides what they are called — the destructive letter removes a
+/// label on one dialog and throws a buffer away on another, and one set of
+/// hardwired words could not say both. Every answer still leads with the key that
+/// gives it, and that key is bound in the same set: a dialog naming a letter it
+/// does not answer would seal the reader in.
+pub fn dialog_answers(answers: Answers, words: AnswerWords) -> Vec<String> {
+    let dismissal = format!("Esc {}", words.dismissal);
     match answers {
-        Answers::Destructive => &["d remove", "Esc cancel"],
-        Answers::Acknowledge => &["Esc / Enter dismiss"],
+        Answers::Destructive => words
+            .affirmative
+            .into_iter()
+            .map(|word| format!("d {word}"))
+            .chain(std::iter::once(dismissal))
+            .collect(),
+        // Nothing is at stake, so both dismissing keys are listed on the one
+        // answer they share.
+        Answers::Acknowledge => vec![format!("Esc / Enter {}", words.dismissal)],
     }
 }
 
@@ -126,16 +188,26 @@ pub const HELP: &[(&str, &str)] = &[
         "open the row (nothing if it has nothing below)",
     ),
     ("Backspace / h / ←", "leave the level"),
-    ("Esc", "leave the level, or editing mode while it is on"),
+    ("Esc", "leave the level, a field, or editing mode"),
     ("Ctrl-D / Ctrl-U", "scroll the preview half a screen"),
     ("PgDn / PgUp / Space", "scroll the preview a screen"),
-    ("Home / End", "preview start / end"),
+    (
+        "Home / End",
+        "preview start / end; a field's ends inside one",
+    ),
     ("< / > / =", "narrow / widen / reset the panes"),
     ("z", "preview fills the width; mouse released"),
     ("e", "editing mode, on the highlighted row"),
+    ("a", "editing mode: add a label, in a dialog"),
     ("d", "editing mode: remove the label, with a confirmation"),
+    ("Ctrl-S / Enter", "save the open field"),
+    ("Ctrl-G", "edit the open field in $EDITOR"),
+    (
+        "Ctrl-A / Ctrl-E",
+        "field start / end; Ctrl-B / Ctrl-F or ← / → by one",
+    ),
     ("r", "re-read the store"),
-    ("?", "these keys"),
+    ("? / F1", "these keys; F1 works inside a field"),
     ("q", "quit"),
 ];
 
@@ -167,13 +239,31 @@ pub const FOOTER_ESSENTIAL: &[&str] = &["q quit", "? keys"];
 ///
 /// Each hint travels with the action it names, because the strip lists the subset
 /// the frozen row offers and only the state machine knows which that is.
-pub const FOOTER_HINTS_EDITING: &[(EditingAction, &str)] = &[(EditingAction::Delete, "d remove")];
+pub const FOOTER_HINTS_EDITING: &[(EditingAction, &str)] = &[
+    (EditingAction::Add, "a add"),
+    (EditingAction::Delete, "d remove"),
+];
+
+/// The droppable hints of an open surface, ranked rather than in key order: they
+/// are not peers. Saving is what the reader came to do, and handing the field to
+/// an external editor is the power-user escape from a cramped one.
+///
+/// A list of its own rather than more entries beside the editing actions: those
+/// are letters a row offers and this row offers none of them — while a surface is
+/// open the only keys that apply are the surface's.
+pub const FOOTER_HINTS_SURFACE: &[&str] = &["Ctrl-S save", "Ctrl-G editor"];
 
 /// Editing mode's essential pair. Neither browse hint applies — `q` does not quit
 /// while the mode is on, and the way out of the mode is not the way out of a
 /// level — so without a pair of its own a narrow terminal would show a mode with
 /// no visible way out of it.
 pub const FOOTER_ESSENTIAL_EDITING: &[&str] = &["Esc leave", "? keys"];
+
+/// An open surface's essential pair. `F1` rather than `?`, because inside a field
+/// `?` is a literal character — and rather than `Ctrl-S`, because the key list
+/// `F1` opens *contains* `Ctrl-S`, so help is the one hint that substitutes for
+/// every other and a reader is never sealed inside an uncommittable buffer.
+pub const FOOTER_ESSENTIAL_SURFACE: &[&str] = &["Esc cancel", "F1 keys"];
 
 /// The separator between hints.
 pub const HINT_SEPARATOR: &str = " · ";
@@ -193,6 +283,43 @@ mod tests {
     /// Every mode a dialog puts the keyboard under, one per set of answers.
     fn dialog_modes() -> Vec<Mode> {
         Answers::ALL.iter().copied().map(Mode::Dialog).collect()
+    }
+
+    /// Words for a dialog's answers, so a test about the letters is not also a
+    /// test about anybody's prose.
+    fn words() -> AnswerWords {
+        AnswerWords {
+            affirmative: Some("go ahead"),
+            dismissal: "get out",
+        }
+    }
+
+    /// The key a hint or an answer leads with, read back from the way it is
+    /// spelled. A strip teaches keys by name, so a test that the name is bound has
+    /// to parse the name the reader sees.
+    fn key_named(spelling: &str) -> KeyEvent {
+        match spelling {
+            "Esc" => plain(KeyCode::Esc),
+            "Enter" => plain(KeyCode::Enter),
+            "F1" => plain(KeyCode::F(1)),
+            _ => match spelling.strip_prefix("Ctrl-") {
+                Some(rest) => ctrl(one_char(rest).to_ascii_lowercase()),
+                None => plain(KeyCode::Char(one_char(spelling))),
+            },
+        }
+    }
+
+    fn one_char(spelling: &str) -> char {
+        let mut chars = spelling.chars();
+        match (chars.next(), chars.next()) {
+            (Some(c), None) => c,
+            _ => panic!("{spelling:?} is not a key this test can read back"),
+        }
+    }
+
+    /// The key an answer or a hint leads with.
+    fn leading(text: &str) -> &str {
+        text.split_whitespace().next().expect("a leading key")
     }
 
     #[test]
@@ -231,14 +358,139 @@ mod tests {
 
     #[test]
     fn every_essential_pair_says_the_way_out_before_it_says_help() {
-        for essential in [FOOTER_ESSENTIAL, FOOTER_ESSENTIAL_EDITING] {
+        for (mode, essential) in [
+            (Mode::Browse, FOOTER_ESSENTIAL),
+            (Mode::Editing, FOOTER_ESSENTIAL_EDITING),
+            (Mode::Surface, FOOTER_ESSENTIAL_SURFACE),
+        ] {
             // Clipping eats the tail, so the rank is the order: the way out
-            // first, help second.
+            // first, help second. Both are checked by what their key does in that
+            // mode rather than by how they are spelled — inside a field the help
+            // key is not the one browse mode teaches, and a pair naming a key that
+            // mode does not answer would seal the reader in.
             assert_eq!(essential.len(), 2);
-            assert!(essential[1].contains('?'), "{essential:?}");
+            let out = action_for(key_named(leading(essential[0])), mode);
+            assert!(
+                matches!(out, Some(Action::Unwind) | Some(Action::Quit)),
+                "{essential:?} in {mode:?} does not lead with a way out"
+            );
+            assert_eq!(
+                action_for(key_named(leading(essential[1])), mode),
+                Some(Action::ToggleHelp),
+                "{essential:?} in {mode:?} does not offer help second"
+            );
         }
         // And the way out of a mode is not the way out of the browser.
         assert_ne!(FOOTER_ESSENTIAL[0], FOOTER_ESSENTIAL_EDITING[0]);
+        assert_ne!(FOOTER_ESSENTIAL[0], FOOTER_ESSENTIAL_SURFACE[0]);
+    }
+
+    #[test]
+    fn an_open_surface_takes_every_key_and_lets_none_reach_what_is_under_it() {
+        // A letter is a character in a field, not the action it carries one layer
+        // up: nothing typed can quit, move a cursor or open a level.
+        for c in ['q', 'j', 'k', 'e', 'r', 'd', 'a', '?', 'z'] {
+            assert_eq!(
+                action_for(plain(KeyCode::Char(c)), Mode::Surface),
+                Some(Action::Insert(c)),
+                "{c:?} did not reach the field"
+            );
+        }
+        // The paging keys belong to the buffer while it is open, so they cannot
+        // scroll the preview behind it — and a single-line field has no page, so
+        // the ones with nothing to do there do nothing at all.
+        for code in [KeyCode::PageDown, KeyCode::PageUp] {
+            assert_eq!(action_for(plain(code), Mode::Surface), None, "{code:?}");
+        }
+        for c in ['d', 'u'] {
+            assert_eq!(action_for(ctrl(c), Mode::Surface), None, "Ctrl-{c}");
+        }
+        // The field's own ends, from the keys that page a preview one layer up.
+        assert_eq!(
+            action_for(plain(KeyCode::Home), Mode::Surface),
+            Some(Action::MoveToStart)
+        );
+        assert_eq!(
+            action_for(plain(KeyCode::End), Mode::Surface),
+            Some(Action::MoveToEnd)
+        );
+    }
+
+    #[test]
+    fn a_field_is_edited_by_the_keys_a_reader_already_knows() {
+        for (key, intent) in [
+            (ctrl('a'), Action::MoveToStart),
+            (ctrl('e'), Action::MoveToEnd),
+            (ctrl('b'), Action::MoveLeft),
+            (ctrl('f'), Action::MoveRight),
+            (plain(KeyCode::Left), Action::MoveLeft),
+            (plain(KeyCode::Right), Action::MoveRight),
+            (plain(KeyCode::Backspace), Action::DeleteBefore),
+            (plain(KeyCode::Delete), Action::DeleteAfter),
+        ] {
+            assert_eq!(action_for(key, Mode::Surface), Some(intent), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn a_one_field_surface_is_accepted_by_either_key_and_left_by_the_way_out() {
+        // Ctrl-S accepts anywhere; a one-field surface has no next field for the
+        // reflex key to move to, so it accepts too.
+        for key in [ctrl('s'), plain(KeyCode::Enter)] {
+            assert_eq!(
+                action_for(key, Mode::Surface),
+                Some(Action::Accept),
+                "{key:?}"
+            );
+        }
+        // The way out, and its alias: inside a mode Ctrl-C is exactly Esc.
+        for key in [plain(KeyCode::Esc), ctrl('c')] {
+            assert_eq!(
+                action_for(key, Mode::Surface),
+                Some(Action::Unwind),
+                "{key:?}"
+            );
+        }
+        assert_eq!(
+            action_for(ctrl('g'), Mode::Surface),
+            Some(Action::ExternalEditor)
+        );
+    }
+
+    #[test]
+    fn help_is_reachable_by_the_one_key_that_works_inside_a_field_too() {
+        // `?` is a literal character in a field, so `F1` is the help key that
+        // reaches every mode — and it is bound outside a field as well, so there
+        // is no second help key to learn on arriving in one.
+        for mode in [Mode::Browse, Mode::Editing, Mode::Surface] {
+            assert_eq!(
+                action_for(plain(KeyCode::F(1)), mode),
+                Some(Action::ToggleHelp),
+                "{mode:?}"
+            );
+        }
+        assert_eq!(
+            action_for(plain(KeyCode::Char('?')), Mode::Browse),
+            Some(Action::ToggleHelp)
+        );
+        assert_eq!(
+            action_for(plain(KeyCode::Char('?')), Mode::Surface),
+            Some(Action::Insert('?'))
+        );
+    }
+
+    #[test]
+    fn every_surface_hint_names_a_key_the_surface_answers() {
+        // The strip teaches keys by name, so a hint naming a key the surface does
+        // not answer teaches a key that does nothing. These are not the editing
+        // actions' hints: a row offers those, and while a surface is open no row
+        // offers anything.
+        for hint in FOOTER_HINTS_SURFACE {
+            assert!(
+                action_for(key_named(leading(hint)), Mode::Surface).is_some(),
+                "{hint:?} names a key the surface ignores"
+            );
+        }
     }
 
     #[test]
@@ -286,13 +538,22 @@ mod tests {
 
     #[test]
     fn an_editing_letter_is_bound_inside_the_mode_only() {
-        // Browse mode is where a reader's fingers rest, so a letter that removes
-        // something must not be one stray keystroke away from a write there.
-        assert_eq!(
-            action_for(plain(KeyCode::Char('d')), Mode::Editing),
-            Some(Action::Delete)
-        );
-        assert_eq!(action_for(plain(KeyCode::Char('d')), Mode::Browse), None);
+        // Browse mode is where a reader's fingers rest, so a letter that writes
+        // must not be one stray keystroke away from a write there.
+        for action in EditingAction::ALL.iter().copied() {
+            let hint = FOOTER_HINTS_EDITING
+                .iter()
+                .find(|(bound, _)| *bound == action)
+                .map(|(_, hint)| *hint)
+                .expect("every editing action has a hint");
+            let key = key_named(leading(hint));
+            assert_eq!(action_for(key, Mode::Editing), Some(action.intent()));
+            assert_eq!(
+                action_for(key, Mode::Browse),
+                None,
+                "{hint:?} in browse mode"
+            );
+        }
         // And the shifted-out variant keeps its own meaning in both: the letter
         // did not take a modifier combination with it.
         for mode in [Mode::Browse, Mode::Editing] {
@@ -303,7 +564,8 @@ mod tests {
     #[test]
     fn the_destructive_answer_is_the_same_letter_and_never_the_reflex_key() {
         let destructive = Mode::Dialog(Answers::Destructive);
-        // The letter that asks for a deletion is the letter that answers for it.
+        // The letter that asks for a deletion is the letter that answers for it,
+        // and it is the letter that answers everything else destructive too.
         assert_eq!(
             action_for(plain(KeyCode::Char('d')), destructive),
             action_for(plain(KeyCode::Char('d')), Mode::Editing)
@@ -386,23 +648,61 @@ mod tests {
     #[test]
     fn every_answer_a_dialog_lists_is_one_that_set_admits() {
         for answers in Answers::ALL.iter().copied() {
-            let listed = dialog_answers(answers);
+            let listed = dialog_answers(answers, words());
             // A dialog that lists no answer seals the reader inside it.
             assert!(!listed.is_empty(), "{answers:?} lists no way to answer it");
-            for answer in listed {
-                // Every answer leads with the key that gives it. Where that key is
-                // a letter it is checked here; the named keys — `Esc`, `Enter` —
-                // are pinned by the tests above, one per set, because their
-                // spelling is not their key code.
-                let leading = answer.split_whitespace().next().expect("a leading key");
-                let mut chars = leading.chars();
-                if let (Some(letter), None) = (chars.next(), chars.next()) {
-                    assert!(
-                        action_for(plain(KeyCode::Char(letter)), Mode::Dialog(answers)).is_some(),
-                        "{answer:?} is listed but not admitted by {answers:?}"
-                    );
-                }
+            for answer in &listed {
+                // Every answer leads with the key that gives it, read back from
+                // the way the dialog spells that key.
+                assert!(
+                    action_for(key_named(leading(answer)), Mode::Dialog(answers)).is_some(),
+                    "{answer:?} is listed but not admitted by {answers:?}"
+                );
             }
+            // And the way out is listed by every set: dismissal is unconditional.
+            assert!(
+                listed.iter().any(|a| a.contains(words().dismissal)),
+                "{answers:?} does not list its way out: {listed:?}"
+            );
         }
+    }
+
+    #[test]
+    fn a_dialog_words_its_own_answers_while_the_letters_stay_this_maps() {
+        // Two dialogs share the destructive letter and mean different things by
+        // it, so the words travel with the dialog: one set of hardwired words
+        // could not say both, and a word never spells a key.
+        let removing = dialog_answers(
+            Answers::Destructive,
+            AnswerWords {
+                affirmative: Some("remove"),
+                dismissal: "cancel",
+            },
+        );
+        let discarding = dialog_answers(
+            Answers::Destructive,
+            AnswerWords {
+                affirmative: Some("discard"),
+                dismissal: "keep editing",
+            },
+        );
+        assert_ne!(removing, discarding);
+        assert_eq!(
+            removing.iter().map(|a| leading(a)).collect::<Vec<_>>(),
+            discarding.iter().map(|a| leading(a)).collect::<Vec<_>>(),
+            "the letters are the set's, not the dialog's"
+        );
+        assert!(discarding[0].ends_with("discard"), "{discarding:?}");
+
+        // A dialog that only reports has nothing to go ahead with, so it lists
+        // one answer: the way out, and both keys that give it.
+        let reporting = dialog_answers(
+            Answers::Acknowledge,
+            AnswerWords {
+                affirmative: None,
+                dismissal: "dismiss",
+            },
+        );
+        assert_eq!(reporting, vec!["Esc / Enter dismiss".to_string()]);
     }
 }

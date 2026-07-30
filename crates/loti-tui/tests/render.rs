@@ -10,7 +10,7 @@ use loti_core::ops::{self, NewEpic, NewNode, Target};
 use loti_core::store::{self, Store};
 use loti_core::Actor;
 use loti_tui::action::{Action, Answers};
-use loti_tui::app::App;
+use loti_tui::app::{App, Modal};
 use loti_tui::data::RowKind;
 use loti_tui::theme::Theme;
 use loti_tui::ui;
@@ -668,9 +668,41 @@ fn resizing_moves_the_divider_in_the_drawn_frame() {
 /// removal is offered. An epic level leads with its collection rows, so `labels`
 /// is the row the cursor lands on.
 fn to_a_label_row(app: &mut App) {
+    to_the_labels_row(app);
+    app.apply(Action::Descend).unwrap();
+}
+
+/// Stand on the epic's own `labels` row, which is where an addition is offered:
+/// creation acts on the container row the cursor stands on.
+fn to_the_labels_row(app: &mut App) {
     app.apply(Action::Descend).unwrap(); // into the epic
     app.apply(Action::CursorFirst).unwrap();
-    app.apply(Action::Descend).unwrap();
+}
+
+/// Open the label surface the way a reader does, and type into it.
+fn open_the_label_surface(app: &mut App, text: &str) {
+    to_the_labels_row(app);
+    app.apply(Action::EnterEditing).unwrap();
+    app.apply(Action::Add).unwrap();
+    for c in text.chars() {
+        app.apply(Action::Insert(c)).unwrap();
+    }
+}
+
+/// The answers the open dialog lists, as the float shows them.
+fn listed_answers(app: &App) -> Vec<String> {
+    let Some(Modal::Dialog(dialog)) = app.modal() else {
+        panic!("no dialog is open")
+    };
+    loti_tui::keymap::dialog_answers(dialog.answers(), dialog.words())
+}
+
+/// The set of answers the open dialog admits.
+fn dialog_answer_set(app: &App) -> Answers {
+    let Some(Modal::Dialog(dialog)) = app.modal() else {
+        panic!("no dialog is open")
+    };
+    dialog.answers()
 }
 
 /// Every cell's symbol, row by row and untrimmed, so comparing two frames sees
@@ -783,14 +815,15 @@ fn a_destructive_question_lists_its_answers_and_never_the_reflex_key() {
     let lines = box_lines(&after, changed_box(&before, &after));
     // A dialog says how to answer it, so the way out never depends on the hint
     // strip a notice or a narrow terminal may have taken.
-    // The answers of the set this dialog asked for, taken from the key map, which
-    // is where the letters live.
-    for answer in loti_tui::keymap::dialog_answers(Answers::Destructive) {
+    // The answers the open dialog lists: the key map's letters carrying this
+    // dialog's own words, which is where each half lives.
+    for answer in listed_answers(&app) {
         assert!(
-            lines.iter().any(|l| l.contains(answer)),
+            lines.iter().any(|l| l.contains(&answer)),
             "{answer:?} is not listed: {lines:#?}"
         );
     }
+    assert_eq!(dialog_answer_set(&app), Answers::Destructive);
     // And the reflex key is listed nowhere, because it answers nothing here: a
     // reader arrives at a destructive question in a hurry.
     assert!(
@@ -961,5 +994,258 @@ fn a_confirmed_removal_leaves_the_mode_and_names_the_label_on_the_strip() {
     assert!(
         !lines.iter().skip(1).any(|l| l.contains("Remove label")),
         "the float outlived the write: {lines:#?}"
+    );
+}
+
+#[test]
+fn an_editing_surface_is_a_centred_float_that_covers_what_is_under_it_and_moves_nothing() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store, Theme::with_color(false)).unwrap();
+    to_the_labels_row(&mut app);
+    app.apply(Action::EnterEditing).unwrap();
+    let (before, _) = draw(&mut app);
+    app.apply(Action::Add).unwrap();
+    for c in "a new label".chars() {
+        app.apply(Action::Insert(c)).unwrap();
+    }
+    let (after, _) = draw(&mut app);
+
+    let (before, after) = (cells(&before), cells(&after));
+    // Bounded to everything above the hint strip: the strip legitimately changes,
+    // because the keys that apply are now the surface's own.
+    let body = ..after.len() - 1;
+    let region @ (x, y, width, height) = changed_box(&before[body], &after[body]);
+    let lines = box_lines(&after, region);
+    // The changed region is the float itself: it starts at its own corner, says
+    // what is being added and to what, and carries the field and its text.
+    assert_eq!(after[y][x], "\u{250c}", "{lines:#?}");
+    assert!(lines[0].contains("new label on browser"), "{lines:#?}");
+    assert!(lines[1].contains("label"), "{lines:#?}");
+    assert!(lines[1].contains("a new label"), "{lines:#?}");
+
+    // Centred on the whole terminal, like every other float: a reader looks for
+    // one in the same place whatever raised it.
+    let (columns, rows) = (after[0].len(), after.len());
+    assert!(
+        x.abs_diff(columns - (x + width)) <= 1,
+        "not centred across: {region:?}"
+    );
+    assert!(
+        y.abs_diff(rows - (y + height)) <= 1,
+        "not centred down: {region:?}"
+    );
+    // Nothing underneath moved: every cell outside the float is what it was, the
+    // breadcrumb line and both pane frames included — which is what being strictly
+    // inside the body proves, given that the region bounds every cell above the
+    // strip that changed at all.
+    assert!(x > 0 && y > 0, "{region:?}");
+    assert!(x + width < columns && y + height < rows - 1, "{region:?}");
+
+    // Above everything: the cells it covers are cleared, so no pane text or border
+    // shows through beside the field.
+    for row in &lines[1..height - 1] {
+        let interior: String = row.chars().skip(1).take(width - 2).collect();
+        assert!(
+            interior.chars().all(|c| !"─│┌┐└┘├┤┬┴┼".contains(c)),
+            "the screen shows through the float: {row:?}"
+        );
+    }
+}
+
+#[test]
+fn the_strip_carries_the_open_surfaces_own_keys_and_drops_the_editor_first() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store, Theme::with_color(false)).unwrap();
+    open_the_label_surface(&mut app, "x");
+    let (_t, lines) = draw(&mut app);
+
+    // The keys that apply right now are the surface's: saving, the external editor,
+    // and the way out of the buffer. None of the mode's letters apply — no row
+    // offers anything while a field is open — and neither browse hint does.
+    for hint in ["Ctrl-S save", "Ctrl-G editor", "Esc cancel", "F1 keys"] {
+        assert!(lines[23].contains(hint), "{hint:?}: {:?}", lines[23]);
+    }
+    for absent in ["a add", "Esc leave", "q quit", "? keys"] {
+        assert!(!lines[23].contains(absent), "{absent:?}: {:?}", lines[23]);
+    }
+
+    // Ranked, not in key order: a terminal too narrow for everything drops the
+    // power-user escape first and keeps the way out and help.
+    let (_t, narrow) = draw_at(&mut app, 40, 12);
+    assert!(narrow[11].contains("Ctrl-S save"), "{:?}", narrow[11]);
+    assert!(!narrow[11].contains("Ctrl-G"), "{:?}", narrow[11]);
+    assert!(narrow[11].contains("Esc cancel"), "{:?}", narrow[11]);
+    assert!(narrow[11].contains("F1 keys"), "{:?}", narrow[11]);
+}
+
+#[test]
+fn the_field_shows_the_text_with_the_cursor_where_the_next_character_lands() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store, Theme::with_color(false)).unwrap();
+    open_the_label_surface(&mut app, "typed");
+    let (mut terminal, _) = draw(&mut app);
+
+    // A field with no cursor does not say where typing goes, so the terminal's own
+    // cursor is placed just after the text.
+    let (x, y) = {
+        let position = terminal.get_cursor_position().unwrap();
+        (position.x as usize, position.y as usize)
+    };
+    let frame = cells(&terminal);
+    let row = frame[y].concat();
+    assert!(
+        row.contains("typed"),
+        "the cursor is not on the field: {row:?}"
+    );
+    assert_eq!(
+        frame[y][x - 1],
+        "d",
+        "the cursor does not follow the text: {row:?}"
+    );
+
+    // Moving to the start of the field moves the cursor there and moves nothing
+    // else: a motion is not a change.
+    let before = frame;
+    app.apply(Action::MoveToStart).unwrap();
+    let (mut terminal, _) = draw(&mut app);
+    let home = terminal.get_cursor_position().unwrap();
+    assert_eq!((home.y as usize, home.x as usize), (y, x - "typed".len()));
+    assert_eq!(before, cells(&terminal), "a motion changed the frame");
+
+    // Content wider than the field scrolls rather than wrapping — it holds one
+    // line — and the part shown contains the cursor, so a reader typing at the end
+    // of a long value can see what they are typing.
+    app.apply(Action::MoveToEnd).unwrap();
+    let long = "a label somebody pasted a whole sentence into, at length";
+    for c in long.chars() {
+        app.apply(Action::Insert(c)).unwrap();
+    }
+    let (mut terminal, lines) = draw_at(&mut app, 40, 12);
+    let end = terminal.get_cursor_position().unwrap();
+    let float = cells(&terminal);
+    assert!(
+        lines.iter().all(|l| l.chars().count() <= 40),
+        "the field ran past the terminal: {lines:#?}"
+    );
+    assert_eq!(float[end.y as usize][end.x as usize - 1], "h", "{lines:#?}");
+    assert!(
+        float[end.y as usize].concat().contains("at length"),
+        "the end of the value is off the field: {lines:#?}"
+    );
+}
+
+#[test]
+fn the_discard_warning_covers_the_buffer_it_asks_about_and_words_its_own_answers() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store, Theme::with_color(false)).unwrap();
+    open_the_label_surface(&mut app, "half a thought");
+    let (buffer, _) = draw(&mut app);
+    app.apply(Action::Unwind).unwrap();
+    let (warned, _) = draw(&mut app);
+
+    let (buffer, warned) = (cells(&buffer), cells(&warned));
+    let float = box_lines(&warned, changed_box(&buffer, &warned));
+    // It names the field, because the frozen row is covered and a buffer carries no
+    // label near it.
+    assert!(
+        float
+            .iter()
+            .any(|l| l.contains("Discard changes to label?")),
+        "{float:#?}"
+    );
+    // The same destructive letter as a removal, with this dialog's own words: the
+    // key is learned once and what it does is said here.
+    for answer in listed_answers(&app) {
+        assert!(
+            float.iter().any(|l| l.contains(&answer)),
+            "{answer:?} is not listed: {float:#?}"
+        );
+    }
+    assert!(float.iter().any(|l| l.contains("d discard")), "{float:#?}");
+    assert!(
+        float.iter().any(|l| l.contains("Esc keep editing")),
+        "{float:#?}"
+    );
+    assert!(
+        !float.iter().any(|l| l.contains("remove")),
+        "the buffer's warning borrowed the removal's words: {float:#?}"
+    );
+    // A reader arrives here in a hurry, so the reflex key answers nothing and is
+    // listed nowhere.
+    assert!(
+        !float.iter().any(|l| l.contains("Enter")),
+        "the float offers the reflex key: {float:#?}"
+    );
+
+    // Keeping the buffer lands back in it, text and all: the frame is the one the
+    // warning was raised over.
+    app.apply(Action::Unwind).unwrap();
+    let (again, _) = draw(&mut app);
+    assert_eq!(cells(&again), buffer);
+}
+
+#[test]
+fn an_empty_required_field_warns_naming_it_and_the_buffer_survives_the_warning() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    open_the_label_surface(&mut app, "");
+    let (buffer, _) = draw(&mut app);
+    app.apply(Action::Accept).unwrap();
+    let (warned, lines) = draw(&mut app);
+
+    let (buffer, warned) = (cells(&buffer), cells(&warned));
+    let float = box_lines(&warned, changed_box(&buffer, &warned));
+    assert!(
+        float.iter().any(|l| l.contains("label is required.")),
+        "{float:#?}"
+    );
+    // Dismissal is what this dialog carries, and it says where it lands.
+    assert!(
+        float.iter().any(|l| l.contains("back to the field")),
+        "{float:#?}"
+    );
+    // A warning is a dialog, never a notice: the strip is untouched.
+    assert!(lines[23].contains("Ctrl-S save"), "{:?}", lines[23]);
+    // And nothing was written: the label set still holds what it held.
+    assert_eq!(
+        ops::list_labels(&store, &Target::Epic("browser".into())).unwrap(),
+        vec!["ui".to_string()]
+    );
+
+    // Acknowledging lands back in the field, which is the frame the warning covered.
+    app.apply(Action::Unwind).unwrap();
+    let (again, _) = draw(&mut app);
+    assert_eq!(cells(&again), buffer);
+}
+
+#[test]
+fn a_saved_label_leaves_the_mode_and_the_notice_names_it() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store, Theme::with_color(false)).unwrap();
+    open_the_label_surface(&mut app, "shipped");
+    app.apply(Action::Accept).unwrap();
+    let (_t, lines) = draw(&mut app);
+
+    // The mode indicator going, the float going and the notice arriving are one
+    // frame, which is what reads as "that finished".
+    assert!(!lines[0].contains("EDITING"), "{:?}", lines[0]);
+    assert!(
+        !lines.iter().any(|l| l.contains("new label on")),
+        "the float outlived the write: {lines:#?}"
+    );
+    assert!(lines[23].contains("label shipped added"), "{:?}", lines[23]);
+
+    // The store was re-read: the label set the reader is standing on now counts one
+    // more member, and entering it shows the label itself.
+    let row = lines
+        .iter()
+        .find(|l| l.contains("labels"))
+        .expect("the label set's row");
+    assert!(row.contains("(2)"), "{row:?}");
+    app.apply(Action::Descend).unwrap();
+    let (_t, members) = draw(&mut app);
+    assert!(
+        members.iter().any(|l| l.contains("shipped")),
+        "the label is not in the level it was added to: {members:#?}"
     );
 }

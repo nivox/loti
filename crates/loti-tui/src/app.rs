@@ -11,8 +11,8 @@ use anyhow::Result;
 use loti_core::store::Store;
 use ratatui_markdown::viewer::MarkdownViewer;
 
-use crate::action::{Action, Answers, EditingAction, Mode};
-use crate::data::{self, Level, Selection};
+use crate::action::{Action, AnswerWords, Answers, EditingAction, Mode};
+use crate::data::{self, Collection, Level, Selection};
 use crate::keymap;
 use crate::nav::Nav;
 use crate::theme::Theme;
@@ -44,6 +44,16 @@ const NOT_AN_EDITING_ACTION: &str = "not an editing action — Esc to leave";
 const CONFIRM_TITLE: &str = " confirm ";
 /// See [`CONFIRM_TITLE`].
 const REFUSAL_TITLE: &str = " the store refused the change ";
+/// See [`CONFIRM_TITLE`].
+const REQUIRED_TITLE: &str = " a required field is empty ";
+/// See [`CONFIRM_TITLE`]. The browser hands the terminal over for an external
+/// editor, so an editor that will not run is the browser's failure to report and
+/// not the store's.
+const EDITOR_TITLE: &str = " the editor could not run ";
+
+/// What a label field is called wherever it has to be named: on the surface that
+/// fills it in, and in the warning that says it is empty.
+const LABEL_FIELD: &str = "label";
 
 /// A transient one-line notice, holding the hint strip's line until its deadline
 /// passes.
@@ -68,25 +78,67 @@ pub enum Modal {
     /// A dialog. One widget carries every question and every report, because each
     /// of them is a critical interruption laid over the screen — the transient
     /// notice channel carries only what a reader need not act on.
-    Dialog(Dialog),
+    ///
+    /// Behind a pointer because a dialog carries what its answer writes and what
+    /// its answers are called, which is far more than the overlay carries, and only
+    /// one modal is ever open: the indirection costs a pointer hop on a keypress
+    /// and saves every browser state from carrying a dialog's worth of bytes.
+    Dialog(Box<Dialog>),
 }
 
-/// A dialog: what it says, how it may be answered, and what answering it
-/// performs.
+/// What an editing action opens on the frozen row: something to answer, or
+/// something to fill in.
 ///
-/// Invariant: a dialog carries all three itself, so the state machine that
-/// answers one names no operation and no answer set of its own — which is what
-/// makes a further kind of dialog a value built here rather than another branch
-/// everywhere a dialog is routed or drawn.
+/// The shape of the input decides which: a question with no text to write is a
+/// dialog to answer, and anything the reader has to type is a surface. Both are
+/// what one row offers, so the hint strip and the key consult the same answer.
+enum Offer {
+    /// A question, answered where it stands.
+    Ask(Dialog),
+    /// A surface to fill in and accept.
+    Fill(Surface),
+}
+
+/// A dialog: what it says, how it may be answered, what its answers are called,
+/// and what each of them performs.
+///
+/// Invariant: a dialog carries all of that itself, so the state machine that
+/// answers one names no operation, no answer set and no wording of its own —
+/// which is what makes a further kind of dialog a value built here rather than
+/// another branch everywhere a dialog is routed or drawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dialog {
     title: &'static str,
     message: String,
     answers: Answers,
-    /// What the affirmative answer performs, and `None` for a dialog that only
-    /// reports: such a dialog has a way out and no answer, so nothing it is shown
-    /// for can be acted on by mistake.
-    performs: Option<Performs>,
+    /// The affirmative answer, and `None` for a dialog that only reports: such a
+    /// dialog has a way out and no answer, so nothing it is shown for can be
+    /// acted on by mistake.
+    affirmative: Option<Answer>,
+    /// The way out. Every dialog has one — dismissal is never refused — so this is
+    /// never absent.
+    dismissal: Dismissal,
+}
+
+/// A dialog's affirmative answer: what it is called, and what it performs.
+///
+/// The word travels with the answer because the answer set decides only which
+/// keys are bound: the destructive letter removes a label on one dialog and
+/// throws a buffer away on another, so a set of words fixed per key could not say
+/// both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Answer {
+    word: &'static str,
+    performs: Performs,
+}
+
+/// A dialog's way out: what it is called, and what the reader lands in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Dismissal {
+    word: &'static str,
+    /// What dismissal performs besides closing the dialog, and `None` where
+    /// landing back exactly where the reader was is the whole of it.
+    performs: Option<OnDismissal>,
 }
 
 /// What a dialog's affirmative answer performs.
@@ -101,33 +153,100 @@ enum Performs {
     /// two are built with the question, so a question and the notice that follows
     /// it can never name different things.
     Write { write: data::Write, done: String },
+    /// Throw the open surface away, the text in it included. Nothing reaches the
+    /// store, which is why an answer that writes nothing is still an answer: the
+    /// text is the only copy of what the reader typed.
+    Discard,
+}
+
+/// What dismissing a dialog performs, over and above the dialog going away.
+///
+/// Invariant: dismissal is unconditional — a dialog can always be got out of — so
+/// nothing here is a condition on getting out; it is only where the reader lands
+/// once they have. This is the mirror of what an affirmative answer performs,
+/// because a dialog that merely reports still has somewhere to put the reader
+/// afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnDismissal {
+    /// Land back in the field the dialog named, so warning, dismissal and typing
+    /// the answer are a straight line with no hunting for which field was meant.
+    Focus(usize),
 }
 
 impl Dialog {
-    /// A destructive question, carrying the write its answer performs and what
-    /// that write says once it has happened.
+    /// A destructive question: the word its answer goes by, what that answer
+    /// performs, and the word for getting out instead.
     ///
-    /// Every deletion is gated behind one of these: a label is trivially
-    /// re-addable and the gate buys little there, but one rule a reader can
-    /// predict beats a per-action judgement they have to remember.
-    fn confirm(question: String, write: data::Write, done: String) -> Self {
+    /// Every deletion is gated behind one of these, and so is throwing a buffer
+    /// away: a label is trivially re-addable and the gate buys little there, but
+    /// one rule a reader can predict beats a per-action judgement they have to
+    /// remember.
+    fn confirm(
+        question: String,
+        word: &'static str,
+        performs: Performs,
+        dismissal: &'static str,
+    ) -> Self {
         Self {
             title: CONFIRM_TITLE,
             message: question,
             answers: Answers::Destructive,
-            performs: Some(Performs::Write { write, done }),
+            affirmative: Some(Answer { word, performs }),
+            dismissal: Dismissal {
+                word: dismissal,
+                performs: None,
+            },
         }
     }
 
-    /// A refusal, in the store's own words and with nothing to answer: the reader
-    /// is being told, not asked.
-    fn refusal(message: String) -> Self {
+    /// The warning the way out raises on a buffer with typing in it. It names the
+    /// field, because the float covers the frozen row and a buffer carries no
+    /// label near it.
+    fn discard(field: &str) -> Self {
+        Self::confirm(
+            format!("Discard changes to {field}?"),
+            "discard",
+            Performs::Discard,
+            "keep editing",
+        )
+    }
+
+    /// A report with nothing to answer: the reader is being told, not asked, so
+    /// the only way out is the way out, and it may carry where to land.
+    fn report(title: &'static str, message: String, dismissal: Dismissal) -> Self {
         Self {
-            title: REFUSAL_TITLE,
+            title,
             message,
             answers: Answers::Acknowledge,
-            performs: None,
+            affirmative: None,
+            dismissal,
         }
+    }
+
+    /// A refusal, in the store's own words.
+    fn refusal(message: String) -> Self {
+        Self::report(
+            REFUSAL_TITLE,
+            message,
+            Dismissal {
+                word: "dismiss",
+                performs: None,
+            },
+        )
+    }
+
+    /// The warning a surface accepted with an empty required field raises instead
+    /// of writing. It names the field, and dismissing it lands there: nothing is
+    /// being judged about the value, only that there is none to send.
+    fn required(field: &str, index: usize) -> Self {
+        Self::report(
+            REQUIRED_TITLE,
+            format!("{field} is required."),
+            Dismissal {
+                word: "back to the field",
+                performs: Some(OnDismissal::Focus(index)),
+            },
+        )
     }
 
     /// The fixed title that says what kind of dialog this is, since the text in it
@@ -141,9 +260,249 @@ impl Dialog {
         &self.message
     }
 
-    /// The set of answers it admits, which is also the set it lists.
+    /// The set of answers it admits, which is also the set of keys it lists.
     pub fn answers(&self) -> Answers {
         self.answers
+    }
+
+    /// What this dialog calls its own answers, for the key map to pair with the
+    /// letters. The affirmative word is present exactly when there is an answer to
+    /// word, so a dialog cannot list a key it does not admit.
+    pub fn words(&self) -> AnswerWords {
+        AnswerWords {
+            affirmative: self.affirmative.as_ref().map(|answer| answer.word),
+            dismissal: self.dismissal.word,
+        }
+    }
+}
+
+/// One text field of an editing surface.
+///
+/// Invariant: the field holds one line. Whatever arrives with line breaks in it —
+/// the external editor's result — has them dropped rather than turned into
+/// spaces, because a space is content the reader did not type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Field {
+    /// What the field is called wherever it has to be named: on the surface, and
+    /// in a warning about it. A warning is raised over the surface and the frozen
+    /// row is covered, so a warning that named no field would not say which.
+    label: &'static str,
+    value: String,
+    /// Where the next character lands, counted in characters and not bytes, so a
+    /// multi-byte character is never split.
+    cursor: usize,
+    /// Whether the store cannot be given this surface with the field left empty.
+    required: bool,
+    /// Whether a content-mutating keystroke has landed here.
+    ///
+    /// Invariant: a flag, never a comparison against what the field started from.
+    /// It is sticky — typing a character and deleting it again leaves the field
+    /// dirty — and cursor motion never sets it. So the way out warns about a field
+    /// that would lose nothing, which is accepted deliberately: a spurious warning
+    /// is cheap, and a flag costs no per-keystroke compare of a whole body against
+    /// its original.
+    dirty: bool,
+}
+
+impl Field {
+    /// An empty field, which is where every surface starts: nothing the browser
+    /// puts there itself could be text the reader meant to write.
+    fn new(label: &'static str, required: bool) -> Self {
+        Self {
+            label,
+            value: String::new(),
+            cursor: 0,
+            required,
+            dirty: false,
+        }
+    }
+
+    /// What the field is called.
+    pub fn label(&self) -> &'static str {
+        self.label
+    }
+
+    /// What it holds.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    /// Where the cursor sits, in characters from the start.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Whether anything has been typed into it. See [`Field::dirty`].
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Whether a required field has nothing in it to send.
+    ///
+    /// A field holding only whitespace counts as empty: the reader cannot tell it
+    /// from a blank one on screen, so warning is more honest than writing
+    /// something invisible. What makes a *non-blank* value acceptable is the
+    /// store's rule, and the browser reimplements none of those.
+    fn unfilled(&self) -> bool {
+        self.required && self.value.trim().is_empty()
+    }
+
+    /// Apply a key's intent to the field.
+    ///
+    /// Invariant: every intent that can change the content sets the dirty flag and
+    /// no motion ever does — including an intent that happened to change nothing,
+    /// a deletion with nothing left to delete among them, because dirty is what was
+    /// *pressed* and not what differs.
+    fn apply(&mut self, action: Action) {
+        match action {
+            Action::Insert(c) => {
+                let at = self.byte_at(self.cursor);
+                self.value.insert(at, c);
+                self.cursor += 1;
+                self.dirty = true;
+            }
+            Action::DeleteBefore => {
+                if self.cursor > 0 {
+                    self.cursor -= 1;
+                    let at = self.byte_at(self.cursor);
+                    self.value.remove(at);
+                }
+                self.dirty = true;
+            }
+            Action::DeleteAfter => {
+                if self.cursor < self.len() {
+                    let at = self.byte_at(self.cursor);
+                    self.value.remove(at);
+                }
+                self.dirty = true;
+            }
+            Action::MoveLeft => self.cursor = self.cursor.saturating_sub(1),
+            Action::MoveRight => self.cursor = (self.cursor + 1).min(self.len()),
+            Action::MoveToStart => self.cursor = 0,
+            Action::MoveToEnd => self.cursor = self.len(),
+            // Everything else is the surface's business or nobody's: a key the
+            // field does not answer must not silently change what it holds.
+            _ => {}
+        }
+    }
+
+    /// Take an external editor's result, which counts as content the reader typed:
+    /// the way out warns about it exactly as it does about typing.
+    ///
+    /// The line breaks an editor leaves behind are dropped, because the field holds
+    /// one line — see [`Field`].
+    fn replace(&mut self, text: &str) {
+        self.value = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+        self.cursor = self.len();
+        self.dirty = true;
+    }
+
+    /// How many characters the field holds, which is where the cursor may go up to.
+    fn len(&self) -> usize {
+        self.value.chars().count()
+    }
+
+    /// The byte offset of a character offset, so an insertion or a removal never
+    /// lands inside a multi-byte character.
+    fn byte_at(&self, cursor: usize) -> usize {
+        self.value
+            .char_indices()
+            .nth(cursor)
+            .map(|(at, _)| at)
+            .unwrap_or(self.value.len())
+    }
+}
+
+/// An open editing surface: the fields the reader fills in, and what accepting it
+/// writes.
+///
+/// Invariant: a surface is open only while editing mode is on, and a dialog about
+/// it is laid over it rather than replacing it — so answering or dismissing one
+/// lands back in the buffer it was raised about, with the text intact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Surface {
+    /// What the float is titled: the action and the row it acts on, since the
+    /// float covers the row it was opened from.
+    title: String,
+    fields: Vec<Field>,
+    /// Which field the keyboard is in.
+    focus: usize,
+    commit: Commit,
+}
+
+/// What accepting a surface writes.
+///
+/// Invariant: named when the surface opens and built from the fields at the moment
+/// it is accepted, so the write and the notice that reports it are one decision
+/// and can never come to name different things.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Commit {
+    /// Put the label the field holds on the set the frozen row names.
+    AddLabel(Selection),
+}
+
+impl Surface {
+    /// The surface that adds one label: a single short line, so it is a float and
+    /// not the preview pane — keeping the row visible buys nothing for a field this
+    /// size, and the pane is where the long-form text goes.
+    fn add_label(set: Selection, container: String) -> Self {
+        Self {
+            title: format!(" new label on {container} "),
+            fields: vec![Field::new(LABEL_FIELD, true)],
+            focus: 0,
+            commit: Commit::AddLabel(set),
+        }
+    }
+
+    /// What the float is titled.
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// Its fields, in the order they are filled in.
+    pub fn fields(&self) -> &[Field] {
+        &self.fields
+    }
+
+    /// Which of them the keyboard is in.
+    pub fn focus(&self) -> usize {
+        self.focus
+    }
+
+    /// The field a warning about lost text names: the first one with typing in it,
+    /// and `None` for a surface nothing has been typed into — which is what makes
+    /// the way out ask on one and not on the other.
+    fn dirtied(&self) -> Option<&Field> {
+        self.fields.iter().find(|field| field.dirty)
+    }
+
+    /// The first required field left empty, which is the one an accept must warn
+    /// about and land the reader back in.
+    fn unfilled(&self) -> Option<usize> {
+        self.fields.iter().position(Field::unfilled)
+    }
+
+    /// The field taking keystrokes.
+    fn focused_mut(&mut self) -> &mut Field {
+        // The focus is only ever set to a field this surface carries, so there is
+        // always one to type into.
+        &mut self.fields[self.focus]
+    }
+
+    /// The write accepting the surface performs, and what the notice says once it
+    /// is committed.
+    fn write(&self) -> (data::Write, String) {
+        match &self.commit {
+            Commit::AddLabel(set) => {
+                let label = self.fields[0].value.clone();
+                (
+                    data::Write::AddLabel(set.clone(), label.clone()),
+                    // The notice names the label, because by the time it is read
+                    // the surface that held it is gone.
+                    format!("label {label} added"),
+                )
+            }
+        }
     }
 }
 
@@ -187,6 +546,16 @@ pub struct App {
     /// on instead of a list being browsed. A reload that leaves the two apart
     /// ends the mode rather than letting them drift.
     editing: Option<Selection>,
+    /// The open editing surface, if any. Only ever open while editing mode is on:
+    /// it is filled in for the frozen row, and a successful save closes both.
+    surface: Option<Surface>,
+    /// The text an external editor has been asked to take, until the loop that
+    /// owns the terminal takes it.
+    ///
+    /// The browser cannot run an editor itself: the editor needs the screen, the
+    /// alternate screen gone, raw mode off and mouse capture off, and none of those
+    /// belong to the state machine. So the handoff is left here to be picked up.
+    editor_handoff: Option<String>,
 }
 
 impl App {
@@ -211,6 +580,8 @@ impl App {
             redraw: true,
             flash: None,
             editing: None,
+            surface: None,
+            editor_handoff: None,
         })
     }
 
@@ -244,6 +615,11 @@ impl App {
         self.editing.as_ref()
     }
 
+    /// The open editing surface, if any.
+    pub fn surface(&self) -> Option<&Surface> {
+        self.surface.as_ref()
+    }
+
     /// Which set of bindings the keyboard is under.
     ///
     /// A dialog is a mode of its own, because a question must admit its own
@@ -255,9 +631,13 @@ impl App {
             // The answers belong to the dialog, so the set the keyboard is under is
             // read off the open dialog rather than off a mode per kind of dialog.
             Some(Modal::Dialog(dialog)) => Mode::Dialog(dialog.answers),
-            Some(Modal::Help) | None => match self.editing.is_some() {
-                true => Mode::Editing,
-                false => Mode::Browse,
+            // An open surface takes every key, so it outranks the mode that opened
+            // it: while a field is being typed into, the mode's own letters are
+            // characters.
+            Some(Modal::Help) | None => match (self.surface.is_some(), self.editing.is_some()) {
+                (true, _) => Mode::Surface,
+                (false, true) => Mode::Editing,
+                (false, false) => Mode::Browse,
             },
         }
     }
@@ -282,8 +662,8 @@ impl App {
         self.offer(action).is_some()
     }
 
-    /// The dialog an editing action raises on the frozen row, or `None` where the
-    /// row does not offer that action.
+    /// What an editing action opens on the frozen row, or `None` where the row does
+    /// not offer that action.
     ///
     /// Invariant: this is the whole of what a row offers — both the hint strip and
     /// the key ask it — and it is exhaustive over the editing actions, so an
@@ -294,16 +674,28 @@ impl App {
     /// members of a collection read alike: an unnamed question would not say what
     /// is about to go. The notice names it for the same reason — by the time it
     /// is read the row is gone.
-    fn offer(&self, action: EditingAction) -> Option<Dialog> {
+    fn offer(&self, action: EditingAction) -> Option<Offer> {
         let target = self.editing.as_ref()?;
         match action {
+            EditingAction::Add => match target {
+                // Creation acts on the container row the cursor stands on, so a
+                // label is added from the label set's own row and nowhere else.
+                Selection::Collection(container, Collection::Labels) => Some(Offer::Fill(
+                    Surface::add_label(target.clone(), container.selection().reference()),
+                )),
+                _ => None,
+            },
             EditingAction::Delete => match target {
                 // A label set has no rename, so a label is only ever removed.
-                Selection::Label(_, label) => Some(Dialog::confirm(
+                Selection::Label(_, label) => Some(Offer::Ask(Dialog::confirm(
                     format!("Remove label {label}?"),
-                    data::Write::RemoveLabel(target.clone()),
-                    format!("label {label} removed"),
-                )),
+                    "remove",
+                    Performs::Write {
+                        write: data::Write::RemoveLabel(target.clone()),
+                        done: format!("label {label} removed"),
+                    },
+                    "cancel",
+                ))),
                 _ => None,
             },
         }
@@ -317,6 +709,12 @@ impl App {
     pub fn apply(&mut self, action: Action) -> Result<bool> {
         if self.modal.is_some() {
             return self.apply_to_modal(action);
+        }
+        // An open surface is the layer under an overlay and above the mode that
+        // opened it: every key belongs to the field while it is open.
+        if self.surface.is_some() {
+            self.apply_to_surface(action)?;
+            return Ok(false);
         }
         if self.editing.is_some() {
             self.apply_editing(action)?;
@@ -362,9 +760,20 @@ impl App {
             // Nothing is open above the level, so unwinding is leaving it.
             Action::Ascend | Action::Unwind => self.nav.ascend(),
 
-            // The letters of editing mode's actions are bound inside the mode
-            // only, so nothing carries this intent while browsing.
-            Action::Delete => {}
+            // The letters of editing mode's actions, and the keys of an open
+            // surface, are bound inside those layers only, so nothing carries
+            // these intents while browsing.
+            Action::Add
+            | Action::Delete
+            | Action::Accept
+            | Action::ExternalEditor
+            | Action::Insert(_)
+            | Action::DeleteBefore
+            | Action::DeleteAfter
+            | Action::MoveLeft
+            | Action::MoveRight
+            | Action::MoveToStart
+            | Action::MoveToEnd => {}
 
             Action::EnterEditing => match self.nav.frame().current() {
                 Some(row) => self.editing = Some(row.selection.clone()),
@@ -416,10 +825,33 @@ impl App {
             Action::Delete => self.answer()?,
             // A refused write leaves the editing session standing: only a
             // successful write ends it, so dismissing lands back in the mode.
-            Action::Unwind => self.modal = None,
+            Action::Unwind => self.dismiss(),
             _ => {}
         }
         Ok(false)
+    }
+
+    /// Get out of the open dialog, landing wherever it says the reader belongs.
+    ///
+    /// Dismissal is unconditional: the dialog always goes. What it may carry is
+    /// only where the reader lands — a warning about an empty field puts them back
+    /// in that field, so answering it is typing rather than hunting.
+    fn dismiss(&mut self) {
+        let performs = match &self.modal {
+            Some(Modal::Dialog(dialog)) => dialog.dismissal.performs,
+            Some(Modal::Help) | None => None,
+        };
+        self.modal = None;
+        match performs {
+            Some(OnDismissal::Focus(field)) => {
+                if let Some(surface) = &mut self.surface {
+                    // The buffer was never what the warning was about, so it is
+                    // still open with its text: only the focus moves.
+                    surface.focus = field.min(surface.fields.len().saturating_sub(1));
+                }
+            }
+            None => {}
+        }
     }
 
     /// Carry out what the open dialog's answer performs.
@@ -434,24 +866,131 @@ impl App {
         let Some(Modal::Dialog(dialog)) = &self.modal else {
             return Ok(());
         };
-        let Some(performs) = dialog.performs.clone() else {
+        let Some(answer) = dialog.affirmative.clone() else {
             return Ok(());
         };
         self.modal = None;
-        match performs {
-            Performs::Write { write, done } => match data::perform(&self.store, &write) {
-                Ok(()) => {
-                    self.editing = None;
-                    self.reload()?;
-                    self.flash(done);
-                }
-                // The store's own words, so the browser and the CLI teach the same
-                // rule in the same words and the browser cannot go stale when a
-                // store rule gains a nuance.
-                Err(e) => self.modal = Some(Modal::Dialog(Dialog::refusal(e.to_string()))),
-            },
+        match answer.performs {
+            Performs::Write { write, done } => self.commit(&write, done)?,
+            // Nothing reaches the store, and the mode stays on its frozen row: the
+            // way out unwinds one layer at a time, and the surface is the layer
+            // that was asked about.
+            Performs::Discard => self.surface = None,
         }
         Ok(())
+    }
+
+    /// Write, and report what happened.
+    ///
+    /// A successful write ends the editing session, the surface with it, and says
+    /// what it did. A refused one keeps everything: the surface stays open with its
+    /// text, so the reader can fix it or carry it out through the external editor —
+    /// only a successful write ends the session.
+    fn commit(&mut self, write: &data::Write, done: String) -> Result<()> {
+        match data::perform(&self.store, write) {
+            Ok(()) => {
+                self.surface = None;
+                self.editing = None;
+                self.reload()?;
+                self.flash(done);
+            }
+            // The store's own words, so the browser and the CLI teach the same
+            // rule in the same words and the browser cannot go stale when a
+            // store rule gains a nuance.
+            Err(e) => self.modal = Some(Modal::Dialog(Box::new(Dialog::refusal(e.to_string())))),
+        }
+        Ok(())
+    }
+
+    /// Carry out an intent while a surface is open.
+    ///
+    /// Every key belongs to the field except the surface's own few: accept, the
+    /// external editor, help, and the way out. There is no unknown-key notice here
+    /// — in a field an unbound key is simply not a character, and the mode's notice
+    /// belongs to the layer where letters are actions.
+    fn apply_to_surface(&mut self, action: Action) -> Result<()> {
+        match action {
+            // The text is the only copy of what the reader wrote, so the way out of
+            // a buffer with typing in it asks first; an untouched one is not worth
+            // a question and goes at once.
+            Action::Unwind => match self.surface.as_ref().and_then(Surface::dirtied) {
+                Some(field) => {
+                    self.modal = Some(Modal::Dialog(Box::new(Dialog::discard(field.label))));
+                }
+                None => self.surface = None,
+            },
+            Action::Accept => self.accept()?,
+            Action::ExternalEditor => {
+                if let Some(surface) = &self.surface {
+                    self.editor_handoff = Some(surface.fields[surface.focus].value.clone());
+                }
+            }
+            // The key list is reachable from inside a field, which is what the help
+            // key that survives a text field is for: the list is a layer above the
+            // surface, so closing it leaves the buffer exactly as it was.
+            Action::ToggleHelp => self.modal = Some(Modal::Help),
+            _ => {
+                if let Some(surface) = &mut self.surface {
+                    surface.focused_mut().apply(action);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Accept the open surface: check the store has something to be given, then
+    /// write.
+    ///
+    /// The check is not a store rule reimplemented — what makes a value acceptable
+    /// is the store's judgement and its refusal is shown verbatim — it is the
+    /// browser refusing to send a field the reader never filled in, and saying
+    /// which field that is rather than which rule was broken.
+    fn accept(&mut self) -> Result<()> {
+        let Some(surface) = &self.surface else {
+            return Ok(());
+        };
+        if let Some(index) = surface.unfilled() {
+            let dialog = Dialog::required(surface.fields[index].label, index);
+            self.modal = Some(Modal::Dialog(Box::new(dialog)));
+            return Ok(());
+        }
+        let (write, done) = surface.write();
+        self.commit(&write, done)
+    }
+
+    /// The text an external editor has been asked to take, clearing the request.
+    ///
+    /// The loop that owns the terminal is the only caller: an editor needs the
+    /// alternate screen gone, raw mode off and mouse capture off, and none of those
+    /// are the state machine's to give.
+    pub fn take_editor_handoff(&mut self) -> Option<String> {
+        self.editor_handoff.take()
+    }
+
+    /// Take an external editor's result back into the field it came from.
+    ///
+    /// It counts as content the reader wrote, so the field is dirty afterwards and
+    /// the way out warns about it exactly as it does about typing.
+    pub fn editor_returned(&mut self, text: &str) {
+        if let Some(surface) = &mut self.surface {
+            surface.focused_mut().replace(text);
+        }
+    }
+
+    /// Report that the external editor could not run, keeping the buffer.
+    ///
+    /// A failed and costly thing is a dialog rather than a transient notice, and
+    /// the message is the failure's own: the browser cannot say more about somebody
+    /// else's editor than the system already did.
+    pub fn editor_failed(&mut self, message: String) {
+        self.modal = Some(Modal::Dialog(Box::new(Dialog::report(
+            EDITOR_TITLE,
+            message,
+            Dismissal {
+                word: "back to the field",
+                performs: None,
+            },
+        ))));
     }
 
     /// Carry out an intent while editing mode is on.
@@ -490,7 +1029,8 @@ impl App {
             // as unknown here as any key the mode never binds — and the offer that
             // decides it is the one the hint strip asked.
             _ => match EditingAction::for_intent(action).and_then(|a| self.offer(a)) {
-                Some(dialog) => self.modal = Some(Modal::Dialog(dialog)),
+                Some(Offer::Ask(dialog)) => self.modal = Some(Modal::Dialog(Box::new(dialog))),
+                Some(Offer::Fill(surface)) => self.surface = Some(surface),
                 None => self.flash(NOT_AN_EDITING_ACTION),
             },
         }
@@ -697,15 +1237,61 @@ mod tests {
         to_row(app, |kind| matches!(kind, RowKind::Work(_)));
     }
 
-    /// Stand on the first label of the epic's own labels level, which is where a
-    /// removal is offered.
-    fn to_a_label_row(app: &mut App) {
+    /// Walk back out to the epic roster, so a test that has been somewhere already
+    /// can still say where it goes next from the top.
+    fn to_the_roster(app: &mut App) {
+        while app.nav().crumbs().len() > 1 {
+            app.apply(Action::Ascend).unwrap();
+        }
+    }
+
+    /// Stand on the epic's own `labels` row, which is where an addition is
+    /// offered: creation acts on the container row the cursor stands on.
+    fn to_the_labels_row(app: &mut App) {
+        to_the_roster(app);
         app.apply(Action::Descend).unwrap(); // into the epic
         to_row(
             app,
             |kind| matches!(kind, RowKind::Collection(c) if c.name() == "labels"),
         );
+    }
+
+    /// Stand on the first label of the epic's own labels level, which is where a
+    /// removal is offered.
+    fn to_a_label_row(app: &mut App) {
+        to_the_labels_row(app);
         app.apply(Action::Descend).unwrap();
+    }
+
+    /// Open the label surface, the way a reader does: freeze the label set's row
+    /// and press the letter that adds a member to it.
+    fn open_the_label_surface(app: &mut App) {
+        to_the_labels_row(app);
+        app.apply(Action::EnterEditing).unwrap();
+        app.apply(Action::Add).unwrap();
+        assert!(app.surface().is_some(), "the add key opened no surface");
+    }
+
+    /// Type into the open field, one keystroke per character, as a reader does.
+    fn type_into(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.apply(Action::Insert(c)).unwrap();
+        }
+    }
+
+    /// What the open surface's focused field holds.
+    fn field_value(app: &App) -> String {
+        let surface = app.surface().expect("a surface is open");
+        surface.fields()[surface.focus()].value().to_string()
+    }
+
+    /// The answers the open dialog lists, as the float shows them: the key map's
+    /// letters carrying the dialog's own words.
+    fn listed_answers(app: &App) -> Vec<String> {
+        let Some(Modal::Dialog(dialog)) = app.modal() else {
+            panic!("no dialog is open: {:?}", app.modal())
+        };
+        keymap::dialog_answers(dialog.answers(), dialog.words())
     }
 
     /// The token the highlighted row is addressed by, which for a label row is
@@ -741,17 +1327,27 @@ mod tests {
             match hinted {
                 true => {
                     assert!(
-                        matches!(app.modal(), Some(Modal::Dialog(_))),
-                        "{action:?} is hinted but the key answers nothing"
+                        app.modal().is_some() || app.surface().is_some(),
+                        "{action:?} is hinted but the key opened nothing"
                     );
-                    // Back out of the question, leaving the mode standing.
+                    // Back out of what it opened, leaving the mode standing. An
+                    // untouched surface has nothing to lose, so it goes without a
+                    // question.
                     app.apply(Action::Unwind).unwrap();
+                    assert!(
+                        app.modal().is_none() && app.surface().is_none(),
+                        "{action:?} could not be backed out of"
+                    );
                 }
                 false => {
                     assert_eq!(
                         app.modal(),
                         None,
                         "{action:?} is not hinted but the key acted"
+                    );
+                    assert!(
+                        app.surface().is_none(),
+                        "{action:?} is not hinted but the key opened a surface"
                     );
                     assert_eq!(app.flash_message(), Some(NOT_AN_EDITING_ACTION));
                 }
@@ -1328,7 +1924,10 @@ mod tests {
         let refusal = data::perform(&fx.store, &data::Write::RemoveLabel(target))
             .expect_err("the store refuses a label removal on a missing entity")
             .to_string();
-        assert_eq!(app.modal(), Some(&Modal::Dialog(Dialog::refusal(refusal))));
+        assert_eq!(
+            app.modal(),
+            Some(&Modal::Dialog(Box::new(Dialog::refusal(refusal))))
+        );
         // Nothing is at stake in reading it, so it is dismissed rather than
         // answered — and a failure is never a transient notice.
         assert_eq!(app.mode(), Mode::Dialog(Answers::Acknowledge));
@@ -1377,6 +1976,513 @@ mod tests {
             assert!(!app.zoomed(), "{action:?} rearranged the screen");
         }
         assert!(fx.epic_labels().contains(&label), "something was written");
+    }
+
+    #[test]
+    fn the_add_key_opens_one_short_field_on_the_label_set_and_nowhere_else() {
+        let (fx, mut app) = app();
+        to_the_labels_row(&mut app);
+        app.apply(Action::EnterEditing).unwrap();
+        // The row offers the addition, and the strip lists exactly what it offers.
+        assert_eq!(app.editing_hints(), vec![hint_for(EditingAction::Add)]);
+        hints_and_keys_agree(&mut app);
+
+        app.apply(Action::Add).unwrap();
+        let surface = app.surface().expect("the letter opened a surface");
+        // One short field, empty and untouched: nothing the browser put there
+        // itself could be text the reader meant to write.
+        assert_eq!(surface.fields().len(), 1);
+        assert_eq!(surface.focus(), 0);
+        let field = &surface.fields()[0];
+        assert_eq!(field.value(), "");
+        assert!(!field.is_dirty());
+        // The float says what is being added and to what, since it covers the row
+        // it was opened from.
+        assert!(surface.title().contains(&fx.epic), "{:?}", surface.title());
+        // Every key now belongs to the field: the mode the keyboard is under is the
+        // only bridge from this state to the key table.
+        assert_eq!(app.mode(), Mode::Surface);
+        assert!(fx.epic_labels().iter().all(|l| !l.is_empty()));
+
+        // A row that is not a label set offers no addition: this surface writes a
+        // label, so the row that opens it can only be the row a label belongs to.
+        // Every other collection's member is a different shape of input, owned by
+        // whichever surface writes it.
+        app.apply(Action::Unwind).unwrap();
+        app.apply(Action::Unwind).unwrap();
+        to_a_label_row(&mut app);
+        app.apply(Action::EnterEditing).unwrap();
+        app.apply(Action::Add).unwrap();
+        assert!(app.surface().is_none(), "a label row offered an addition");
+        assert_eq!(app.flash_message(), Some(NOT_AN_EDITING_ACTION));
+        app.apply(Action::Unwind).unwrap();
+        app.apply(Action::Ascend).unwrap();
+
+        for other in ["comments", "blocked-by", "assets"] {
+            to_the_roster(&mut app);
+            app.apply(Action::Descend).unwrap(); // into the epic
+                                                 // `blocked-by` is a node's collection only, so it is reached one level
+                                                 // further in; the epic's own level carries the other two.
+            if other == "blocked-by" {
+                to_work_row(&mut app);
+                app.apply(Action::Descend).unwrap();
+            }
+            to_row(
+                &mut app,
+                |kind| matches!(kind, RowKind::Collection(c) if c.name() == other),
+            );
+            app.apply(Action::EnterEditing).unwrap();
+            app.apply(Action::Add).unwrap();
+            assert!(
+                app.surface().is_none(),
+                "the {other} row opened the label surface"
+            );
+            assert_eq!(app.flash_message(), Some(NOT_AN_EDITING_ACTION), "{other}");
+            assert!(app.editing_hints().is_empty(), "{other}");
+            app.apply(Action::Unwind).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_filled_field_is_written_says_what_it_did_and_ends_the_session() {
+        let (fx, mut app) = app();
+        let before = fx.epic_labels();
+        open_the_label_surface(&mut app);
+        type_into(&mut app, "a new label");
+
+        app.apply(Action::Accept).unwrap();
+
+        // Written once, exactly what was typed, and nothing else touched.
+        let mut expected = before;
+        expected.push("a new label".to_string());
+        assert_eq!(fx.epic_labels(), expected);
+        // A successful write ends the session, surface and all — the mode is one
+        // edit long — and says what it did, naming the label.
+        assert!(app.surface().is_none());
+        assert_eq!(app.editing_target(), None);
+        assert_eq!(app.mode(), Mode::Browse);
+        assert_eq!(app.modal(), None);
+        let notice = app.flash_message().expect("every write says what it did");
+        assert!(notice.contains("a new label"), "{notice:?}");
+        // The store was re-read: the level under the row the reader is standing on
+        // now holds one more member than it did.
+        let row = app.nav().frame().current().expect("a highlighted row");
+        assert_eq!(row.children, expected.len());
+    }
+
+    #[test]
+    fn an_empty_required_field_warns_naming_it_writes_nothing_and_lands_back_in_it() {
+        let (fx, mut app) = app();
+        let before = fx.epic_labels();
+        open_the_label_surface(&mut app);
+
+        // Accepting an empty required field warns instead of writing. It is not a
+        // store rule reimplemented: there is nothing to send, and the warning names
+        // which field, because the float names no columns.
+        app.apply(Action::Accept).unwrap();
+        let Some(Modal::Dialog(dialog)) = app.modal() else {
+            panic!(
+                "an empty required field wrote or said nothing: {:?}",
+                app.modal()
+            )
+        };
+        assert!(dialog.message().contains(LABEL_FIELD), "{dialog:?}");
+        assert!(dialog.message().contains("required"), "{dialog:?}");
+        // Nothing is being asked — there is nothing to go ahead with — so it is
+        // dismissed rather than answered.
+        assert_eq!(dialog.answers(), Answers::Acknowledge);
+        assert_eq!(fx.epic_labels(), before, "the warning wrote something");
+        // A failure the reader must act on is a dialog and never a notice.
+        assert_eq!(app.flash_message(), None);
+        // What dismissing does is on the dialog itself, so the float says it.
+        assert!(
+            listed_answers(&app).iter().any(|a| a.contains("field")),
+            "{:?}",
+            listed_answers(&app)
+        );
+
+        // The dialog carries where dismissal lands, and it is the field it named:
+        // that is what makes "warn, dismiss, type" a straight line rather than a
+        // hunt, and it is the mirror of what an affirmative answer carries.
+        let Some(Modal::Dialog(dialog)) = app.modal() else {
+            unreachable!("the warning is open")
+        };
+        assert_eq!(
+            dialog.dismissal.performs,
+            Some(OnDismissal::Focus(0)),
+            "the warning does not say where acknowledging lands"
+        );
+
+        // Acknowledging lands back in the offending field: the buffer was never
+        // what the warning was about, so typing the answer is a straight line.
+        app.apply(Action::Unwind).unwrap();
+        assert_eq!(app.modal(), None);
+        assert_eq!(app.mode(), Mode::Surface);
+        assert_eq!(app.surface().map(Surface::focus), Some(0));
+        type_into(&mut app, "ui-2");
+        assert_eq!(field_value(&app), "ui-2");
+
+        // A field holding only whitespace is empty too: a reader cannot tell it
+        // from a blank one, so writing something invisible would be worse.
+        app.apply(Action::MoveToStart).unwrap();
+        for _ in 0.."ui-2".len() {
+            app.apply(Action::DeleteAfter).unwrap();
+        }
+        type_into(&mut app, "   ");
+        app.apply(Action::Accept).unwrap();
+        assert!(matches!(app.modal(), Some(Modal::Dialog(_))));
+        assert_eq!(fx.epic_labels(), before);
+    }
+
+    #[test]
+    fn the_way_out_of_a_clean_field_cancels_at_once_and_of_a_dirty_one_asks_first() {
+        let (fx, mut app) = app();
+        let before = fx.epic_labels();
+        open_the_label_surface(&mut app);
+
+        // An untouched surface has nothing to lose, so the way out is silent — and
+        // it unwinds one layer: the mode stays on its frozen row.
+        app.apply(Action::Unwind).unwrap();
+        assert!(app.surface().is_none());
+        assert_eq!(app.modal(), None);
+        assert_eq!(app.mode(), Mode::Editing);
+        assert_eq!(app.flash_message(), None, "nothing happened worth saying");
+
+        // With typing in it, the way out asks: the text is the only copy of what
+        // the reader wrote.
+        app.apply(Action::Add).unwrap();
+        type_into(&mut app, "half a thought");
+        app.apply(Action::Unwind).unwrap();
+        let Some(Modal::Dialog(dialog)) = app.modal() else {
+            panic!("a dirty field was thrown away unasked: {:?}", app.modal())
+        };
+        assert!(dialog.message().contains("Discard"), "{dialog:?}");
+        assert!(dialog.message().contains(LABEL_FIELD), "{dialog:?}");
+        assert_eq!(dialog.answers(), Answers::Destructive);
+
+        // The answer that is never destructive lands back in the buffer, with the
+        // text exactly as it was: a warning is not a way of losing it.
+        app.apply(Action::Unwind).unwrap();
+        assert_eq!(app.modal(), None);
+        assert_eq!(field_value(&app), "half a thought");
+        assert_eq!(app.mode(), Mode::Surface);
+
+        // The destructive letter throws the buffer away, and only the buffer: the
+        // mode stays on the row, and nothing reached the store.
+        app.apply(Action::Unwind).unwrap();
+        app.apply(Action::Delete).unwrap();
+        assert!(app.surface().is_none());
+        assert_eq!(app.modal(), None);
+        assert_eq!(app.mode(), Mode::Editing);
+        assert_eq!(fx.epic_labels(), before, "discarding wrote something");
+    }
+
+    #[test]
+    fn dirty_is_a_sticky_flag_and_never_a_comparison() {
+        let (_fx, mut app) = app();
+
+        // Cursor motion never dirties a field, whatever it does to the cursor:
+        // moving is not writing, so the way out stays silent.
+        open_the_label_surface(&mut app);
+        for action in [
+            Action::MoveRight,
+            Action::MoveLeft,
+            Action::MoveToEnd,
+            Action::MoveToStart,
+        ] {
+            app.apply(action).unwrap();
+            assert!(
+                !app.surface().unwrap().fields()[0].is_dirty(),
+                "{action:?} dirtied a field it did not write to"
+            );
+        }
+        // And a cursor cannot be moved off the end of what the field holds: what is
+        // to the right of the last character is not a position to type at.
+        for _ in 0..3 {
+            app.apply(Action::MoveRight).unwrap();
+        }
+        assert_eq!(app.surface().unwrap().fields()[0].cursor(), 0);
+        type_into(&mut app, "ab");
+        for _ in 0..3 {
+            app.apply(Action::MoveRight).unwrap();
+        }
+        assert_eq!(app.surface().unwrap().fields()[0].cursor(), 2);
+        app.apply(Action::MoveToStart).unwrap();
+        for _ in 0..3 {
+            app.apply(Action::MoveLeft).unwrap();
+        }
+        assert_eq!(app.surface().unwrap().fields()[0].cursor(), 0);
+
+        // Back to a field nothing was typed into, which is what the way out is
+        // silent about.
+        app.apply(Action::Unwind).unwrap();
+        app.apply(Action::Delete).unwrap();
+        app.apply(Action::Add).unwrap();
+        app.apply(Action::Unwind).unwrap();
+        assert!(app.surface().is_none(), "a clean field asked a question");
+
+        // Typing and then deleting it all again leaves the field dirty: the flag is
+        // sticky and is never compared against what the field started from. So the
+        // way out warns about a field that would lose nothing, which is accepted —
+        // a spurious warning is cheap.
+        app.apply(Action::Add).unwrap();
+        type_into(&mut app, "x");
+        app.apply(Action::DeleteBefore).unwrap();
+        assert_eq!(field_value(&app), "");
+        assert!(app.surface().unwrap().fields()[0].is_dirty());
+        app.apply(Action::Unwind).unwrap();
+        assert!(
+            matches!(app.modal(), Some(Modal::Dialog(_))),
+            "a deletion cleared the flag typing set"
+        );
+        app.apply(Action::Unwind).unwrap();
+
+        // And a deleting keystroke with nothing to delete dirties it too: what is
+        // recorded is that the reader pressed a key that writes, not that anything
+        // came out different.
+        app.apply(Action::Unwind).unwrap();
+        app.apply(Action::Delete).unwrap();
+        app.apply(Action::Add).unwrap();
+        app.apply(Action::DeleteBefore).unwrap();
+        assert!(app.surface().unwrap().fields()[0].is_dirty());
+    }
+
+    #[test]
+    fn two_dialogs_share_the_destructive_letter_and_word_it_for_themselves() {
+        let (_fx, mut app) = app();
+        // The letter that removes a label and the letter that throws a buffer away
+        // are one key, learned once — and mean different things, so the words are
+        // the dialog's own rather than the answer set's.
+        to_a_label_row(&mut app);
+        app.apply(Action::EnterEditing).unwrap();
+        app.apply(Action::Delete).unwrap();
+        let removing = listed_answers(&app);
+        app.apply(Action::Unwind).unwrap();
+        app.apply(Action::Unwind).unwrap();
+        app.apply(Action::Ascend).unwrap();
+
+        open_the_label_surface(&mut app);
+        type_into(&mut app, "x");
+        app.apply(Action::Unwind).unwrap();
+        let discarding = listed_answers(&app);
+
+        let letters = |answers: &[String]| -> Vec<String> {
+            answers
+                .iter()
+                .map(|a| a.split_whitespace().next().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(letters(&removing), letters(&discarding));
+        assert_ne!(removing, discarding);
+        assert!(
+            discarding.iter().any(|a| a.contains("discard")),
+            "{discarding:?}"
+        );
+        assert!(
+            removing.iter().any(|a| a.contains("remove")),
+            "{removing:?}"
+        );
+    }
+
+    #[test]
+    fn the_external_editor_is_handed_the_field_and_its_result_comes_back_as_one_line() {
+        let (_fx, mut app) = app();
+        open_the_label_surface(&mut app);
+        type_into(&mut app, "a start");
+
+        // The browser cannot run an editor itself — the editor needs the terminal —
+        // so the field's content is left for the loop that owns it to hand over.
+        app.apply(Action::ExternalEditor).unwrap();
+        assert_eq!(app.take_editor_handoff().as_deref(), Some("a start"));
+        // Taken once: a request honoured twice would open two editors.
+        assert_eq!(app.take_editor_handoff(), None);
+
+        // The field holds one line, so the editor's line breaks are dropped rather
+        // than turned into spaces — a space is content the reader did not write.
+        app.editor_returned("first\nsecond\r\n");
+        assert_eq!(field_value(&app), "firstsecond");
+        // Coming back from the editor counts as writing, so the way out warns about
+        // it exactly as it does about typing.
+        assert!(app.surface().unwrap().fields()[0].is_dirty());
+        // The cursor is left where the text ends, which is where typing continues.
+        assert_eq!(
+            app.surface().unwrap().fields()[0].cursor(),
+            "firstsecond".chars().count()
+        );
+
+        // An editor that cannot be run is a failure, so it is a dialog rather than a
+        // notice — and the buffer is kept: it is still the reader's only copy.
+        app.editor_failed("no editor is set".into());
+        let Some(Modal::Dialog(dialog)) = app.modal() else {
+            panic!("a failed editor said nothing: {:?}", app.modal())
+        };
+        assert!(dialog.message().contains("no editor is set"), "{dialog:?}");
+        assert_eq!(dialog.answers(), Answers::Acknowledge);
+        assert_eq!(app.flash_message(), None);
+        app.apply(Action::Unwind).unwrap();
+        assert_eq!(field_value(&app), "firstsecond");
+    }
+
+    #[test]
+    fn a_field_nothing_was_typed_into_is_dirty_once_the_editor_has_written_it() {
+        let (fx, mut app) = app();
+        let before = fx.epic_labels();
+        open_the_label_surface(&mut app);
+
+        // Straight out to the editor from an untouched field, so the return is the
+        // only thing that can have dirtied it — and it is the one path where the
+        // reader's whole text exists nowhere else.
+        app.apply(Action::ExternalEditor).unwrap();
+        assert_eq!(app.take_editor_handoff().as_deref(), Some(""));
+        app.editor_returned("written in the editor");
+        assert!(app.surface().unwrap().fields()[0].is_dirty());
+
+        // So the way out asks instead of throwing it away silently.
+        app.apply(Action::Unwind).unwrap();
+        let Some(Modal::Dialog(dialog)) = app.modal() else {
+            panic!(
+                "what the editor wrote was thrown away unasked: {:?}",
+                app.modal()
+            )
+        };
+        assert!(dialog.message().contains(LABEL_FIELD), "{dialog:?}");
+        assert_eq!(dialog.answers(), Answers::Destructive);
+
+        // And the answer that is never destructive lands back on the text intact.
+        app.apply(Action::Unwind).unwrap();
+        assert_eq!(field_value(&app), "written in the editor");
+        assert_eq!(app.mode(), Mode::Surface);
+        assert_eq!(fx.epic_labels(), before, "the round-trip wrote something");
+    }
+
+    #[test]
+    fn a_refused_addition_keeps_the_buffer_and_the_session() {
+        let (fx, mut app) = app();
+        open_the_label_surface(&mut app);
+        type_into(&mut app, "never written");
+
+        // Only the store can judge a write, so the browser offers the action and
+        // shows what comes back: here the entity goes between offer and accept.
+        fx.remove_the_epics_file();
+        app.apply(Action::Accept).unwrap();
+
+        let Some(Modal::Dialog(dialog)) = app.modal() else {
+            panic!("a refusal was swallowed: {:?}", app.modal())
+        };
+        assert_eq!(dialog.answers(), Answers::Acknowledge);
+        assert_eq!(dialog.title(), REFUSAL_TITLE);
+
+        // A refused save keeps everything: the buffer with its text, and the
+        // session — only a successful write ends it. So the reader can fix what
+        // they wrote, or carry it out through the external editor.
+        app.apply(Action::Unwind).unwrap();
+        assert_eq!(app.modal(), None);
+        assert_eq!(field_value(&app), "never written");
+        assert_eq!(app.mode(), Mode::Surface);
+        assert!(app.editing_target().is_some());
+    }
+
+    #[test]
+    fn an_open_surface_takes_every_key_and_lets_none_reach_what_is_under_it() {
+        let (_fx, mut app) = app();
+        open_the_label_surface(&mut app);
+        type_into(&mut app, "held");
+        let (cursor, crumbs) = (app.nav().cursor(), app.nav().crumbs().join("/"));
+
+        // No key typed into a field can move, reload, zoom or end the session. The
+        // key map admits none of these here, but a mouse wheel reaches the state
+        // machine without passing the key map at all.
+        for action in [
+            Action::Quit,
+            Action::CursorDown,
+            Action::CursorUp,
+            Action::Descend,
+            Action::Ascend,
+            Action::Reload,
+            Action::ToggleZoom,
+            Action::EnterEditing,
+            Action::Delete,
+            Action::Add,
+        ] {
+            assert!(!app.apply(action).unwrap(), "{action:?} left the browser");
+            assert_eq!(app.nav().cursor(), cursor, "{action:?} moved the cursor");
+            assert_eq!(
+                app.nav().crumbs().join("/"),
+                crumbs,
+                "{action:?} changed the level"
+            );
+            assert!(!app.zoomed(), "{action:?} rearranged the screen");
+            assert_eq!(app.modal(), None, "{action:?} raised something");
+            assert_eq!(field_value(&app), "held", "{action:?} changed the field");
+        }
+    }
+
+    #[test]
+    fn the_key_list_is_reachable_from_a_field_and_closing_it_leaves_the_buffer() {
+        let (_fx, mut app) = app();
+        open_the_label_surface(&mut app);
+        type_into(&mut app, "kept");
+
+        // Inside a field `?` is a character, so the key list has its own key there;
+        // it is a layer above the buffer, not a way out of it.
+        app.apply(Action::ToggleHelp).unwrap();
+        assert_eq!(app.modal(), Some(&Modal::Help));
+        assert_eq!(app.mode(), Mode::Surface);
+
+        // One layer at a time: the overlay goes and the buffer stays, text and all.
+        app.apply(Action::Unwind).unwrap();
+        assert_eq!(app.modal(), None);
+        assert_eq!(field_value(&app), "kept");
+        assert_eq!(app.mode(), Mode::Surface);
+    }
+
+    #[test]
+    fn every_dialog_the_browser_raises_words_the_answers_its_set_admits() {
+        // A dialog's affirmative word exists exactly when there is an answer to
+        // word: a set that binds a letter with nothing to call it would list a key
+        // the reader cannot use, and a word with no key behind it teaches a key that
+        // does nothing.
+        let dialogs = [
+            Dialog::confirm(
+                "Remove label ui?".into(),
+                "remove",
+                Performs::Write {
+                    write: data::Write::RemoveLabel(Selection::Label(
+                        data::Container::Epic("e".into()),
+                        "ui".into(),
+                    )),
+                    done: "label ui removed".into(),
+                },
+                "cancel",
+            ),
+            Dialog::discard(LABEL_FIELD),
+            Dialog::required(LABEL_FIELD, 0),
+            Dialog::refusal("the store said no".into()),
+        ];
+        for dialog in dialogs {
+            let words = dialog.words();
+            assert_eq!(
+                words.affirmative.is_some(),
+                dialog.answers() == Answers::Destructive,
+                "{dialog:?}"
+            );
+            assert!(!words.dismissal.is_empty(), "{dialog:?} has no way out");
+            let listed = keymap::dialog_answers(dialog.answers(), words);
+            assert!(!listed.is_empty(), "{dialog:?} lists no answer");
+            for answer in &listed {
+                // Nothing a dialog lists spells out its own key: the letters come
+                // from the key map and the words from the dialog.
+                let word = answer
+                    .split_whitespace()
+                    .skip(1)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert!(
+                    !word.is_empty(),
+                    "{answer:?} is a key with nothing to call it"
+                );
+            }
+        }
     }
 
     #[test]
