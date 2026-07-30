@@ -1,10 +1,25 @@
 //! Every user intent the browser can carry out, named independently of the keys
 //! that trigger it.
 //!
-//! Invariant: this enum is the only vocabulary the application state
+//! Invariant: [`Action`] is the only vocabulary the application state
 //! understands. A new capability is a new variant plus one binding in
 //! [`crate::keymap`]; a rebinding touches the keymap alone. Nothing here knows
 //! about key codes, and nothing in the state machine matches on a key.
+
+/// Which set of bindings is live, because one key may carry a different intent
+/// in each mode.
+///
+/// Invariant: a mode is an input to the key-to-intent mapping and is derived from
+/// the application state, never from a key — so the mapping stays the only place
+/// a key is named, and the state machine stays the only place an intent is
+/// interpreted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Browsing the store: the cursor moves and every browse binding is live.
+    Browse,
+    /// Editing mode, with the selection frozen on one row.
+    Editing,
+}
 
 /// A resolved user intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +36,13 @@ pub enum Action {
     Descend,
     /// Leave the current level for its parent.
     Ascend,
+    /// Back out of the innermost thing the reader is inside: an open overlay,
+    /// then editing mode, then the level.
+    ///
+    /// Distinct from [`Action::Ascend`] because editing mode has to tell the way
+    /// out from a level key: while the mode is on the level cannot change, and
+    /// the one key that unwinds must not be one of several that look like it.
+    Unwind,
     /// Scroll the preview down half a screen.
     PreviewHalfDown,
     /// Scroll the preview up half a screen.
@@ -43,6 +65,8 @@ pub enum Action {
     ToggleZoom,
     /// Re-read the store.
     Reload,
+    /// Enter editing mode on the highlighted row.
+    EnterEditing,
     /// Toggle the key-binding overlay.
     ToggleHelp,
     /// Leave the browser.

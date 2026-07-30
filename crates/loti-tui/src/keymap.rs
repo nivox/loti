@@ -2,20 +2,34 @@
 //!
 //! The two panes never compete for a key, so there is no focus to switch: the
 //! navigation cursor owns the plain motion keys and the preview owns the paging
-//! keys. `Esc` leaves a level rather than the application, so a mis-hit while
-//! browsing can never discard the session; `q` is the only way out.
+//! keys. `Esc` unwinds one layer of where the reader is standing rather than
+//! leaving the application, so a mis-hit can never discard the session; `q` is
+//! the way out of the browser, and it is not a key any mode borrows.
+//!
+//! One key may carry different intents in different modes, but never two intents
+//! in the same mode: a binding maps to one intent here, and the state machine
+//! decides what that intent means where the reader is standing.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::action::Action;
+use crate::action::{Action, Mode};
 
-/// The intent a key press carries, or `None` if it is not bound.
-pub fn action_for(key: KeyEvent) -> Option<Action> {
+/// The intent a key press carries in a mode, or `None` if it is not bound there.
+pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     Some(match (key.code, ctrl) {
-        // Quitting. Raw mode delivers Ctrl-C as a key press rather than a
-        // signal, so it has to be bound explicitly to be honoured at all.
-        (KeyCode::Char('q'), false) | (KeyCode::Char('c'), true) => Action::Quit,
+        // Quitting. `q` is the way out of the browser and no mode borrows it.
+        (KeyCode::Char('q'), false) => Action::Quit,
+
+        // Raw mode delivers Ctrl-C as a key press rather than a signal, so it
+        // has to be bound explicitly to be honoured at all. Inside editing mode
+        // it is the same key as `Esc` — the conventional way to abandon what you
+        // are in — so it ends the session while browsing only, which is the safe
+        // direction for a key a habit presses.
+        (KeyCode::Char('c'), true) => match mode {
+            Mode::Browse => Action::Quit,
+            Mode::Editing => Action::Unwind,
+        },
 
         // Preview paging. Bound before the plain motions so Ctrl-D/Ctrl-U are
         // not shadowed by any character binding.
@@ -34,10 +48,13 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
         (KeyCode::Enter, _) | (KeyCode::Char('l'), false) | (KeyCode::Right, false) => {
             Action::Descend
         }
-        (KeyCode::Backspace, _)
-        | (KeyCode::Esc, _)
-        | (KeyCode::Char('h'), false)
-        | (KeyCode::Left, false) => Action::Ascend,
+        // `Esc` unwinds one layer at a time, which is not what a level key does:
+        // while editing mode is on the level cannot change, so the level keys do
+        // nothing there and `Esc` alone is still the way out.
+        (KeyCode::Esc, _) => Action::Unwind,
+        (KeyCode::Backspace, _) | (KeyCode::Char('h'), false) | (KeyCode::Left, false) => {
+            Action::Ascend
+        }
 
         // Layout.
         (KeyCode::Char('<'), false) => Action::ShrinkNav,
@@ -46,6 +63,7 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
         (KeyCode::Char('z'), false) => Action::ToggleZoom,
 
         // Session.
+        (KeyCode::Char('e'), false) => Action::EnterEditing,
         (KeyCode::Char('r'), false) => Action::Reload,
         (KeyCode::Char('?'), false) => Action::ToggleHelp,
 
@@ -62,12 +80,14 @@ pub const HELP: &[(&str, &str)] = &[
         "Enter / l / →",
         "open the row (nothing if it has nothing below)",
     ),
-    ("Backspace / Esc / h / ←", "leave the level"),
+    ("Backspace / h / ←", "leave the level"),
+    ("Esc", "leave the level, or editing mode while it is on"),
     ("Ctrl-D / Ctrl-U", "scroll the preview half a screen"),
     ("PgDn / PgUp / Space", "scroll the preview a screen"),
     ("Home / End", "preview start / end"),
     ("< / > / =", "narrow / widen / reset the panes"),
     ("z", "preview fills the width; mouse released"),
+    ("e", "editing mode, on the highlighted row"),
     ("r", "re-read the store"),
     ("?", "these keys"),
     ("q", "quit"),
@@ -86,9 +106,27 @@ pub const FOOTER_HINTS: &[&str] = &[
     "r reload",
 ];
 
-/// The hints that survive any width: the overlay is how every other binding is
-/// discovered, and quitting must never be a hint the reader has to guess.
-pub const FOOTER_ESSENTIAL: &[&str] = &["? keys", "q quit"];
+/// The pair the strip always appends, in rank order: how to get out of where you
+/// are, then how to get help.
+///
+/// The way out comes first because a width too narrow for the pair clips the
+/// tail: a reader who cannot see how to get help can still leave, widen the
+/// terminal or read the docs, while a reader who cannot see how to leave is stuck
+/// inside the application.
+pub const FOOTER_ESSENTIAL: &[&str] = &["q quit", "? keys"];
+
+/// The droppable hints of editing mode: the actions the frozen row offers, in
+/// this map's own order rather than reordered per row.
+///
+/// Empty while the mode carries no action at all: an action slice adds its own
+/// hint here, so the strip only ever lists what the row can really do.
+pub const FOOTER_HINTS_EDITING: &[&str] = &[];
+
+/// Editing mode's essential pair. Neither browse hint applies — `q` does not quit
+/// while the mode is on, and the way out of the mode is not the way out of a
+/// level — so without a pair of its own a narrow terminal would show a mode with
+/// no visible way out of it.
+pub const FOOTER_ESSENTIAL_EDITING: &[&str] = &["Esc leave", "? keys"];
 
 /// The separator between hints.
 pub const HINT_SEPARATOR: &str = " · ";
@@ -106,29 +144,89 @@ mod tests {
     }
 
     #[test]
-    fn escape_leaves_a_level_and_never_the_application() {
-        assert_eq!(action_for(plain(KeyCode::Esc)), Some(Action::Ascend));
-        assert_eq!(action_for(plain(KeyCode::Char('q'))), Some(Action::Quit));
+    fn escape_carries_its_own_intent_and_never_the_way_out_of_the_application() {
+        // What that intent does with a level is the state machine's, and is
+        // pinned there; here it is only that the two are not the same binding.
+        for mode in [Mode::Browse, Mode::Editing] {
+            assert_eq!(action_for(plain(KeyCode::Esc), mode), Some(Action::Unwind));
+            assert_eq!(
+                action_for(plain(KeyCode::Char('q')), mode),
+                Some(Action::Quit)
+            );
+        }
     }
 
     #[test]
-    fn ctrl_c_quits_because_raw_mode_delivers_it_as_a_key() {
-        assert_eq!(action_for(ctrl('c')), Some(Action::Quit));
+    fn the_way_out_is_not_one_of_the_level_keys() {
+        // Editing mode leaves the level keys with nothing to do and keeps `Esc`
+        // as its way out, so the two intents cannot share a binding.
+        for code in [KeyCode::Backspace, KeyCode::Char('h'), KeyCode::Left] {
+            assert_eq!(action_for(plain(code), Mode::Browse), Some(Action::Ascend));
+        }
+        assert_eq!(
+            action_for(plain(KeyCode::Esc), Mode::Browse),
+            Some(Action::Unwind)
+        );
+    }
+
+    #[test]
+    fn editing_mode_is_entered_by_its_own_key() {
+        assert_eq!(
+            action_for(plain(KeyCode::Char('e')), Mode::Browse),
+            Some(Action::EnterEditing)
+        );
+    }
+
+    #[test]
+    fn every_essential_pair_says_the_way_out_before_it_says_help() {
+        for essential in [FOOTER_ESSENTIAL, FOOTER_ESSENTIAL_EDITING] {
+            // Clipping eats the tail, so the rank is the order: the way out
+            // first, help second.
+            assert_eq!(essential.len(), 2);
+            assert!(essential[1].contains('?'), "{essential:?}");
+        }
+        // And the way out of a mode is not the way out of the browser.
+        assert_ne!(FOOTER_ESSENTIAL[0], FOOTER_ESSENTIAL_EDITING[0]);
+    }
+
+    #[test]
+    fn ctrl_c_is_the_way_out_of_a_mode_and_quits_while_browsing_only() {
+        // Raw mode delivers it as a key rather than a signal, so what it means is
+        // this map's decision: inside editing mode it is the same key as `Esc`,
+        // and only outside one does it end the session.
+        assert_eq!(action_for(ctrl('c'), Mode::Browse), Some(Action::Quit));
+        assert_eq!(action_for(ctrl('c'), Mode::Editing), Some(Action::Unwind));
+        assert_eq!(
+            action_for(ctrl('c'), Mode::Editing),
+            action_for(plain(KeyCode::Esc), Mode::Editing),
+            "inside a mode Ctrl-C is exactly Esc"
+        );
     }
 
     #[test]
     fn preview_paging_is_not_shadowed_by_the_plain_motions() {
-        assert_eq!(action_for(ctrl('d')), Some(Action::PreviewHalfDown));
-        assert_eq!(action_for(ctrl('u')), Some(Action::PreviewHalfUp));
         assert_eq!(
-            action_for(plain(KeyCode::Char('j'))),
+            action_for(ctrl('d'), Mode::Browse),
+            Some(Action::PreviewHalfDown)
+        );
+        assert_eq!(
+            action_for(ctrl('u'), Mode::Browse),
+            Some(Action::PreviewHalfUp)
+        );
+        assert_eq!(
+            action_for(plain(KeyCode::Char('j')), Mode::Browse),
             Some(Action::CursorDown)
         );
     }
 
     #[test]
     fn unbound_keys_are_ignored() {
-        assert_eq!(action_for(plain(KeyCode::Char('x'))), None);
-        assert_eq!(action_for(plain(KeyCode::F(5))), None);
+        // A mode chooses which intent a bound key carries, never whether it is
+        // bound at all: an unbound key is unbound in every mode, so no mode can
+        // smuggle in a binding of its own.
+        for mode in [Mode::Browse, Mode::Editing] {
+            assert_eq!(action_for(plain(KeyCode::Char('x')), mode), None);
+            assert_eq!(action_for(plain(KeyCode::F(5)), mode), None);
+        }
     }
 }

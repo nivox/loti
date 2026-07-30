@@ -113,7 +113,11 @@ fn frame_lines(terminal: &Terminal<TestBackend>) -> Vec<String> {
 }
 
 fn draw(app: &mut App) -> (Terminal<TestBackend>, Vec<String>) {
-    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    draw_at(app, 100, 24)
+}
+
+fn draw_at(app: &mut App, width: u16, height: u16) -> (Terminal<TestBackend>, Vec<String>) {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal.draw(|f| ui::draw(f, app)).unwrap();
     let lines = frame_lines(&terminal);
     (terminal, lines)
@@ -335,6 +339,147 @@ fn a_flash_is_not_painted_like_the_hints_it_covers() {
         flash_fg, hint_fg,
         "a notice in the hint colour reads as a binding"
     );
+}
+
+#[test]
+fn editing_mode_names_itself_on_the_breadcrumb_line_and_stops_when_it_is_left() {
+    let (_dir, store) = fixture();
+    // Colour disabled: the mode has to be readable from the words alone.
+    let mut app = App::new(store, Theme::with_color(false)).unwrap();
+    app.apply(Action::EnterEditing).unwrap();
+    let (terminal, lines) = draw(&mut app);
+
+    // The marker holds the right-hand end of the line and the breadcrumb keeps
+    // the left, so the two never compete for the same columns.
+    assert!(lines[0].contains("EDITING"), "{:?}", lines[0]);
+    assert!(
+        lines[0].ends_with("EDITING \u{2500}\u{2500}"),
+        "{:?}",
+        lines[0]
+    );
+    assert!(lines[0].starts_with(" epics"), "{:?}", lines[0]);
+    // Pinned from the raw buffer, because the lines above are trimmed: a centred
+    // marker would end with the same characters and read as right-aligned here.
+    let buffer = terminal.backend().buffer();
+    let last_painted = (0..buffer.area.width)
+        .filter(|x| buffer[(*x, 0)].symbol() != " ")
+        .max()
+        .expect("the line is not blank");
+    assert_eq!(
+        last_painted,
+        buffer.area.width - 1,
+        "the marker has to reach the right-hand end of the line"
+    );
+
+    app.apply(Action::Unwind).unwrap();
+    let (_t, browsing) = draw(&mut app);
+    assert!(!browsing[0].contains("EDITING"), "{:?}", browsing[0]);
+}
+
+#[test]
+fn a_narrow_line_elides_the_breadcrumb_rather_than_the_mode_it_is_in() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store, Theme::with_color(false)).unwrap();
+    app.apply(Action::Descend).unwrap(); // into the epic
+    to_work_row(&mut app);
+    app.apply(Action::Descend).unwrap(); // into the ticket
+    app.apply(Action::EnterEditing).unwrap();
+    let (_t, lines) = draw_at(&mut app, 40, 12);
+
+    // A fact about the whole session must not be what a narrow terminal drops:
+    // the path is elided from the left instead, keeping the level you are in.
+    assert!(
+        lines[0].contains("\u{2500}\u{2500} EDITING \u{2500}\u{2500}"),
+        "{:?}",
+        lines[0]
+    );
+    assert!(lines[0].contains('\u{2026}'), "{:?}", lines[0]);
+    assert!(lines[0].chars().count() <= 40, "{:?}", lines[0]);
+}
+
+#[test]
+fn the_frozen_row_is_barred_and_at_contrast_while_every_other_row_dims() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store, Theme::with_color(true)).unwrap();
+    app.apply(Action::Descend).unwrap(); // into the epic
+    to_work_row(&mut app);
+    app.apply(Action::EnterEditing).unwrap();
+    let width = nav_pane_width(&app);
+    let (terminal, _) = draw(&mut app);
+
+    // The frozen row: a gutter bar, no dimming, and none of the inversion a
+    // browsed level uses — the pane has stopped being a list being browsed.
+    let target = row_cells(&terminal, "Navigation pane", width);
+    assert_eq!(target[0].0, "\u{258c}");
+    assert!(target.iter().all(|(_, style)| {
+        !style.add_modifier.contains(Modifier::DIM)
+            && !style.add_modifier.contains(Modifier::REVERSED)
+    }));
+
+    // Every other row is disabled: the selection cannot move to it.
+    for other in ["Preview pane", "labels", "comments"] {
+        let cells = row_cells(&terminal, other, width);
+        assert_ne!(cells[0].0, "\u{258c}", "{other} took the bar");
+        assert!(
+            cells
+                .iter()
+                .any(|(_, style)| style.add_modifier.contains(Modifier::DIM)),
+            "{other} does not read as disabled"
+        );
+    }
+}
+
+#[test]
+fn the_navigation_pane_is_framed_in_the_modes_own_colour_while_it_is_on() {
+    let (_dir, store) = fixture();
+    let theme = Theme::with_color(true);
+    let mut app = App::new(store, theme).unwrap();
+    let (browsing, _) = draw(&mut app);
+    // The pane's own top-left corner, on the first line of the body.
+    let corner = |terminal: &Terminal<TestBackend>| terminal.backend().buffer()[(0, 1)].style().fg;
+    assert_eq!(corner(&browsing), Some(theme.muted()));
+
+    app.apply(Action::EnterEditing).unwrap();
+    let (editing, _) = draw(&mut app);
+    // The same colour the indicator is painted in, so the marker and the framed
+    // pane read as one fact rather than two.
+    assert_eq!(corner(&editing), Some(theme.notice()));
+}
+
+#[test]
+fn the_strip_offers_the_modes_own_keys_and_not_the_levels() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store, Theme::with_color(false)).unwrap();
+    app.apply(Action::EnterEditing).unwrap();
+    let (_t, lines) = draw(&mut app);
+
+    // The way out of the mode, first, and help beside it. Neither browse hint
+    // applies: `q` does not quit while the mode is on.
+    assert!(lines[23].contains("Esc leave"), "{:?}", lines[23]);
+    assert!(lines[23].contains("? keys"), "{:?}", lines[23]);
+    assert!(!lines[23].contains("q quit"), "{:?}", lines[23]);
+    assert!(!lines[23].contains("j/k move"), "{:?}", lines[23]);
+}
+
+#[test]
+fn a_key_the_mode_ignores_says_how_to_leave_it_on_the_strips_line() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store, Theme::with_color(false)).unwrap();
+    app.apply(Action::EnterEditing).unwrap();
+    app.apply(Action::CursorDown).unwrap();
+    let (_t, lines) = draw(&mut app);
+
+    // A notice covers the strip, so it has to carry the way out itself. Matched
+    // on the notice's own wording: the essential hint the strip would show
+    // instead says `Esc` too, so `Esc` alone would pass with no notice at all.
+    assert!(
+        lines[23].contains("not an editing action"),
+        "{:?}",
+        lines[23]
+    );
+    assert!(lines[23].contains("Esc"), "{:?}", lines[23]);
+    // And the mode is still on: an ignored key is not an implicit exit.
+    assert!(lines[0].contains("EDITING"), "{:?}", lines[0]);
 }
 
 /// A store whose epics cover every epic state: open, completed and closed.

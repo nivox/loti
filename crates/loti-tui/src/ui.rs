@@ -23,6 +23,16 @@ const CRUMB_SEPARATOR: &str = " › ";
 /// The rule drawn between a level's collection rows and its work rows.
 const STRUCTURE_RULE: &str = "─";
 
+/// What the breadcrumb line's right-hand slot says while editing mode is on. A
+/// word rather than a colour, because a mode that only a hue announced would be
+/// invisible with colour disabled.
+const EDITING_INDICATOR: &str = "── EDITING ──";
+
+/// The bar drawn in the gutter of editing mode's frozen row. A shape, so the row
+/// being acted on is identifiable with colour disabled, where dimming the others
+/// carries nothing.
+const GUTTER_BAR: &str = "▌";
+
 /// Draw one frame.
 pub fn draw(f: &mut Frame, app: &mut App) {
     let theme = app.theme();
@@ -94,6 +104,9 @@ fn area_text_width(width: u16) -> usize {
 /// seconds and a notice's own wording has to carry the way out where that
 /// matters. It is painted in the notice colour, so it reads as a message rather
 /// than as one more binding.
+///
+/// The strip is the keys that apply right now, so each mode brings its own: while
+/// editing, neither the level's keys nor `q` are among them.
 fn footer(app: &App, width: u16) -> Span<'static> {
     let theme = app.theme();
     let columns = area_text_width(width);
@@ -102,20 +115,32 @@ fn footer(app: &App, width: u16) -> Span<'static> {
             format!(" {}", truncate(message, columns)),
             Style::default().fg(theme.notice()),
         ),
-        None => Span::styled(
-            format!(" {}", hint_strip(columns)),
-            Style::default().fg(theme.muted()),
-        ),
+        None => {
+            let (hints, essential) = match app.editing_target().is_some() {
+                true => (
+                    keymap::FOOTER_HINTS_EDITING,
+                    keymap::FOOTER_ESSENTIAL_EDITING,
+                ),
+                false => (keymap::FOOTER_HINTS, keymap::FOOTER_ESSENTIAL),
+            };
+            Span::styled(
+                format!(" {}", hint_strip(columns, hints, essential)),
+                Style::default().fg(theme.muted()),
+            )
+        }
     }
 }
 
-/// Build the hint strip for a width: as many hints as fit, whole, never a hint
-/// cut in half. The overlay and quit hints are kept whatever the width, since
-/// they are how a reader finds every other binding and how they leave.
-fn hint_strip(width: usize) -> String {
-    let essential = keymap::FOOTER_ESSENTIAL.join(keymap::HINT_SEPARATOR);
+/// Build the hint strip for a width: as many droppable hints as fit, whole, never
+/// a hint cut in half, and then the mode's essential pair.
+///
+/// A width too narrow for even the pair is clipped rather than shortened or
+/// laddered, and clipping eats the tail — which is why the pair is ranked with
+/// the way out first: help is the hint that goes.
+fn hint_strip(width: usize, hints: &[&str], essential_hints: &[&str]) -> String {
+    let essential = essential_hints.join(keymap::HINT_SEPARATOR);
     let mut shown: Vec<&str> = Vec::new();
-    for hint in keymap::FOOTER_HINTS {
+    for hint in hints {
         let candidate = shown
             .iter()
             .chain(std::iter::once(hint))
@@ -130,7 +155,7 @@ fn hint_strip(width: usize) -> String {
         }
         shown.push(hint);
     }
-    shown.extend_from_slice(keymap::FOOTER_ESSENTIAL);
+    shown.extend_from_slice(essential_hints);
     let strip = shown.join(keymap::HINT_SEPARATOR);
     // Narrower than even the essential hints: clip, since something is better
     // than a blank strip.
@@ -139,7 +164,19 @@ fn hint_strip(width: usize) -> String {
 
 fn draw_breadcrumb(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let crumbs = app.nav().crumbs();
-    let text = elide_left(&crumbs, area.width.saturating_sub(1) as usize);
+    // The mode is a fact about the whole session, so it holds the right-hand end
+    // of the line and the breadcrumb elides into what is left: a session-level
+    // fact must not be the thing a narrow terminal scrolls away. One column of
+    // gap, so a crumb can never run into the marker.
+    let indicator = app.editing_target().is_some();
+    let reserved = match indicator {
+        true => EDITING_INDICATOR.chars().count() + 1,
+        false => 0,
+    };
+    let text = elide_left(
+        &crumbs,
+        area_text_width(area.width).saturating_sub(reserved),
+    );
     let path = Style::default()
         .fg(theme.accent())
         .add_modifier(Modifier::BOLD);
@@ -164,6 +201,20 @@ fn draw_breadcrumb(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
         Paragraph::new(Line::from(spans)).alignment(Alignment::Left),
         area,
     );
+    if indicator {
+        // The mode's own colour, the one the navigation pane's border also takes,
+        // so the marker and the framed pane read as the same fact.
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                EDITING_INDICATOR,
+                Style::default()
+                    .fg(theme.notice())
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .alignment(Alignment::Right),
+            area,
+        );
+    }
 }
 
 /// Join breadcrumb entries to fit, dropping from the left. The tail says where
@@ -186,9 +237,16 @@ fn elide_left(crumbs: &[&str], width: usize) -> String {
 }
 
 fn draw_nav(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
+    // While editing mode is on the whole pane is in a mode — one row can be acted
+    // on and no other row can be reached — so the frame around it says so.
+    let editing = app.editing_target().is_some();
+    let border = match editing {
+        true => theme.notice(),
+        false => theme.muted(),
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.muted()))
+        .border_style(Style::default().fg(border))
         .title(" navigation ");
     let inner = block.inner(area);
 
@@ -224,17 +282,22 @@ fn draw_nav(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
                 label_width,
                 count_width,
                 inner.width as usize,
-                index == app.nav().cursor(),
+                emphasis(editing, index == app.nav().cursor()),
             )));
         }
         items
     };
 
-    let list = List::new(items).block(block).highlight_style(
-        Style::default()
+    // Editing mode's frozen row is marked by its gutter bar and by being the one
+    // row not dimmed; inverting it as well would keep the level looking like a
+    // list being browsed, which is exactly what it has stopped being.
+    let highlight = match editing {
+        true => Style::default().add_modifier(Modifier::BOLD),
+        false => Style::default()
             .add_modifier(Modifier::REVERSED)
             .add_modifier(Modifier::BOLD),
-    );
+    };
+    let list = List::new(items).block(block).highlight_style(highlight);
     let mut state = ListState::default();
     if !rows.is_empty() {
         state.select(Some(highlight_index(rows, app.nav().cursor())));
@@ -280,6 +343,30 @@ fn count_cell(row: &Row) -> String {
     }
 }
 
+/// How a row is drawn relative to what the reader can act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Emphasis {
+    /// A row of a level being browsed.
+    Plain,
+    /// The row the cursor is on while browsing.
+    Cursor,
+    /// Editing mode's frozen row: the one row that can be acted on.
+    Target,
+    /// Every other row while editing mode is on. It really is disabled — the
+    /// selection cannot move to it — so it is drawn that way.
+    Disabled,
+}
+
+/// How the row at the cursor and the rows around it are drawn in each mode.
+fn emphasis(editing: bool, at_cursor: bool) -> Emphasis {
+    match (editing, at_cursor) {
+        (true, true) => Emphasis::Target,
+        (true, false) => Emphasis::Disabled,
+        (false, true) => Emphasis::Cursor,
+        (false, false) => Emphasis::Plain,
+    }
+}
+
 /// One row: `<glyph> <identifier> <(children)>  <name>`. Everything the eye
 /// needs to judge a row sits on the left, so the name may be truncated at the
 /// pane edge without losing state or enterability.
@@ -296,15 +383,22 @@ fn count_cell(row: &Row) -> String {
 /// The highlighted row is drawn without any per-column colour: the selection is
 /// shown by inverting the line, and inverting a line whose columns each carry
 /// their own foreground breaks the bar into mismatched blocks.
+///
+/// Editing mode inverts nothing and adds a gutter column instead: the frozen row
+/// keeps every column's own colour and takes the bar, and every other row is
+/// dimmed by modifier as well as by colour, so which row is being acted on is
+/// legible with colour disabled too. The gutter is reserved only while the mode is
+/// on, so a level being browsed spends no width on it.
 fn row_line<'a>(
     row: &'a Row,
     theme: Theme,
     label_width: usize,
     count_width: usize,
     pane_width: usize,
-    selected: bool,
+    emphasis: Emphasis,
 ) -> Line<'a> {
     let muted = Style::default().fg(theme.muted());
+    let disabled = muted.add_modifier(Modifier::DIM);
     let plain = Style::default();
     let (glyph_cell, id_style, name_style) = match &row.kind {
         RowKind::Work(status) => {
@@ -319,14 +413,25 @@ fn row_line<'a>(
         RowKind::Collection(_) | RowKind::Withdrawn => (" ", muted, muted),
         RowKind::Member => (" ", plain, plain),
     };
-    let (id_style, count_style, name_style) = if selected {
-        (plain, plain, plain)
-    } else {
-        (id_style, muted, name_style)
+    let (id_style, count_style, name_style) = match emphasis {
+        Emphasis::Cursor => (plain, plain, plain),
+        Emphasis::Disabled => (disabled, disabled, disabled),
+        Emphasis::Plain | Emphasis::Target => (id_style, muted, name_style),
     };
-    let prefix_width = 2 + label_width + 1 + count_width + 2;
+    let gutter = match emphasis {
+        Emphasis::Target => Some(Span::styled(
+            GUTTER_BAR,
+            Style::default().fg(theme.notice()),
+        )),
+        // The bar's column, kept blank, so the rows of a level stay aligned.
+        Emphasis::Disabled => Some(Span::raw(" ")),
+        Emphasis::Plain | Emphasis::Cursor => None,
+    };
+    let prefix_width = usize::from(gutter.is_some()) + 2 + label_width + 1 + count_width + 2;
     let name_budget = pane_width.saturating_sub(prefix_width);
-    Line::from(vec![
+    let mut spans = Vec::with_capacity(8);
+    spans.extend(gutter);
+    spans.extend([
         Span::styled(glyph_cell, id_style),
         Span::raw(" "),
         Span::styled(format!("{:<label_width$}", row.label), id_style),
@@ -334,7 +439,8 @@ fn row_line<'a>(
         Span::styled(format!("{:<count_width$}", count_cell(row)), count_style),
         Span::raw("  "),
         Span::styled(truncate(&row.name, name_budget), name_style),
-    ])
+    ]);
+    Line::from(spans)
 }
 
 /// Truncate to a column budget, marking the cut so a clipped name cannot be
@@ -484,7 +590,7 @@ mod tests {
     fn only_a_work_row_carries_a_glyph() {
         let theme = Theme::with_color(false);
         for row in mixed_level() {
-            let line = row_line(&row, theme, 2, 3, 40, false);
+            let line = row_line(&row, theme, 2, 3, 40, Emphasis::Plain);
             let cell = line.spans[0].content.to_string();
             let is_work = matches!(row.kind, RowKind::Work(_));
             assert_eq!(
@@ -492,6 +598,51 @@ mod tests {
                 is_work,
                 "{:?} drew the glyph cell {cell:?}",
                 row.kind
+            );
+        }
+    }
+
+    #[test]
+    fn editing_marks_the_frozen_row_and_disables_the_others_without_colour() {
+        // Colour disabled: whatever distinguishes the rows here is shape and
+        // modifier, which is what a `NO_COLOR` reader has.
+        let theme = Theme::with_color(false);
+        let row = crate::data::fixture::epic_row("e", 0);
+        let target = row_line(&row, theme, 2, 3, 40, Emphasis::Target);
+        let disabled = row_line(&row, theme, 2, 3, 40, Emphasis::Disabled);
+        let browsed = row_line(&row, theme, 2, 3, 40, Emphasis::Plain);
+
+        // The bar is the frozen row's own column; the others keep it blank so the
+        // level stays aligned, and a browsed level spends no width on it at all.
+        assert_eq!(target.spans[0].content, GUTTER_BAR);
+        assert_eq!(disabled.spans[0].content, " ");
+        assert_eq!(browsed.spans[0].content, super::glyph("open"));
+
+        let dimmed = |line: &Line| {
+            line.spans
+                .iter()
+                .any(|s| s.style.add_modifier.contains(Modifier::DIM))
+        };
+        assert!(dimmed(&disabled), "a disabled row has to read as disabled");
+        assert!(
+            !dimmed(&target),
+            "the row being acted on keeps its contrast"
+        );
+
+        // The bar's column is charged to the name budget like every other
+        // column. Left uncharged, a row whose name fills the budget is one column
+        // wider than its pane, and the renderer clips the last character — which
+        // is the cut marker, so a clipped name would read as a whole one.
+        let width =
+            |line: &Line| -> usize { line.spans.iter().map(|s| s.content.chars().count()).sum() };
+        let mut long = row.clone();
+        long.name = "a name longer than any pane is wide".repeat(2);
+        for emphasis in [Emphasis::Target, Emphasis::Disabled, Emphasis::Plain] {
+            let line = row_line(&long, theme, 2, 3, 40, emphasis);
+            assert!(
+                width(&line) <= 40,
+                "a {emphasis:?} row overruns its pane by {}",
+                width(&line) - 40
             );
         }
     }
@@ -511,7 +662,7 @@ mod tests {
     #[test]
     fn the_hint_strip_never_clips_a_hint_in_half() {
         for width in 10..120usize {
-            let strip = hint_strip(width);
+            let strip = hint_strip(width, keymap::FOOTER_HINTS, keymap::FOOTER_ESSENTIAL);
             assert!(strip.chars().count() <= width, "width {width}: {strip:?}");
             if width >= 40 {
                 for hint in strip.split(keymap::HINT_SEPARATOR) {
@@ -525,20 +676,46 @@ mod tests {
         }
     }
 
+    /// Both strips a mode can ask for: the essential pair travels with the
+    /// droppable hints it is appended to.
+    fn strips() -> [(&'static [&'static str], &'static [&'static str]); 2] {
+        [
+            (keymap::FOOTER_HINTS, keymap::FOOTER_ESSENTIAL),
+            (
+                keymap::FOOTER_HINTS_EDITING,
+                keymap::FOOTER_ESSENTIAL_EDITING,
+            ),
+        ]
+    }
+
     #[test]
-    fn the_hint_strip_always_says_how_to_get_help_and_out() {
-        for width in 40..120usize {
-            let strip = hint_strip(width);
-            assert!(strip.contains("? keys"), "width {width}: {strip:?}");
-            assert!(strip.contains("q quit"), "width {width}: {strip:?}");
+    fn the_way_out_is_the_hint_a_narrow_strip_keeps() {
+        for (hints, essential) in strips() {
+            let pair = essential.join(keymap::HINT_SEPARATOR);
+            let way_out = essential[0];
+            for width in 1..120usize {
+                let strip = hint_strip(width, hints, essential);
+                assert!(strip.chars().count() <= width, "width {width}: {strip:?}");
+                if width >= pair.chars().count() {
+                    // Wide enough for the pair: both are there, and the pair is
+                    // the tail whatever else fits before it.
+                    assert!(strip.ends_with(&pair), "width {width}: {strip:?}");
+                } else if width >= way_out.chars().count() {
+                    // Too narrow for the pair: clipping eats help, never the way
+                    // out, so a reader is never sealed in with no visible exit.
+                    assert!(strip.starts_with(way_out), "width {width}: {strip:?}");
+                }
+            }
         }
     }
 
     #[test]
     fn a_wide_strip_carries_every_hint() {
-        let strip = hint_strip(200);
-        for hint in keymap::FOOTER_HINTS {
-            assert!(strip.contains(hint), "{strip:?} is missing {hint:?}");
+        for (hints, essential) in strips() {
+            let strip = hint_strip(200, hints, essential);
+            for hint in hints.iter().chain(essential) {
+                assert!(strip.contains(hint), "{strip:?} is missing {hint:?}");
+            }
         }
     }
 

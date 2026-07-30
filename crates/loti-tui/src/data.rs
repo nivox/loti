@@ -770,6 +770,28 @@ pub(crate) mod fixture {
         pub(crate) fn epic_selection(&self) -> Selection {
             Selection::Epic(self.epic.clone())
         }
+
+        /// Take every label off the epic, as a concurrent writer would.
+        ///
+        /// This is the shortest way to make a level the browser is standing on
+        /// vanish under it: a collection with no members is no longer a level.
+        /// Withdrawing a comment would not do it — a tombstone stays listed.
+        pub(crate) fn strip_the_epics_labels(&self) {
+            let target = Target::Epic(self.epic.clone());
+            let labels = ops::list_labels(&self.store, &target).unwrap();
+            ops::remove_labels(&self.store, &target, &labels).unwrap();
+        }
+    }
+
+    /// An initialised store with nothing in it, for the browser's one screen with
+    /// no selection at all: the roster of an empty store. The directory travels
+    /// with the handle, because dropping it removes the store.
+    pub(crate) fn empty_store() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".loti");
+        loti_core::store::init(dir.path(), &root).unwrap();
+        let store = Store::at(&root);
+        (dir, store)
     }
 
     fn new_node(

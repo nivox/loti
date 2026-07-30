@@ -11,7 +11,7 @@ use anyhow::Result;
 use loti_core::store::Store;
 use ratatui_markdown::viewer::MarkdownViewer;
 
-use crate::action::Action;
+use crate::action::{Action, Mode};
 use crate::data::{self, Level, Selection};
 use crate::nav::Nav;
 use crate::theme::Theme;
@@ -84,6 +84,14 @@ pub struct App {
     /// The live notice, if any. One at a time: the strip it draws over holds a
     /// single line, so there is nothing a queue could show.
     flash: Option<Flash>,
+    /// The row editing mode was entered on, for as long as the mode is on.
+    ///
+    /// Invariant: while this is `Some` the selection is frozen — neither the
+    /// cursor nor the level moves — so the row held here is always the
+    /// highlighted row, which is what lets the screen show one row being acted
+    /// on instead of a list being browsed. A reload that leaves the two apart
+    /// ends the mode rather than letting them drift.
+    editing: Option<Selection>,
 }
 
 impl App {
@@ -107,6 +115,7 @@ impl App {
             // The opening frame is owed: the browser paints before any input.
             redraw: true,
             flash: None,
+            editing: None,
         })
     }
 
@@ -135,17 +144,38 @@ impl App {
         self.nav_percent
     }
 
+    /// The row editing mode is acting on, or `None` while browsing.
+    pub fn editing_target(&self) -> Option<&Selection> {
+        self.editing.as_ref()
+    }
+
+    /// Which set of bindings the keyboard is under. An open overlay does not
+    /// change it: the overlay is a layer above the mode, and unwinding takes one
+    /// layer at a time, so the key that closes it is the mode's own way out.
+    pub fn mode(&self) -> Mode {
+        match self.editing.is_some() {
+            true => Mode::Editing,
+            false => Mode::Browse,
+        }
+    }
+
     /// Carry out an intent. Returns whether the browser should exit.
     ///
     /// While an overlay is open it takes every key: only closing it, or
     /// quitting, gets through — so a keypress can never move an unseen cursor.
+    /// Editing mode is the layer under it, and unwinding takes one layer at a
+    /// time: closing the overlay leaves the mode standing.
     pub fn apply(&mut self, action: Action) -> Result<bool> {
         if self.modal.is_some() {
             match action {
                 Action::Quit => return Ok(true),
-                Action::ToggleHelp | Action::Ascend => self.modal = None,
+                Action::ToggleHelp | Action::Unwind | Action::Ascend => self.modal = None,
                 _ => {}
             }
+            return Ok(false);
+        }
+        if self.editing.is_some() {
+            self.apply_editing(action)?;
             return Ok(false);
         }
 
@@ -159,7 +189,16 @@ impl App {
             Action::CursorUp if self.zoomed => self.preview.viewer.scroll_up(1),
             Action::CursorFirst if self.zoomed => self.preview.viewer.scroll_to_top(),
             Action::CursorLast if self.zoomed => self.preview.viewer.scroll_to_bottom(),
-            Action::Descend | Action::Ascend if self.zoomed => {}
+            Action::Descend | Action::Ascend | Action::Unwind if self.zoomed => {}
+            // The same rule, said out loud because nothing on screen would say
+            // it: an action that needs a visible cursor does nothing while there
+            // is none. Editing mode needs one twice over — to freeze it, and to
+            // show which row is frozen — and none of the marks it would show for
+            // that exist without the navigation pane. The screen is the reader's
+            // choice, so the refusal leaves it as it is rather than un-zooming.
+            Action::EnterEditing if self.zoomed => {
+                self.flash("nothing to edit while the preview fills the width")
+            }
 
             Action::CursorDown => self.nav.cursor_down(),
             Action::CursorUp => self.nav.cursor_up(),
@@ -176,7 +215,15 @@ impl App {
                     self.flash("nothing to open here");
                 }
             }
-            Action::Ascend => self.nav.ascend(),
+            // Nothing is open above the level, so unwinding is leaving it.
+            Action::Ascend | Action::Unwind => self.nav.ascend(),
+
+            Action::EnterEditing => match self.nav.frame().current() {
+                Some(row) => self.editing = Some(row.selection.clone()),
+                // The roster of an empty store is the browser's one screen with
+                // no selection, and the mode acts on a row.
+                None => self.flash("nothing to edit: this store has no epics"),
+            },
 
             Action::PreviewHalfDown => self.preview.viewer.scroll_down(self.half_page()),
             Action::PreviewHalfUp => self.preview.viewer.scroll_up(self.half_page()),
@@ -190,12 +237,51 @@ impl App {
             Action::ResetSplit => self.set_nav_percent(DEFAULT_NAV_PERCENT),
             Action::ToggleZoom => self.zoomed = !self.zoomed,
 
-            Action::Reload => {
-                let store = &self.store;
-                self.nav.reload(|level| data::rows(store, level))?;
-            }
+            Action::Reload => self.reload()?,
         }
         Ok(false)
+    }
+
+    /// Carry out an intent while editing mode is on.
+    ///
+    /// The mode admits the way out, help and a reload, and ignores everything
+    /// else with a notice naming the way out. With the selection frozen there is
+    /// nothing left for a motion, level or layout key to do, and an unknown key
+    /// is deliberately not an implicit exit: a typo must not silently drop the
+    /// reader out of a mode whose indicator is at the top of the screen while
+    /// their eyes are on the row.
+    ///
+    /// Quitting is one of the keys the mode does not admit, so no key reaching
+    /// this far can end the session. The overlay is the exception, and a layer
+    /// above: a key that opens it is answered there, and quitting gets through
+    /// that layer whether or not the mode is on.
+    fn apply_editing(&mut self, action: Action) -> Result<()> {
+        match action {
+            Action::Unwind => self.editing = None,
+            Action::ToggleHelp => self.modal = Some(Modal::Help),
+            // Nothing is pending at this layer, so a reload is safe — and it is
+            // the natural move when the preview looks stale before committing to
+            // an edit.
+            Action::Reload => {
+                self.reload()?;
+                let target = self.nav.frame().current().map(|row| &row.selection);
+                if target != self.editing.as_ref() {
+                    // The mode acts on one row, so a row that is gone ends it.
+                    // Where the cursor lands instead is the ordinary reload
+                    // fallback's business: the mode invents no second recovery.
+                    self.editing = None;
+                    self.flash("the row you were editing is gone");
+                }
+            }
+            _ => self.flash("not an editing action — Esc to leave"),
+        }
+        Ok(())
+    }
+
+    /// Re-read every level from the store.
+    fn reload(&mut self) -> Result<()> {
+        let store = &self.store;
+        self.nav.reload(|level| data::rows(store, level))
     }
 
     /// Set the divider, clamped so neither pane can be resized away.
@@ -428,10 +514,44 @@ mod tests {
     #[test]
     fn zoom_keeps_the_motion_keys_off_the_hidden_cursor() {
         let (_fx, mut app) = app();
-        app.apply(Action::ToggleZoom).unwrap();
-        app.apply(Action::CursorDown).unwrap();
+        // Standing inside a level, so a level key has somewhere to go if it is
+        // wrongly honoured: at the roster it would be a no-op either way.
         app.apply(Action::Descend).unwrap();
-        assert_eq!(app.nav().cursor(), 0);
+        app.apply(Action::ToggleZoom).unwrap();
+
+        // With the navigation pane gone there is no cursor to move and no level
+        // to leave: the motions fall through to the preview, and every intent
+        // that would change the level — unwinding included, since with nothing
+        // over the level that is what it unwinds — does nothing at all.
+        for action in [
+            Action::CursorDown,
+            Action::CursorUp,
+            Action::Descend,
+            Action::Ascend,
+            Action::Unwind,
+        ] {
+            app.apply(action).unwrap();
+            assert_eq!(app.nav().cursor(), 0, "{action:?} moved a hidden cursor");
+            assert_eq!(
+                app.nav().crumbs(),
+                vec!["epics", "feature"],
+                "{action:?} changed the level"
+            );
+        }
+    }
+
+    #[test]
+    fn unwinding_leaves_a_level_and_never_the_application() {
+        let (_fx, mut app) = app();
+        app.apply(Action::Descend).unwrap(); // into the epic
+        assert_eq!(app.nav().crumbs(), vec!["epics", "feature"]);
+
+        // Nothing is open over the level, so unwinding is leaving it — and it is
+        // never the way out of the browser, so a mis-hit cannot discard the
+        // session even at the root, where there is nothing left to unwind.
+        assert!(!app.apply(Action::Unwind).unwrap());
+        assert_eq!(app.nav().crumbs(), vec!["epics"]);
+        assert!(!app.apply(Action::Unwind).unwrap());
         assert_eq!(app.nav().crumbs(), vec!["epics"]);
     }
 
@@ -581,6 +701,188 @@ mod tests {
             depth,
             "the level must not have moved"
         );
+    }
+
+    #[test]
+    fn editing_mode_is_entered_on_the_highlighted_row_and_left_by_the_way_out() {
+        let (_fx, mut app) = app();
+        app.apply(Action::Descend).unwrap(); // into the epic
+        to_work_row(&mut app);
+        let row = app.nav().frame().current().unwrap().selection.clone();
+
+        assert_eq!(app.mode(), Mode::Browse);
+        app.apply(Action::EnterEditing).unwrap();
+        assert_eq!(app.editing_target(), Some(&row));
+        // The bindings the keyboard is under are derived from the frozen row and
+        // nothing else: it is the only bridge from this state to the key table,
+        // so a mode that did not follow the row would silently hand the mode
+        // browse's meanings for the same keys.
+        assert_eq!(app.mode(), Mode::Editing);
+        app.apply(Action::Unwind).unwrap();
+        assert_eq!(app.editing_target(), None);
+        assert_eq!(app.mode(), Mode::Browse);
+        // The way out of the mode is not the way out of the level: leaving the
+        // mode leaves the reader exactly where they were.
+        assert_eq!(app.nav().crumbs(), vec!["epics", "feature"]);
+        assert_eq!(
+            app.nav().frame().current().map(|r| r.selection.clone()),
+            Some(row)
+        );
+
+        // And the same key, once the mode is off, is the level's way out again:
+        // the mode borrowed it for as long as it was on, and no longer.
+        app.apply(Action::Unwind).unwrap();
+        assert_eq!(app.nav().crumbs(), vec!["epics"]);
+    }
+
+    #[test]
+    fn the_selection_is_frozen_while_the_mode_is_on() {
+        let (_fx, mut app) = app();
+        app.apply(Action::Descend).unwrap(); // into the epic
+        to_work_row(&mut app);
+        app.apply(Action::EnterEditing).unwrap();
+        let (cursor, crumbs, split) = (
+            app.nav().cursor(),
+            app.nav().crumbs().join("/"),
+            app.nav_percent(),
+        );
+
+        // Not the motion keys, not the level keys, and not the layout keys: with
+        // one row frozen as the target there is nothing left for them to do.
+        for action in [
+            Action::CursorDown,
+            Action::CursorUp,
+            Action::CursorFirst,
+            Action::CursorLast,
+            Action::Descend,
+            Action::Ascend,
+            Action::ShrinkNav,
+            Action::GrowNav,
+            Action::ResetSplit,
+            Action::ToggleZoom,
+        ] {
+            assert!(!app.apply(action).unwrap(), "{action:?} left the browser");
+            assert!(app.editing_target().is_some(), "{action:?} left the mode");
+            assert_eq!(app.nav().cursor(), cursor, "{action:?} moved the cursor");
+            assert_eq!(
+                app.nav().crumbs().join("/"),
+                crumbs,
+                "{action:?} changed the level"
+            );
+            assert_eq!(app.nav_percent(), split, "{action:?} moved the divider");
+            assert!(!app.zoomed(), "{action:?} rearranged the screen");
+        }
+    }
+
+    #[test]
+    fn an_ignored_key_says_how_to_leave_and_does_not_leave() {
+        let (_fx, mut app) = app();
+        app.apply(Action::EnterEditing).unwrap();
+
+        // Quitting is not an editing action either: a stray key must not end the
+        // session from inside a mode whose indicator is at the top of the screen.
+        assert!(!app.apply(Action::Quit).unwrap());
+        assert!(app.editing_target().is_some());
+        let notice = app.flash_message().expect("an ignored key says why");
+        assert!(
+            notice.contains("Esc"),
+            "{notice:?} does not name the way out"
+        );
+    }
+
+    #[test]
+    fn help_is_reachable_from_the_mode_and_closing_it_leaves_the_mode_standing() {
+        let (_fx, mut app) = app();
+        app.apply(Action::EnterEditing).unwrap();
+        app.apply(Action::ToggleHelp).unwrap();
+        assert_eq!(app.modal(), Some(&Modal::Help));
+        // The overlay is a layer above the mode, not a way out of it, so the
+        // keyboard is still under the mode's bindings while it is open.
+        assert_eq!(app.mode(), Mode::Editing);
+
+        // One layer at a time: the overlay goes and the mode stays.
+        app.apply(Action::Unwind).unwrap();
+        assert_eq!(app.modal(), None);
+        assert!(app.editing_target().is_some());
+        assert_eq!(app.mode(), Mode::Editing);
+        app.apply(Action::Unwind).unwrap();
+        assert_eq!(app.editing_target(), None);
+    }
+
+    #[test]
+    fn a_reload_that_changes_nothing_leaves_the_mode_on() {
+        let (_fx, mut app) = app();
+        app.apply(Action::Descend).unwrap(); // into the epic
+        to_work_row(&mut app);
+        app.apply(Action::EnterEditing).unwrap();
+        let target = app.editing_target().cloned();
+
+        // Nothing is pending at this layer, so a reload is an ordinary reload.
+        app.apply(Action::Reload).unwrap();
+        assert_eq!(app.editing_target(), target.as_ref());
+        assert_eq!(app.flash_message(), None, "nothing happened worth saying");
+    }
+
+    #[test]
+    fn a_reload_that_removes_the_frozen_row_ends_the_mode_and_says_so() {
+        let (fx, mut app) = app();
+        app.apply(Action::Descend).unwrap(); // into the epic
+        to_row(
+            &mut app,
+            |kind| matches!(kind, RowKind::Collection(c) if c.name() == "labels"),
+        );
+        app.apply(Action::Descend).unwrap(); // into the labels
+        app.apply(Action::EnterEditing).unwrap();
+        assert!(app.editing_target().is_some());
+
+        // A reload that removes nothing has to leave the mode standing.
+        app.apply(Action::Reload).unwrap();
+        assert!(app.editing_target().is_some());
+
+        // Now the frozen row goes, and with the last member the level goes too.
+        fx.strip_the_epics_labels();
+        app.apply(Action::Reload).unwrap();
+        assert_eq!(app.editing_target(), None, "the frozen row is gone");
+        let notice = app.flash_message().expect("a mode that ends says why");
+        assert!(notice.contains("gone"), "{notice:?}");
+        // The browser's own reload fallback took over: no second recovery story.
+        assert_eq!(app.nav().crumbs(), vec!["epics", "feature"]);
+    }
+
+    #[test]
+    fn the_mode_is_refused_while_the_preview_fills_the_width() {
+        let (_fx, mut app) = app();
+        app.apply(Action::Descend).unwrap(); // into the epic
+        to_work_row(&mut app);
+        app.apply(Action::ToggleZoom).unwrap();
+
+        // None of the mode's marks exist without the navigation pane — no gutter
+        // bar, no dimming, no framed pane — and the frozen row is off screen, so
+        // the indicator could not say which row is the target. Refused with a
+        // notice, on the rule that already leaves the level keys nothing to do.
+        app.apply(Action::EnterEditing).unwrap();
+        assert_eq!(app.editing_target(), None);
+        assert!(app.flash_message().is_some(), "a refusal has to say why");
+        // And refused, not worked around: the screen is the reader's choice.
+        assert!(app.zoomed(), "the mode must not un-zoom the screen");
+
+        // Once the row list is back, so is the mode.
+        app.apply(Action::ToggleZoom).unwrap();
+        app.apply(Action::EnterEditing).unwrap();
+        assert!(app.editing_target().is_some());
+    }
+
+    #[test]
+    fn the_roster_of_an_empty_store_has_nothing_to_edit() {
+        let (_dir, store) = crate::data::fixture::empty_store();
+        let mut app = App::new(store, Theme::with_color(false)).unwrap();
+        assert!(app.nav().frame().current().is_none());
+
+        app.apply(Action::EnterEditing).unwrap();
+        // The one screen with no selection at all: the mode acts on a row, so it
+        // cannot be entered, and saying nothing would look like a broken key.
+        assert_eq!(app.editing_target(), None);
+        assert!(app.flash_message().is_some());
     }
 
     #[test]

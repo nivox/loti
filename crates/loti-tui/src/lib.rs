@@ -151,7 +151,9 @@ fn event_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
                 // moved on, and a notice's lifetime is a maximum. Before
                 // dispatch, so a key that raises one of its own keeps it.
                 app.clear_flash();
-                if let Some(action) = keymap::action_for(key) {
+                // The mode is an input to the mapping, so one key can be the way
+                // out of a mode here and the way out of the browser there.
+                if let Some(action) = keymap::action_for(key, app.mode()) {
                     if app.apply(action)? {
                         return Ok(());
                     }
