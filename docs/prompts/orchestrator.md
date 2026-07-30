@@ -42,14 +42,20 @@ Repeat until a stop condition below is met.
 Re-read the tickets **every cycle**. State may have changed under you, and a
 ticket that was unblocked last cycle may not be now.
 
-    loti ticket list <root> --fields ref,status,name,blocked-by
+    loti ticket list <root> --fields ref,status,labels,name,blocked-by
 
 A candidate is `to-do`, inside your scope, not the root while descendants
 remain, and has every blocker terminal. Among candidates prefer, in order:
 
-1. one that unblocks the most other tickets in scope;
-2. one whose cost is small and whose result other tickets build on;
-3. otherwise the lowest number.
+1. a `critical` followup — it must not ship, and anything built after it risks
+   being built on it;
+2. whatever unblocks the most other tickets in scope, **whatever its priority**:
+   progress beats grading, and a followup graded `debt` that another ticket
+   waits on is on the critical path regardless of the label;
+3. planned work — a ticket with no priority label — before any remaining
+   followup: a working version comes before polishing it;
+4. then `defect`, then `enhancement`, then `debt`;
+5. ties go to the smaller job, then to the lowest number.
 
 **Skip any ticket whose body asks for a decision** the recorded design does not
 settle. Leave those until last; if they are all that remain, stop and put them
@@ -144,13 +150,35 @@ the what, and never a ticket id or spec section — see `AGENTS.md`.
 
 ## Stop
 
-Stop and report when any of these holds:
+Stop and report when any of these holds.
 
-- every ticket in scope is terminal;
-- the only unblocked candidates left require a decision — list them, and say
-  what each needs decided;
-- a must-fix needs a human ruling;
-- the working tree will not build or test clean and you cannot fix it.
+**Nothing left to do**
+
+- Every ticket in scope is terminal.
+
+**Only judgement calls left**
+
+- The only unblocked candidates require a decision the record does not settle.
+  List them, and say what each needs decided.
+- A must-fix needs a human ruling.
+
+**Only polish left — stop and ask**
+
+- The only unblocked candidates are followups labelled `enhancement` or `debt`,
+  and none of them unblocks anything else in scope.
+
+  Say so, and ask whether to go on. The planned work is finished at that point,
+  and a working version usually matters more than the queue behind it — but that
+  is the human's call, not yours. Reviews produce followups faster than they can
+  be worked, so left to your own judgement you would polish indefinitely.
+
+  **Do not stop while such a ticket blocks something.** A followup graded `debt`
+  that another ticket is waiting on is on the critical path whatever its label
+  says: work it, and stop once the queue behind it is clear.
+
+**Cannot proceed**
+
+- The working tree will not build or test clean and you cannot fix it.
 
 Report: tickets completed with their commits, followups filed by priority,
 tickets left and why, and every decision waiting on the human.
