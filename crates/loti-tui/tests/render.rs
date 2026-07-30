@@ -189,6 +189,28 @@ fn zoom_replaces_the_navigation_pane_but_keeps_the_breadcrumb() {
 }
 
 #[test]
+fn refusing_the_mode_while_zoomed_names_the_pane_and_the_key_that_brings_it_back() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store, Theme::with_color(false)).unwrap();
+    app.apply(Action::Descend).unwrap();
+    to_work_row(&mut app);
+    app.apply(Action::ToggleZoom).unwrap();
+    app.apply(Action::EnterEditing).unwrap();
+    let (_t, lines) = draw(&mut app);
+
+    // There is something to edit here — the row the cursor was left on is still
+    // the one the mode would freeze — so the notice must not claim there is not.
+    // What is missing is the navigation pane, so the notice names it along with
+    // the key that brings it back, the refusal not rearranging the screen itself.
+    assert!(
+        lines[23].contains("editing needs the navigation pane"),
+        "{:?}",
+        lines[23]
+    );
+    assert!(lines[23].contains("z brings it back"), "{:?}", lines[23]);
+}
+
+#[test]
 fn a_level_leads_with_its_collections_and_a_rule_before_the_work() {
     let (_dir, store) = fixture();
     let mut app = App::new(store, Theme::with_color(false)).unwrap();

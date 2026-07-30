@@ -38,6 +38,12 @@ const FLASH_LIFETIME: Duration = Duration::from_secs(5);
 /// for as long as it is up.
 const NOT_AN_EDITING_ACTION: &str = "not an editing action — Esc to leave";
 
+/// What entering editing mode says while the preview fills the width. It names
+/// the remedy rather than the obstacle: there *is* something to edit, and what is
+/// missing is the navigation pane, so the notice carries the key that brings the
+/// pane back. The refusal never un-zooms by itself — the screen is the reader's.
+const EDITING_NEEDS_THE_NAV_PANE: &str = "editing needs the navigation pane — z brings it back";
+
 /// What a reload that finds the store may no longer be written says, on the one
 /// reload that finds it.
 ///
@@ -1054,9 +1060,7 @@ impl App {
             // show which row is frozen — and none of the marks it would show for
             // that exist without the navigation pane. The screen is the reader's
             // choice, so the refusal leaves it as it is rather than un-zooming.
-            Action::EnterEditing if self.zoomed => {
-                self.flash("nothing to edit while the preview fills the width")
-            }
+            Action::EnterEditing if self.zoomed => self.flash(EDITING_NEEDS_THE_NAV_PANE),
 
             Action::CursorDown => self.nav.cursor_down(),
             Action::CursorUp => self.nav.cursor_up(),
@@ -3435,6 +3439,26 @@ mod tests {
         assert_eq!(field_value(&app), "never written");
         assert_eq!(app.mode(), surface_mode(Fields::One, Lines::One));
         assert!(app.editing_target().is_some());
+    }
+
+    #[test]
+    fn a_surface_opens_at_the_split_the_reader_set_and_never_widens_itself() {
+        let (_fx, mut app) = app();
+        // A split the reader chose, so a surface that widened or reset it is
+        // distinguishable from one that left it alone.
+        app.apply(Action::ShrinkNav).unwrap();
+        let split = app.nav_percent();
+        assert_ne!(split, DEFAULT_NAV_PERCENT);
+
+        open_the_label_surface(&mut app);
+
+        // An editing surface draws where the reader has the panes, and the
+        // navigation pane is left as it was: widening the preview to admit a
+        // buffer would move the divider out from under the reader at the one
+        // moment they were concentrating on something else, and closing the
+        // surface would then have to decide whether to put it back.
+        assert_eq!(app.nav_percent(), split, "the surface moved the divider");
+        assert!(!app.zoomed(), "the surface took the whole width");
     }
 
     #[test]
