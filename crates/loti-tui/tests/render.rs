@@ -6,6 +6,7 @@
 //! upstream release into a test failure without telling us anything about loti.
 
 use loti_core::domain::NodeRef;
+use loti_core::lock::LockConfig;
 use loti_core::meta::{self, Meta};
 use loti_core::ops::{self, NewEpic, NewNode, Target};
 use loti_core::store::{self, Store};
@@ -18,6 +19,7 @@ use loti_tui::ui;
 use ratatui::backend::TestBackend;
 use ratatui::style::{Color, Modifier};
 use ratatui::Terminal;
+use std::time::Duration;
 
 /// A store with one epic carrying meta, a ticket with a subticket, and a
 /// childless ticket.
@@ -25,7 +27,13 @@ fn fixture() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join(".loti");
     store::init(dir.path(), &root).unwrap();
-    let store = Store::at(&root);
+    let store = Store::at(&root).with_lock_config(LockConfig {
+        // A rendering test holds one descendant's lock to make a cascade stop
+        // after its first write; it must fail quickly rather than wait for the
+        // production liveness window.
+        stale_threshold: Duration::from_millis(80),
+        retry_interval: Duration::from_millis(5),
+    });
     ops::create_epic(
         &store,
         NewEpic {
@@ -54,7 +62,7 @@ fn fixture() -> (tempfile::TempDir, Store) {
         },
     )
     .unwrap();
-    ops::create_node(
+    let child = ops::create_node(
         &store,
         NewNode {
             epic_id: "browser".into(),
@@ -75,6 +83,23 @@ fn fixture() -> (tempfile::TempDir, Store) {
             epic_id: "browser".into(),
             parent: None,
             name: "Preview pane".into(),
+            summary: "s".into(),
+            labels: vec![],
+            body: String::new(),
+        },
+    )
+    .unwrap();
+    // A second descendant lets a cascade write the first before it meets a
+    // controlled failure on the second.
+    ops::create_node(
+        &store,
+        NewNode {
+            epic_id: "browser".into(),
+            parent: Some(NodeRef {
+                epic_id: "browser".into(),
+                number: child.frontmatter.number,
+            }),
+            name: "Cascade tail".into(),
             summary: "s".into(),
             labels: vec![],
             body: String::new(),
@@ -3227,16 +3252,17 @@ fn a_cascade_that_stops_partway_shows_the_stores_words_and_says_nothing_on_the_s
     app.apply(Action::MoveDown).unwrap();
 
     // A cascade is not atomic: it closes each descendant on its own and stops at the
-    // first failure, leaving a half-closed subtree. A node is written by writing
-    // beside it and renaming over it, so a directory that may not be added to is the
-    // way to stop one — here at its first step.
-    let unseal = seal(&store, "browser");
+    // first failure. Holding the second descendant's lock lets the first commit,
+    // leaving the subtree half-closed rather than refusing before it changes.
+    let held = loti_core::lock::try_acquire(&store.node_path("browser", 4))
+        .expect("the tail lock can be taken")
+        .expect("the tail was unlocked");
     app.apply(Action::Accept).unwrap();
-    let (_t, lines) = draw(&mut app);
+    let (terminal, lines) = draw(&mut app);
     // The store's own message, verbatim: it names the node it stopped on and says to
     // re-run, and re-running is the whole of the recovery because each step is
     // idempotent. Taken from the operation itself rather than spelled out here — and
-    // while the store is still sealed, or it would not be the same answer.
+    // while the tail lock is still held, or the retry would converge instead.
     let refusal = ops::set_node_status(
         &store,
         &NodeRef::new("browser", 1),
@@ -3248,10 +3274,11 @@ fn a_cascade_that_stops_partway_shows_the_stores_words_and_says_nothing_on_the_s
     .map(|_| ())
     .expect_err("the cascade could not run")
     .to_string();
-    // Restored before any assertion, or a failing one would leave a store that
-    // cannot be removed with the fixture.
-    unseal();
-    let said = float_text(&_t, "refused");
+    // Release before any assertion, or a failure would leave the fixture with a
+    // held lock. The first descendant remains closed; a retry would converge from
+    // that partial progress.
+    drop(held);
+    let said = float_text(&terminal, "refused");
     assert!(
         said.contains(&refusal.split_whitespace().collect::<Vec<_>>().join(" ")),
         "{refusal:?} is not what the float says: {said:?}"
@@ -3283,6 +3310,22 @@ fn a_cascade_that_stops_partway_shows_the_stores_words_and_says_nothing_on_the_s
     assert!(
         app.editing_target().is_some(),
         "the refusal ended the session"
+    );
+
+    // The reader can leave the still-open picker without changing the partial
+    // result. The descendant level's real frame must then show the first close.
+    app.apply(Action::Unwind).unwrap();
+    app.apply(Action::Delete).unwrap();
+    app.apply(Action::Unwind).unwrap();
+    app.apply(Action::Descend).unwrap();
+    let (_t, refreshed) = draw(&mut app);
+    let child = refreshed[1..23]
+        .iter()
+        .find(|line| line.contains("Row rendering"))
+        .expect("the first cascade descendant row");
+    assert!(
+        child.contains(loti_tui::theme::glyph("closed")),
+        "the rows still show the state before the partial cascade: {child:?}"
     );
 }
 
@@ -3336,18 +3379,6 @@ fn the_gate_on_a_state_is_the_stores_refusal_and_not_a_state_the_picker_withhold
         app.editing_target().is_some(),
         "the refusal ended the session"
     );
-}
-
-/// Stop the store from taking a write to any node of an epic, and hand back the way
-/// to let it again; see the cascade that stops partway.
-fn seal(store: &Store, epic: &str) -> impl FnOnce() {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = store.epic_dir(epic);
-    let was = std::fs::metadata(&dir).unwrap().permissions();
-    let mut sealed = was.clone();
-    sealed.set_mode(0o555);
-    std::fs::set_permissions(&dir, sealed).unwrap();
-    move || std::fs::set_permissions(&dir, was).unwrap()
 }
 
 /// What a float says, its wrapped lines joined back into one and the runs of blanks

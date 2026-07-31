@@ -94,14 +94,17 @@ pub enum OpError {
     /// An asset add was given no name and no --file to derive one from.
     #[error("an asset needs a name: pass --name, or --file so the basename can be used")]
     AssetNeedsName,
-    /// A cascade close committed some descendants but then failed; the store is
-    /// left with partial progress and the operation is safe to re-run.
+    /// A cascade close stopped at one descendant. It records whether earlier
+    /// steps committed, because a caller must re-read after partial progress but
+    /// not after a failure before the first write.
     #[error("cascade close stopped partway at {failed}: {reason}; re-run to finish")]
     CascadePartial {
         /// The node the cascade failed on.
         failed: NodeRef,
         /// Why it failed.
         reason: String,
+        /// Whether an earlier descendant write committed before the failure.
+        committed: bool,
     },
 }
 
@@ -541,6 +544,7 @@ fn close_descendants(
         .iter()
         .map(|n| store.node_path(epic_id, *n))
         .collect();
+    let mut changed = false;
     let report = lock::cascade(paths, |path| {
         // Recover the node number from the path to address it via the store.
         let number = targets
@@ -553,15 +557,15 @@ fn close_descendants(
                 // Idempotent: a descendant already terminal needs no rewrite, so
                 // the change leaves it as found and nothing is published.
                 if child.frontmatter.status.is_terminal() {
-                    return Ok::<(), StoreError>(());
+                    return Ok::<bool, StoreError>(false);
                 }
                 child.frontmatter.status = NodeState::Closed;
                 child.frontmatter.close_reason = reason.clone();
                 child.frontmatter.block_reason = None;
                 child.frontmatter.updated = now();
-                Ok(())
+                Ok(true)
             })
-            .map(|_| ())
+            .map(|(_, wrote)| changed |= wrote)
             .map_err(|e| e.to_string())
     });
 
@@ -575,6 +579,7 @@ fn close_descendants(
         return Err(OpError::CascadePartial {
             failed: NodeRef::new(epic_id, number),
             reason,
+            committed: changed,
         });
     }
     Ok(())
@@ -2116,6 +2121,99 @@ mod tests {
             std::fs::read(&child_path).unwrap(),
             resolved_bytes,
             "a descendant needing no change must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn a_no_op_after_another_actor_resolved_it_does_not_make_a_later_failure_partial() {
+        let (_d, s) = seeded();
+        let cascade = Store::at(s.root()).with_lock_config(LockConfig {
+            // The first lock stays fresh while the other actor resolves it; the
+            // second is held until this cascade's shorter liveness window refuses.
+            stale_threshold: Duration::from_secs(1),
+            retry_interval: Duration::from_millis(5),
+        });
+        create_epic(&s, new_epic("e")).unwrap();
+        let parent = create_node(&s, new_node("e", None)).unwrap();
+        let parent_ref = NodeRef::new("e", parent.frontmatter.number);
+        let first = create_node(&s, new_node("e", Some(parent_ref.clone()))).unwrap();
+        let first_ref = NodeRef::new("e", first.frontmatter.number);
+        let second = create_node(&s, new_node("e", Some(parent_ref.clone()))).unwrap();
+        let second_ref = NodeRef::new("e", second.frontmatter.number);
+
+        // The cascade plans while both descendants are open, then waits at the
+        // first. Another actor resolves that one before the cascade can take its
+        // lock; the second remains locked so the later step is the controlled
+        // failure. A successful no-op at the first step must not count as a write.
+        let first_lock = lock::acquire(
+            &s.node_path("e", first_ref.number),
+            &patient_config(),
+            Force::Deny,
+        )
+        .unwrap();
+        let second_lock = lock::acquire(
+            &s.node_path("e", second_ref.number),
+            &patient_config(),
+            Force::Deny,
+        )
+        .unwrap();
+        let result = std::thread::scope(|scope| {
+            let closer = scope.spawn(|| {
+                set_node_status(
+                    &cascade,
+                    &parent_ref,
+                    NodeStatusChange::Closed {
+                        reason: Some("obsolete".into()),
+                        cascade: true,
+                    },
+                )
+            });
+            std::thread::sleep(HOLD);
+            let mut resolved = s.read_node("e", first_ref.number).unwrap();
+            resolved.frontmatter.status = NodeState::Done;
+            first_lock
+                .commit(resolved.to_text().unwrap().as_bytes())
+                .unwrap();
+            closer.join().unwrap()
+        });
+        // Release before assertions so a failed assertion cannot leave a fixture
+        // with the deliberately blocked second step.
+        drop(second_lock);
+
+        assert!(
+            matches!(
+                result,
+                Err(OpError::CascadePartial {
+                    ref failed,
+                    committed: false,
+                    ..
+                }) if failed == &second_ref
+            ),
+            "a no-op at the first step made the later refusal look changed: {result:?}"
+        );
+        assert_eq!(
+            s.read_node("e", first_ref.number)
+                .unwrap()
+                .frontmatter
+                .status,
+            NodeState::Done,
+            "the resolution that landed while waiting was overwritten"
+        );
+        assert_eq!(
+            s.read_node("e", second_ref.number)
+                .unwrap()
+                .frontmatter
+                .status,
+            NodeState::ToDo,
+            "the failed step changed the second descendant"
+        );
+        assert_eq!(
+            s.read_node("e", parent_ref.number)
+                .unwrap()
+                .frontmatter
+                .status,
+            NodeState::ToDo,
+            "a partial cascade closed its parent"
         );
     }
 

@@ -1304,9 +1304,24 @@ pub enum Refusal {
     /// written. The reader is asked about this one rather than told: only they can
     /// decide whether their text should replace the change that landed under it.
     Conflict,
-    /// Every other refusal, in the store's own words, so the browser and the
-    /// command line teach the same rule in the same words.
+    /// Every other refusal that leaves the store as it was, in the store's own
+    /// words, so the browser and the command line teach the same rule in the same
+    /// words.
     Rule(String),
+    /// A cascade closed one or more descendants before it stopped. Its message is
+    /// still the store's own, but the browser must reload before showing it so its
+    /// rows do not contradict the partial progress.
+    Partial(String),
+}
+
+impl Refusal {
+    /// Whether the store changed before refusing the write.
+    ///
+    /// This is a typed outcome rather than an inference from a refusal message, so
+    /// the browser has one decision point for reloading after every changed write.
+    pub fn changed(&self) -> bool {
+        matches!(self, Refusal::Partial(..))
+    }
 }
 
 /// Carry out a write, returning the store's own refusal when it refuses.
@@ -1375,6 +1390,15 @@ fn as_asked(result: Result<(), Refusal>) -> Result<Effect, Refusal> {
 fn refusal(error: ops::OpError) -> Refusal {
     match error {
         ops::OpError::Store(loti_core::store::StoreError::Conflict { .. }) => Refusal::Conflict,
+        // The cascade outcome says whether an earlier independent descendant
+        // write committed. Keep that fact with the store's message, rather than
+        // asking callers to recognise it from wording that may change.
+        ops::OpError::CascadePartial {
+            committed: true, ..
+        } => Refusal::Partial(error.to_string()),
+        ops::OpError::CascadePartial {
+            committed: false, ..
+        } => Refusal::Rule(error.to_string()),
         other => Refusal::Rule(other.to_string()),
     }
 }
@@ -2184,24 +2208,6 @@ pub(crate) mod fixture {
                 .count()
         }
 
-        /// Stop the store from taking a write to any node of the epic, and hand back
-        /// the way to let it again.
-        ///
-        /// A node is written by writing beside it and renaming over it, so a
-        /// directory that may not be added to is a node that cannot be written —
-        /// which is how a cascade is made to stop partway without corrupting
-        /// anything. Restoring is the caller's, and has to happen before the fixture
-        /// is dropped: the store's own directory has to be writable to be removed.
-        pub(crate) fn seal_the_epics_directory(&self) -> impl FnOnce() + '_ {
-            use std::os::unix::fs::PermissionsExt;
-            let dir = self.store.epic_dir(&self.epic);
-            let was = std::fs::metadata(&dir).unwrap().permissions();
-            let mut sealed = was.clone();
-            sealed.set_mode(0o555);
-            std::fs::set_permissions(&dir, sealed).unwrap();
-            move || std::fs::set_permissions(&dir, was).unwrap()
-        }
-
         /// One replaceable field of an entity as the store holds it, read through
         /// the seam an editing surface opens on — so a test about a surface asserts
         /// against the store rather than against a constant that a richer fixture
@@ -2665,8 +2671,10 @@ pub(crate) mod fixture {
 mod tests {
     use super::fixture::Fixture;
     use super::*;
-    use loti_core::ops::{EpicEdits, NewEpic, NodeEdits};
+    use loti_core::lock::{self, LockConfig};
+    use loti_core::ops::{EpicEdits, NewEpic, NewNode, NodeEdits};
     use loti_core::store::StoreError;
+    use std::time::Duration;
 
     /// The words a refusal is shown in.
     ///
@@ -2675,7 +2683,7 @@ mod tests {
     /// must not silently accept one in its place.
     fn refusal_words(refused: Refusal) -> String {
         match refused {
-            Refusal::Rule(words) => words,
+            Refusal::Rule(words) | Refusal::Partial(words) => words,
             Refusal::Conflict => panic!("refused as a conflict rather than by a rule"),
         }
     }
@@ -5005,40 +5013,94 @@ mod tests {
     }
 
     #[test]
-    fn a_cascade_that_stops_partway_comes_back_in_the_stores_own_words() {
+    fn a_cascade_that_stops_partway_reports_that_the_store_changed() {
         let fx = Fixture::build();
         let closed = State::Work(NodeState::Closed);
-        assert!(fx.open_descendants(&fx.node) > 0, "nothing to cascade to");
+        // A second descendant lets the first write before the controlled failure.
+        let store = Store::at(fx.store.root()).with_lock_config(LockConfig {
+            stale_threshold: Duration::from_millis(80),
+            retry_interval: Duration::from_millis(5),
+        });
+        let tail = ops::create_node(
+            &store,
+            NewNode {
+                epic_id: fx.epic.clone(),
+                parent: Some(fx.subnode.clone()),
+                name: "cascade tail".into(),
+                summary: String::new(),
+                labels: Vec::new(),
+                body: String::new(),
+            },
+        )
+        .expect("the tail can be created");
+        let held = lock::try_acquire(&store.node_path(&fx.epic, tail.frontmatter.number))
+            .expect("the tail lock can be taken")
+            .expect("the tail was unlocked");
 
-        // A cascade is not atomic: it closes each descendant on its own and stops at
-        // the first failure. With the store unable to take a node write at all, the
-        // first step is where it stops — and the words are the store's, which name
-        // where it stopped and say to re-run.
-        let unseal = fx.seal_the_epics_directory();
+        let refused = perform(&store, &pick(&fx.node_selection(), closed, "a", true))
+            .expect_err("the cascade stops after its first descendant");
+        drop(held);
+
+        assert!(refused.changed(), "partial progress must request a reload");
+        let Refusal::Partial(_) = refused else {
+            panic!("the partial cascade was not classified as changed");
+        };
+        assert_eq!(fx.node_state(&fx.node).0, NodeState::ToDo.wire_name());
+        assert_eq!(fx.node_state(&fx.subnode).0, NodeState::Closed.wire_name());
+    }
+
+    #[test]
+    fn a_cascade_that_stops_at_its_first_descendant_is_unchanged_and_not_partial() {
+        let fx = Fixture::build();
+        let closed = State::Work(NodeState::Closed);
+        let store = Store::at(fx.store.root()).with_lock_config(LockConfig {
+            stale_threshold: Duration::from_millis(80),
+            retry_interval: Duration::from_millis(5),
+        });
+        let was = (
+            fx.node_state(&fx.node),
+            fx.node_state(&fx.subnode),
+            fx.open_descendants(&fx.node),
+        );
+        // The first planned descendant cannot be locked, so no independent step
+        // can publish before the controlled refusal.
+        let held = lock::try_acquire(&store.node_path(&fx.epic, fx.subnode.number))
+            .expect("the first descendant lock can be taken")
+            .expect("the first descendant was unlocked");
+        let refused = perform(&store, &pick(&fx.node_selection(), closed, "a", true))
+            .expect_err("the cascade stops before its first descendant");
+        // The operation supplies the displayed words. Run it while the same lock
+        // remains held, so this proves the browser did not paraphrase its refusal.
         let expected = ops::set_node_status(
-            &fx.store,
+            &store,
             &fx.node,
             NodeStatusChange::Closed {
                 reason: Some("a".into()),
                 cascade: true,
             },
         )
-        .map(|_| ())
-        .expect_err("the store cannot take the cascade")
+        .expect_err("the store still refuses the first descendant")
         .to_string();
-        let refused = perform(&fx.store, &pick(&fx.node_selection(), closed, "a", true));
-        // Before any assertion, or a failing one would leave a store that cannot be
-        // removed with the fixture.
-        unseal();
+        // Release before assertions so fixture cleanup is never coupled to one.
+        drop(held);
 
-        assert_eq!(
-            refusal_words(refused.expect_err("the cascade cannot run")),
-            expected
+        assert!(
+            !refused.changed(),
+            "a cascade that wrote nothing must not request a reload"
         );
-        // The row the reader was closing is left as it was: the descendants go first,
-        // so a cascade that could not start has changed nothing at all.
-        assert_eq!(fx.node_state(&fx.node).0, NodeState::ToDo.wire_name());
-        assert!(fx.open_descendants(&fx.node) > 0);
+        let Refusal::Rule(words) = refused else {
+            panic!("a cascade that stopped before writing was classified as partial");
+        };
+        assert_eq!(words, expected);
+        assert_eq!(
+            (
+                fx.node_state(&fx.node),
+                fx.node_state(&fx.subnode),
+                fx.open_descendants(&fx.node),
+            ),
+            was,
+            "a refusal at the first descendant changed the store"
+        );
     }
 
     #[test]

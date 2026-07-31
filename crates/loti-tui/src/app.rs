@@ -2396,16 +2396,23 @@ impl App {
     /// text, so the reader can fix it or carry it out through the external editor —
     /// only a successful write ends the session.
     ///
-    /// Invariant: nothing after the store has taken the write may fail. The change
-    /// is already committed by then, so a failure that skipped the notice — or
-    /// ended the session — would leave the reader believing nothing happened; the
-    /// re-read that follows it cannot fail for exactly that reason.
+    /// Invariant: every changed outcome reloads before the result is shown. Most
+    /// changed writes succeed, but a cascade can close descendants and then refuse;
+    /// keeping that decision with the typed outcome prevents success and partial
+    /// failure from acquiring separate refresh rules.
     fn commit(&mut self, write: &data::Write, done: String) {
-        let refusal = match data::perform(&self.store, write) {
+        let outcome = data::perform(&self.store, write);
+        let changed = match &outcome {
+            Ok(_) => true,
+            Err(refusal) => refusal.changed(),
+        };
+        if changed {
+            self.reload();
+        }
+        let refusal = match outcome {
             Ok(effect) => {
                 self.surface = None;
                 self.editing = None;
-                self.reload();
                 self.flash(reported(done, effect));
                 return;
             }
@@ -2426,13 +2433,16 @@ impl App {
             // A rule refusal can be the version gate itself — a migration can
             // start or finish while the mode is open — and the writability
             // marker is a snapshot from whenever it was last asked, not a
-            // licence that stays valid until the next reload. So a refusal is
-            // asked again here rather than left to go on claiming a write is
-            // possible until something else happens to reload.
+            // licence that stays valid until the next reload. So an unchanged
+            // refusal is asked again here rather than left to go on claiming a
+            // write is possible until something else happens to reload.
             data::Refusal::Rule(message) => {
                 self.read_only = data::read_only(&self.store);
                 Dialog::refusal(message)
             }
+            // Reloading partial progress happened with every other changed
+            // outcome above; the critical refusal still wins over a notice.
+            data::Refusal::Partial(message) => Dialog::refusal(message),
         };
         self.modal = Some(Modal::Dialog(Box::new(dialog)));
     }
@@ -2893,6 +2903,10 @@ mod tests {
     use crate::data::fixture::Fixture;
     use crate::data::{FreeForm, RowKind};
     use crate::theme::Theme;
+    use loti_core::lock::{self, LockConfig};
+    use loti_core::ops::{self, NewNode};
+    use loti_core::NodeState;
+    use std::time::Duration;
 
     /// The browser on the shared fixture store. The fixture is returned with it
     /// because the store is deleted when the fixture is dropped.
@@ -2900,6 +2914,67 @@ mod tests {
         let fx = Fixture::build();
         let app = App::new(fx.store.clone(), Theme::with_color(false)).unwrap();
         (fx, app)
+    }
+
+    #[test]
+    fn a_partial_refusal_reloads_the_rows_held_behind_its_dialog() {
+        let fx = Fixture::build();
+        let store = Store::at(fx.store.root()).with_lock_config(LockConfig {
+            stale_threshold: Duration::from_millis(80),
+            retry_interval: Duration::from_millis(5),
+        });
+        // Keep a second target locked so the first descendant commits before the
+        // cascade reaches its controlled failure.
+        let tail = ops::create_node(
+            &store,
+            NewNode {
+                epic_id: fx.epic.clone(),
+                parent: Some(fx.subnode.clone()),
+                name: "cascade tail".into(),
+                summary: String::new(),
+                labels: Vec::new(),
+                body: String::new(),
+            },
+        )
+        .expect("the tail can be created");
+        let held = lock::try_acquire(&store.node_path(&fx.epic, tail.frontmatter.number))
+            .expect("the tail lock can be taken")
+            .expect("the tail was unlocked");
+        let mut app = App::new(store, Theme::with_color(false)).unwrap();
+
+        // The level behind the dialog is already open. Calling the write boundary
+        // here pins its obligation to refresh every held level, not a later descent
+        // that would load the changed descendant anew.
+        app.apply(Action::Descend).unwrap();
+        to_work_row(&mut app);
+        app.apply(Action::Descend).unwrap();
+        app.commit(
+            &data::Write::SetState {
+                target: fx.node_selection(),
+                state: data::State::Work(NodeState::Closed),
+                reason: "obsolete".into(),
+                cascade: true,
+            },
+            "ignored".into(),
+        );
+        // Release before any assertion so a failure cannot leave fixture cleanup
+        // waiting on the controlled refusal.
+        drop(held);
+
+        assert!(
+            matches!(app.modal(), Some(Modal::Dialog(_))),
+            "no refusal dialog opened"
+        );
+        let child = app
+            .nav()
+            .rows()
+            .iter()
+            .find(|row| row.selection == fx.subnode_selection())
+            .expect("the first cascade descendant row behind the dialog");
+        assert!(
+            matches!(&child.kind, RowKind::Work { status, .. } if status == "closed"),
+            "the held rows still show the state before the partial cascade: {child:?}"
+        );
     }
 
     #[test]
@@ -3278,7 +3353,7 @@ mod tests {
     /// browser's own words, so it must not stand in for a refusal shown verbatim.
     fn store_refusal(store: &Store, write: &data::Write, why: &str) -> String {
         match data::perform(store, write) {
-            Err(data::Refusal::Rule(words)) => words,
+            Err(data::Refusal::Rule(words) | data::Refusal::Partial(words)) => words,
             other => panic!("{why}: {other:?}"),
         }
     }
