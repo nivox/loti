@@ -12,7 +12,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::action::{Action, AnswerWords, Answers, EditingAction, Fields, Lines, Mode, Shape};
+use crate::action::{Action, AnswerWords, Answers, EditingAction, FieldKind, Fields, Mode, Shape};
 use crate::data::FreeForm;
 
 /// The intent a key press carries in a mode, or `None` if it is not bound there.
@@ -96,6 +96,9 @@ pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
         (KeyCode::Char('S'), false) if matches!(mode, Mode::Editing) => {
             Action::Edit(FreeForm::Summary)
         }
+        // The unshifted letter belongs to the state because the state is the action
+        // a reader takes far more often than any other; the summary takes the shift.
+        (KeyCode::Char('s'), false) if matches!(mode, Mode::Editing) => Action::SetState,
         // The one shift-pair whose halves are the same noun: the letter takes the
         // claim and the shifted letter gives it up. Giving up is the shifted half
         // because it is offered only while a claim is held, so it is the rarer of
@@ -123,10 +126,11 @@ pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
 /// ignored rather than handed to the level underneath.
 ///
 /// The surface's shape is an input rather than something read off a key, because
-/// two keys mean different things by it: how many fields there are decides whether
-/// the field-motion keys have anywhere to go, and how many lines the focused field
-/// holds decides whether a line break is content. Neither decides how a surface is
-/// accepted — that is one key everywhere.
+/// several keys mean different things by it: how many fields there are decides
+/// whether the field-motion keys have anywhere to go, and what kind of field the
+/// keyboard is in decides whether a line break is content, what the vertical keys
+/// move, and whether there is any text for the external editor to take. None of
+/// them decides how a surface is accepted — that is one key everywhere.
 fn surface_action(key: KeyEvent, shape: Shape) -> Option<Action> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     Some(match (key.code, ctrl) {
@@ -142,13 +146,21 @@ fn surface_action(key: KeyEvent, shape: Shape) -> Option<Action> {
         // already carries the save key, and a notice covers the whole strip for as
         // long as it is up, so teaching the save key would hide the hint that
         // teaches it along with the field and editor hints beside it.
-        (KeyCode::Enter, _) if matches!(shape.lines, Lines::Many) => Action::Insert('\n'),
+        (KeyCode::Enter, _) if matches!(shape.kind, FieldKind::ManyLines) => Action::Insert('\n'),
         // Field motion, and the only keys that move between fields. Bound where
         // there is another field to reach and nowhere else: a key that did nothing
         // on a one-field surface would be a key taught for nothing.
         (KeyCode::Tab, _) if matches!(shape.fields, Fields::Several) => Action::NextField,
         (KeyCode::BackTab, _) if matches!(shape.fields, Fields::Several) => Action::PreviousField,
-        (KeyCode::Char('g'), true) => Action::ExternalEditor,
+        // Handing the field over is for a field made of text: a picker holds none,
+        // so there is nothing to hand over and nothing an editor could hand back.
+        // Unbound there rather than ignored, so the strip and the key are settled by
+        // one answer.
+        (KeyCode::Char('g'), true)
+            if matches!(shape.kind, FieldKind::OneLine | FieldKind::ManyLines) =>
+        {
+            Action::ExternalEditor
+        }
         (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => Action::Unwind,
         // The one help key that can be pressed inside a field.
         (KeyCode::F(1), _) => Action::ToggleHelp,
@@ -161,13 +173,19 @@ fn surface_action(key: KeyEvent, shape: Shape) -> Option<Action> {
         (KeyCode::Char('e'), true) | (KeyCode::End, _) => Action::MoveToEnd,
         (KeyCode::Char('b'), true) | (KeyCode::Left, _) => Action::MoveLeft,
         (KeyCode::Char('f'), true) | (KeyCode::Right, _) => Action::MoveRight,
-        // Vertical motion, bound where there is a line to move to and nowhere else:
-        // in a field holding one line these keys would land where they started, and
-        // a key taught for that is a key taught for nothing.
-        (KeyCode::Up, _) | (KeyCode::Char('p'), true) if matches!(shape.lines, Lines::Many) => {
+        // Vertical motion, bound where there is something above or below to reach:
+        // another line of text, or the picker's next value. One meaning — up and
+        // down — and the field the keyboard is in says what is up and down in it.
+        // In a field holding one line there is neither, so the keys are unbound
+        // rather than landing where they started.
+        (KeyCode::Up, _) | (KeyCode::Char('p'), true)
+            if matches!(shape.kind, FieldKind::ManyLines | FieldKind::Pick) =>
+        {
             Action::MoveUp
         }
-        (KeyCode::Down, _) | (KeyCode::Char('n'), true) if matches!(shape.lines, Lines::Many) => {
+        (KeyCode::Down, _) | (KeyCode::Char('n'), true)
+            if matches!(shape.kind, FieldKind::ManyLines | FieldKind::Pick) =>
+        {
             Action::MoveDown
         }
 
@@ -253,7 +271,7 @@ pub fn dialog_answers(answers: Answers, words: AnswerWords) -> Vec<String> {
 pub const HELP: &[(&str, &str)] = &[
     (
         "j / k / ↓ / ↑",
-        "move the cursor; ↑ / ↓ by line in a text area",
+        "move the cursor; ↑ / ↓ by line, or through a picker",
     ),
     ("g / G", "first / last row"),
     // Enter's two meanings, and it has no third: it is a line break where breaks
@@ -284,7 +302,14 @@ pub const HELP: &[(&str, &str)] = &[
         "n / S / b",
         "editing mode: the name / the summary / the body",
     ),
-    ("c / C", "editing mode: take the claim / release it"),
+    // Three keys on one row, for the same reason the fields above share one: the
+    // list is as tall as the shortest terminal the browser supports and a row past
+    // that is clipped without saying so. These three set what a row *is* rather than
+    // what it says, so they read as one group.
+    (
+        "s / c / C",
+        "editing mode: the state / take the claim / release it",
+    ),
     ("Ctrl-S", "save, whichever field you are in"),
     ("Tab / Shift-Tab", "next / previous field"),
     ("Ctrl-G", "edit the open field in $EDITOR"),
@@ -331,6 +356,7 @@ pub const FOOTER_HINTS_EDITING: &[(EditingAction, &str)] = &[
     (EditingAction::Edit(FreeForm::Name), "n name"),
     (EditingAction::Edit(FreeForm::Summary), "S summary"),
     (EditingAction::Edit(FreeForm::Body), "b body"),
+    (EditingAction::SetState, "s state"),
     (EditingAction::TakeClaim, "c claim"),
     (EditingAction::ReleaseClaim, "C release"),
 ];
@@ -344,14 +370,18 @@ pub const FOOTER_HINTS_EDITING: &[(EditingAction, &str)] = &[
 /// are letters a row offers and this row offers none of them — while a surface is
 /// open the only keys that apply are the surface's.
 ///
-/// The field-navigation hint is listed on a surface with fields to move between
-/// and on no other, because the strip must never name a key the surface ignores.
-pub fn footer_hints_surface(fields: Fields) -> Vec<&'static str> {
+/// Each hint is listed only where the surface answers the key it names, because the
+/// strip must never name a key the surface ignores: the field-navigation hint wants
+/// another field to reach, and the external editor wants a field made of text — a
+/// picker has none to hand over.
+pub fn footer_hints_surface(shape: Shape) -> Vec<&'static str> {
     let mut hints = vec!["Ctrl-S save"];
-    if matches!(fields, Fields::Several) {
+    if matches!(shape.fields, Fields::Several) {
         hints.push("Tab fields");
     }
-    hints.push("Ctrl-G editor");
+    if matches!(shape.kind, FieldKind::OneLine | FieldKind::ManyLines) {
+        hints.push("Ctrl-G editor");
+    }
     hints
 }
 
@@ -394,28 +424,45 @@ mod tests {
         Shape::ALL.iter().copied().map(Mode::Surface).collect()
     }
 
-    /// A surface holding this many fields, whose focused field holds one line —
-    /// the shape every surface the browser ships has.
+    /// A surface holding this many fields, whose focused field is one line of text.
     fn one_line(fields: Fields) -> Mode {
         Mode::Surface(Shape {
             fields,
-            lines: Lines::One,
+            kind: FieldKind::OneLine,
         })
     }
 
-    /// A surface whose focused field holds many lines, at each field count: the
-    /// count must not change what the reflex key means there.
-    fn text_areas() -> Vec<Mode> {
+    /// Every mode a surface whose focused field is of this kind puts the keyboard
+    /// under, one per field count: how many fields there are must not change what a
+    /// key means inside the field the keyboard is in.
+    fn focused_on(kind: FieldKind) -> Vec<Mode> {
         Fields::ALL
             .iter()
             .copied()
-            .map(|fields| {
-                Mode::Surface(Shape {
-                    fields,
-                    lines: Lines::Many,
-                })
-            })
+            .map(|fields| Mode::Surface(Shape { fields, kind }))
             .collect()
+    }
+
+    /// A surface whose focused field holds many lines, at each field count.
+    fn text_areas() -> Vec<Mode> {
+        focused_on(FieldKind::ManyLines)
+    }
+
+    /// A surface whose focused field is a picker, at each field count.
+    fn pickers() -> Vec<Mode> {
+        focused_on(FieldKind::Pick)
+    }
+
+    /// Every mode a surface whose focused field is made of text puts the keyboard
+    /// under: the kinds an external editor can be handed, and the kinds a character
+    /// is content in.
+    fn text_fields() -> Vec<Mode> {
+        text_areas().into_iter().chain(one_lines()).collect()
+    }
+
+    /// A surface whose focused field is one line of text, at each field count.
+    fn one_lines() -> Vec<Mode> {
+        focused_on(FieldKind::OneLine)
     }
 
     /// Every key press a terminal can deliver that this crate could plausibly
@@ -663,9 +710,10 @@ mod tests {
     }
 
     #[test]
-    fn a_surface_is_left_and_handed_to_the_editor_by_the_same_keys_on_every_shape() {
+    fn a_surface_is_left_by_the_same_keys_on_every_shape_and_only_a_field_of_text_is_handed_over() {
         for mode in surface_modes() {
-            // The way out, and its alias: inside a mode Ctrl-C is exactly Esc.
+            // The way out, and its alias: inside a mode Ctrl-C is exactly Esc. One
+            // key whatever the reader is standing in, picker included.
             for key in [plain(KeyCode::Esc), ctrl('c')] {
                 assert_eq!(
                     action_for(key, mode),
@@ -673,11 +721,58 @@ mod tests {
                     "{key:?} in {mode:?}"
                 );
             }
+        }
+        // The external editor reaches a field made of text, whichever kind and
+        // however many fields there are.
+        for mode in text_fields() {
             assert_eq!(
                 action_for(ctrl('g'), mode),
                 Some(Action::ExternalEditor),
                 "{mode:?}"
             );
+        }
+        // And nowhere else: a picker holds no text, so there is nothing to hand an
+        // editor and nothing it could hand back. Unbound rather than ignored, so the
+        // strip that lists it and the key that answers it are settled by one answer.
+        for mode in pickers() {
+            assert_eq!(action_for(ctrl('g'), mode), None, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn the_vertical_keys_move_a_pickers_mark_and_nothing_else_in_it_does() {
+        // A picker has no confirming key: the keys that move the mark are the keys
+        // that change what a save would write, and they are the same keys that move
+        // by line in a text area — one meaning, and the field says what is up and
+        // down in it.
+        for mode in pickers() {
+            for (key, intent) in [
+                (plain(KeyCode::Up), Action::MoveUp),
+                (plain(KeyCode::Down), Action::MoveDown),
+                (ctrl('p'), Action::MoveUp),
+                (ctrl('n'), Action::MoveDown),
+            ] {
+                assert_eq!(action_for(key, mode), Some(intent), "{key:?} in {mode:?}");
+            }
+            // And no other key moves it: a value the reader did not mark must not be
+            // what a save writes, and the sweep is the point — the keys that must not
+            // move a mark are the list nobody thinks to write down.
+            for key in every_key().into_iter().filter(|key| {
+                !matches!(key.code, KeyCode::Up | KeyCode::Down)
+                    && *key != ctrl('p')
+                    && *key != ctrl('n')
+            }) {
+                assert!(
+                    !matches!(
+                        action_for(key, mode),
+                        Some(Action::MoveUp) | Some(Action::MoveDown)
+                    ),
+                    "{key:?} moves the mark in {mode:?}"
+                );
+            }
+            // The reflex key is not a way of confirming one either: a break is
+            // content in a text area and nothing anywhere else, a picker included.
+            assert_eq!(action_for(plain(KeyCode::Enter), mode), None, "{mode:?}");
         }
     }
 
@@ -686,26 +781,26 @@ mod tests {
         // Whatever kind of field the keyboard is in: the count decides whether there
         // is anywhere to go, and the kind never does — a form holding a text area is
         // navigated exactly like one that does not.
-        for lines in Lines::ALL.iter().copied() {
+        for kind in FieldKind::ALL.iter().copied() {
             let several = Mode::Surface(Shape {
                 fields: Fields::Several,
-                lines,
+                kind,
             });
             assert_eq!(
                 action_for(key_named("Tab"), several),
                 Some(Action::NextField),
-                "{lines:?}"
+                "{kind:?}"
             );
             assert_eq!(
                 action_for(key_named("Shift-Tab"), several),
                 Some(Action::PreviousField),
-                "{lines:?}"
+                "{kind:?}"
             );
             // And no field to move to means no key that moves: a bound key that
             // could only land where it started is a key taught for nothing.
             let one = Mode::Surface(Shape {
                 fields: Fields::One,
-                lines,
+                kind,
             });
             for key in [key_named("Tab"), key_named("Shift-Tab")] {
                 assert_eq!(action_for(key, one), None, "{key:?} in {one:?}");
@@ -768,7 +863,7 @@ mod tests {
         // actions' hints: a row offers those, and while a surface is open no row
         // offers anything.
         for shape in Shape::ALL.iter().copied() {
-            let hints = footer_hints_surface(shape.fields);
+            let hints = footer_hints_surface(shape);
             for hint in &hints {
                 assert!(
                     action_for(key_named(leading(hint)), Mode::Surface(shape)).is_some(),
@@ -781,6 +876,14 @@ mod tests {
             assert_eq!(
                 hints.iter().any(|hint| leading(hint) == "Tab"),
                 shape.fields == Fields::Several,
+                "{shape:?}: {hints:?}"
+            );
+            // And so is the external editor: it takes a field made of text, so the
+            // strip teaches it in one and stays quiet in a picker, which has no text
+            // to hand over.
+            assert_eq!(
+                hints.iter().any(|hint| leading(hint) == "Ctrl-G"),
+                shape.kind != FieldKind::Pick,
                 "{shape:?}: {hints:?}"
             );
         }

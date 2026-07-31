@@ -12,8 +12,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use crate::action::Lines;
-use crate::app::{App, Field, Modal, Placement, Surface};
+use crate::action::FieldKind;
+use crate::app::{App, Field, Modal, Placement, Shown, Surface};
 use crate::data::{ReadOnly, Row, RowKind, Selection};
 use crate::keymap;
 use crate::theme::{glyph, Theme};
@@ -95,6 +95,17 @@ const GUTTER_BAR: &str = "▌";
 /// away, because a holder is long enough to crowd out the name that identifies
 /// the row.
 const CLAIM_MARKER: &str = "@";
+
+/// The mark on the value a picker holds, and the blank of the same width on every
+/// other value.
+///
+/// A shape rather than a colour, like every other state signal in the browser, so
+/// what a save would write is legible with colour disabled. It marks the value
+/// itself and stands for no separate control: a picker has no confirming key, so
+/// what is marked is what is written.
+const PICK_MARKER: &str = "\u{25b8}";
+/// See [`PICK_MARKER`].
+const PICK_UNMARKED: &str = " ";
 
 /// How wide a dialog wants to be. Fixed rather than sized to its content: a
 /// refusal can be a paragraph, and a float as wide as the terminal would stop
@@ -191,7 +202,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 /// with no cursor does not say where the next character lands.
 fn draw_surface(f: &mut Frame, theme: Theme, surface: &Surface, pane: Rect) {
     let fields = surface.fields();
-    let popup = surface_area(surface.placement(), f.area(), pane, fields.len());
+    let popup = surface_area(
+        surface.placement(),
+        f.area(),
+        pane,
+        least_interior(&demands(fields)),
+    );
     let width = popup.width;
     let label_width = fields
         .iter()
@@ -199,13 +215,18 @@ fn draw_surface(f: &mut Frame, theme: Theme, surface: &Surface, pane: Rect) {
         .max()
         .unwrap_or(0);
     let value_width = value_width(width, label_width);
-    let kinds: Vec<Lines> = fields.iter().map(Field::lines).collect();
-    let heights = field_heights(&kinds, popup.height.saturating_sub(2) as usize);
+    let heights = field_heights(&demands(fields), popup.height.saturating_sub(2) as usize);
     let mut lines: Vec<Line> = Vec::new();
     let mut cursor: Option<(usize, usize)> = None;
     for (index, (field, height)) in fields.iter().zip(&heights).enumerate() {
-        let (shown, (row, column)) =
-            field_view(field.value(), field.cursor(), value_width, *height);
+        let (shown, (row, column)) = match field.shown() {
+            Shown::Text { value, cursor } => field_view(value, cursor, value_width, *height),
+            // A picker's values are drawn as the list the vertical keys move
+            // through, one to a line, with the one it holds marked. The cursor sits
+            // on that mark: a picker has no place for the next character, so where
+            // the cursor says the keyboard is is the value a save would write.
+            Shown::Pick { options, at } => (pick_view(&options, at), (at, 0)),
+        };
         if index == surface.focus() {
             cursor = Some((lines.len() + row, column));
         }
@@ -245,25 +266,104 @@ fn draw_surface(f: &mut Frame, theme: Theme, surface: &Surface, pane: Rect) {
     }
 }
 
+/// The lines one value of a picker is drawn on: the values in the order the
+/// vertical keys move through them, with the one the field holds marked.
+fn pick_view(options: &[&str], at: usize) -> Vec<String> {
+    options
+        .iter()
+        .enumerate()
+        .map(|(index, option)| {
+            let mark = match index == at {
+                true => PICK_MARKER,
+                false => PICK_UNMARKED,
+            };
+            format!("{mark} {option}")
+        })
+        .collect()
+}
+
+/// How many screen lines one field asks a surface for.
+///
+/// Invariant: what a field asks for follows from what it is, so a kind added later
+/// cannot inherit the last one's answer — which for a picker would draw one of its
+/// values and hide the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Demand {
+    /// Exactly this many, whatever the surface has: one for a line of text, and one
+    /// per value for a picker, whose values are moved through vertically and so are
+    /// drawn that way.
+    Fixed(usize),
+    /// Whatever the surface has left over, which is what makes a field of many lines
+    /// a text area rather than a very long line.
+    Rest,
+}
+
+/// How many screen lines a field of this kind, offering this many values, asks a
+/// surface for.
+///
+/// The count is a picker's: a field of text offers no values, and every field keeps
+/// a line whatever it offers, because a field with no line on screen has nowhere to
+/// put the cursor that says the keyboard is in it.
+fn demand(kind: FieldKind, values: usize) -> Demand {
+    match kind {
+        FieldKind::OneLine => Demand::Fixed(1),
+        FieldKind::ManyLines => Demand::Rest,
+        FieldKind::Pick => Demand::Fixed(values.max(1)),
+    }
+}
+
+/// What each field of a surface asks for; see [`demand`].
+fn demands(fields: &[Field]) -> Vec<Demand> {
+    fields
+        .iter()
+        .map(|field| {
+            let values = match field.shown() {
+                Shown::Pick { options, .. } => options.len(),
+                Shown::Text { .. } => 0,
+            };
+            demand(field.kind(), values)
+        })
+        .collect()
+}
+
+/// The least tall a surface holding these fields can be drawn: what every field
+/// asks for outright, plus a line for each that wants what is left over.
+fn least_interior(demands: &[Demand]) -> usize {
+    demands
+        .iter()
+        .map(|demand| match demand {
+            Demand::Fixed(lines) => *lines,
+            Demand::Rest => 1,
+        })
+        .sum()
+}
+
 /// How many screen lines each field of a surface is drawn on.
 ///
-/// A field that holds one line takes one. What is left of the surface goes to the
-/// fields that hold many, so a body is drawn as the lines the reader wrote instead
-/// of with its breaks collapsed into one — which is the whole difference between a
-/// text area and a long single line. Every field keeps at least one line however
-/// short the surface is: a field with no line on screen has nowhere to put its
-/// cursor.
-fn field_heights(kinds: &[Lines], interior: usize) -> Vec<usize> {
-    let many = kinds
+/// A field takes what it asks for, and what is left of the surface is shared between
+/// the fields that asked for the remainder — so a body is drawn as the lines the
+/// reader wrote instead of with its breaks collapsed into one, which is the whole
+/// difference between a text area and a long single line. Every field keeps at least
+/// one line however short the surface is: a field with no line on screen has nowhere
+/// to put its cursor.
+fn field_heights(demands: &[Demand], interior: usize) -> Vec<usize> {
+    let rest = demands
         .iter()
-        .filter(|lines| matches!(lines, Lines::Many))
+        .filter(|demand| matches!(demand, Demand::Rest))
         .count();
-    let spare = interior.saturating_sub(kinds.len() - many);
-    kinds
+    let claimed: usize = demands
         .iter()
-        .map(|lines| match lines {
-            Lines::One => 1,
-            Lines::Many => (spare / many.max(1)).max(1),
+        .map(|demand| match demand {
+            Demand::Fixed(lines) => *lines,
+            Demand::Rest => 0,
+        })
+        .sum();
+    let spare = interior.saturating_sub(claimed);
+    demands
+        .iter()
+        .map(|demand| match demand {
+            Demand::Fixed(lines) => (*lines).max(1),
+            Demand::Rest => (spare / rest.max(1)).max(1),
         })
         .collect()
 }
@@ -276,9 +376,9 @@ fn field_heights(kinds: &[Lines], interior: usize) -> Vec<usize> {
 /// takes the pane exactly, so the frozen row stays visible in the navigation pane
 /// beside it — and it follows the pane wherever the pane is, rather than answering
 /// the separate question of whether an open surface may fill the width.
-fn surface_area(placement: Placement, screen: Rect, pane: Rect, fields: usize) -> Rect {
+fn surface_area(placement: Placement, screen: Rect, pane: Rect, interior: usize) -> Rect {
     match placement {
-        Placement::Float => centred(screen, DIALOG_WIDTH, fields as u16 + 2),
+        Placement::Float => centred(screen, DIALOG_WIDTH, interior as u16 + 2),
         Placement::Pane => pane,
     }
 }
@@ -559,7 +659,7 @@ fn footer(app: &App, width: u16) -> Span<'static> {
                 // holds, so the strip asks the surface for its shape exactly as the
                 // key map does: the strip and the keys cannot then disagree.
                 (Some(surface), _) => (
-                    keymap::footer_hints_surface(surface.shape().fields),
+                    keymap::footer_hints_surface(surface.shape()),
                     keymap::FOOTER_ESSENTIAL_SURFACE,
                 ),
                 (None, true) => (app.editing_hints(), keymap::FOOTER_ESSENTIAL_EDITING),
@@ -1278,9 +1378,9 @@ mod tests {
                 keymap::FOOTER_ESSENTIAL_EDITING,
             ),
         ];
-        for fields in crate::action::Fields::ALL.iter().copied() {
+        for shape in crate::action::Shape::ALL.iter().copied() {
             strips.push((
-                keymap::footer_hints_surface(fields),
+                keymap::footer_hints_surface(shape),
                 keymap::FOOTER_ESSENTIAL_SURFACE,
             ));
         }
@@ -1503,16 +1603,92 @@ mod tests {
     fn a_field_that_holds_many_lines_is_given_what_the_surface_has_left_over() {
         // One field holding many lines takes the whole interior: a body drawn on one
         // screen line is a body with its breaks collapsed.
-        assert_eq!(field_heights(&[Lines::Many], 20), vec![20]);
+        assert_eq!(field_heights(&[Demand::Rest], 20), vec![20]);
         // Beside a field that holds one line, that line comes off the top first.
-        assert_eq!(field_heights(&[Lines::One, Lines::Many], 20), vec![1, 19]);
+        assert_eq!(
+            field_heights(&[Demand::Fixed(1), Demand::Rest], 20),
+            vec![1, 19]
+        );
         // A surface of one-line fields is what it always was: a line each.
-        assert_eq!(field_heights(&[Lines::One, Lines::One], 20), vec![1, 1]);
+        assert_eq!(
+            field_heights(&[Demand::Fixed(1), Demand::Fixed(1)], 20),
+            vec![1, 1]
+        );
+        // A field that asks for several lines outright — a picker, one per value —
+        // takes them off the top too, and what is left over is still the text area's.
+        assert_eq!(
+            field_heights(&[Demand::Fixed(5), Demand::Rest], 20),
+            vec![5, 15]
+        );
         // And every field keeps a line however short the surface is: a field with no
         // line on screen has nowhere to put its cursor.
         for interior in 0..4usize {
-            let heights = field_heights(&[Lines::One, Lines::Many], interior);
+            let heights = field_heights(&[Demand::Fixed(1), Demand::Rest], interior);
             assert!(heights.iter().all(|h| *h >= 1), "{interior}: {heights:?}");
+        }
+    }
+
+    #[test]
+    fn a_field_asks_for_the_lines_its_own_kind_needs_and_a_float_is_as_tall_as_all_of_them() {
+        // Every kind, so a kind added later has to say what it asks for rather than
+        // inheriting the last arm's answer — which for a picker would draw one of its
+        // values and hide the rest.
+        for kind in FieldKind::ALL.iter().copied() {
+            let asked = demand(kind, 5);
+            match kind {
+                // A line of text is one line, wherever it is drawn.
+                FieldKind::OneLine => assert_eq!(asked, Demand::Fixed(1)),
+                // A text area is what the surface has left, which is what makes it an
+                // area rather than a very long line.
+                FieldKind::ManyLines => assert_eq!(asked, Demand::Rest),
+                // A picker asks for one line per value it offers: its values are
+                // moved through vertically, so they are all on screen to be moved
+                // through, and none is hidden behind the one that is marked.
+                FieldKind::Pick => assert_eq!(asked, Demand::Fixed(5)),
+            }
+            // Every kind keeps a line however little it is given: a field with no
+            // line on screen has nowhere to put its cursor.
+            assert!(field_heights(&[asked], 0)[0] >= 1, "{kind:?}");
+        }
+        // A float is as tall as everything its fields ask for, plus its borders, so a
+        // picker's values cannot fall off the bottom of the surface offering them.
+        let form = [demand(FieldKind::Pick, 5), demand(FieldKind::OneLine, 0)];
+        assert_eq!(least_interior(&form), 6);
+        assert_eq!(field_heights(&form, least_interior(&form)), vec![5, 1]);
+    }
+
+    #[test]
+    fn a_picker_marks_the_value_it_holds_and_no_other() {
+        // The mark is a shape rather than a colour, like every other state signal
+        // here, so what a save would write is legible with colour disabled — and it
+        // marks exactly one value, because a picker holds exactly one.
+        let drawn = pick_view(&["to-do", "blocked", "closed"], 1);
+        assert_eq!(
+            drawn,
+            vec![
+                format!("{PICK_UNMARKED} to-do"),
+                format!("{PICK_MARKER} blocked"),
+                format!("{PICK_UNMARKED} closed"),
+            ]
+        );
+        // Every value is on screen whichever is marked, and the mark costs the same
+        // columns as the blank beside it, so the words stay in one column.
+        for at in 0..3 {
+            let drawn = pick_view(&["to-do", "blocked", "closed"], at);
+            assert_eq!(
+                drawn
+                    .iter()
+                    .filter(|line| line.contains(PICK_MARKER))
+                    .count(),
+                1,
+                "{at}: {drawn:?}"
+            );
+            let widths: Vec<usize> = drawn
+                .iter()
+                .zip(["to-do", "blocked", "closed"])
+                .map(|(line, word)| line.chars().count() - word.chars().count())
+                .collect();
+            assert!(widths.windows(2).all(|w| w[0] == w[1]), "{drawn:?}");
         }
     }
 

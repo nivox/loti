@@ -70,8 +70,8 @@ impl Fields {
     }
 }
 
-/// How many lines a field holds, which is the axis deciding whether a line break
-/// is content or a key doing something else.
+/// How many lines a field of text holds, which is the axis deciding whether a
+/// line break is content or a key doing something else.
 ///
 /// Invariant: a one-line field never holds a line break, whichever door text
 /// arrives through — a keystroke, or an external editor's result. A field that
@@ -86,27 +86,69 @@ pub enum Lines {
 }
 
 impl Lines {
-    /// Every kind a field may be, so a surface that has to cover them all — the
+    /// Every kind of text field, so a surface that has to cover them all — the
     /// keys each answers, and what each does with a line break — cannot miss one.
     pub const ALL: &'static [Lines] = &[Lines::One, Lines::Many];
 }
 
-/// An open surface as the key map is told it: how many fields it holds, and how
-/// many lines the field the keyboard is in holds.
+/// What kind of field the keyboard is in, which is the axis a key's meaning turns
+/// on inside an open surface.
+///
+/// Invariant: this says what the field *is*, not how much it holds — a picker
+/// holds no lines at all, so a count of lines could not name it. A line break is
+/// content in one kind and nothing anywhere else; the vertical keys move by line
+/// in one kind and change the value in another; and the external editor reaches
+/// the kinds made of text and no other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldKind {
+    /// Text on one line.
+    OneLine,
+    /// Text on as many lines as the reader writes.
+    ManyLines,
+    /// One of a fixed set of values, whichever is highlighted.
+    ///
+    /// It has no confirming key: the value is what is marked, so the keys that
+    /// move the highlight are the keys that change what a save would write, and
+    /// there is nothing to type into it.
+    Pick,
+}
+
+impl FieldKind {
+    /// Every kind a field may be, so a surface that has to cover them all — the
+    /// keys each answers, the hints each lists, the lines each is drawn on —
+    /// cannot miss one.
+    pub const ALL: &'static [FieldKind] =
+        &[FieldKind::OneLine, FieldKind::ManyLines, FieldKind::Pick];
+
+    /// The kind a field of text this tall is. Derived from how many lines it
+    /// holds rather than named a second time, so a field of text can never come
+    /// to describe itself as a picker.
+    pub fn text(lines: Lines) -> Self {
+        match lines {
+            Lines::One => FieldKind::OneLine,
+            Lines::Many => FieldKind::ManyLines,
+        }
+    }
+}
+
+/// An open surface as the key map is told it: how many fields it holds, and what
+/// kind of field the keyboard is in.
 ///
 /// Invariant: the two halves answer different keys and never the same one. The
 /// count decides whether the field-motion keys have anywhere to go; the kind
-/// decides whether the reflex key is a line break, which it is in a field holding
-/// many lines and nowhere else. Accepting is the save key's alone on every shape,
-/// so neither half takes part in that decision: one key means one thing wherever
-/// the reader is, rather than a rule with cases to remember.
+/// decides whether the reflex key is a line break, what the vertical keys move,
+/// and whether the external editor has any text to take. Accepting is the save
+/// key's alone on every shape, so neither half takes part in that decision: one
+/// key means one thing wherever the reader is, rather than a rule with cases to
+/// remember.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Shape {
     /// How many fields the surface holds.
     pub fields: Fields,
-    /// How many lines the focused field holds. The focused one, because a key is
-    /// answered by the field it lands in and a surface may hold both kinds.
-    pub lines: Lines,
+    /// What kind of field the keyboard is in. The focused one, because a key is
+    /// answered by the field it lands in and a surface may hold every kind at
+    /// once.
+    pub kind: FieldKind,
 }
 
 impl Shape {
@@ -115,19 +157,27 @@ impl Shape {
     pub const ALL: &'static [Shape] = &[
         Shape {
             fields: Fields::One,
-            lines: Lines::One,
+            kind: FieldKind::OneLine,
         },
         Shape {
             fields: Fields::One,
-            lines: Lines::Many,
+            kind: FieldKind::ManyLines,
+        },
+        Shape {
+            fields: Fields::One,
+            kind: FieldKind::Pick,
         },
         Shape {
             fields: Fields::Several,
-            lines: Lines::One,
+            kind: FieldKind::OneLine,
         },
         Shape {
             fields: Fields::Several,
-            lines: Lines::Many,
+            kind: FieldKind::ManyLines,
+        },
+        Shape {
+            fields: Fields::Several,
+            kind: FieldKind::Pick,
         },
     ];
 }
@@ -219,6 +269,9 @@ pub enum EditingAction {
     /// read and asked about the same way on a conflict, so a further replaceable
     /// field is a field here rather than another path through all of that.
     Edit(FreeForm),
+    /// Put the frozen row into a state the reader picks: the five a unit of work
+    /// moves between, or the stored flag an epic is open or closed by.
+    SetState,
     /// Take the claim on the frozen row, for a holder the reader types — which
     /// reassigns it when it is already held, because a claim has one holder.
     TakeClaim,
@@ -242,6 +295,7 @@ impl EditingAction {
         EditingAction::Edit(FreeForm::Name),
         EditingAction::Edit(FreeForm::Summary),
         EditingAction::Edit(FreeForm::Body),
+        EditingAction::SetState,
         EditingAction::TakeClaim,
         EditingAction::ReleaseClaim,
     ];
@@ -253,6 +307,7 @@ impl EditingAction {
             EditingAction::Add => Action::Add,
             EditingAction::Delete => Action::Delete,
             EditingAction::Edit(field) => Action::Edit(field),
+            EditingAction::SetState => Action::SetState,
             EditingAction::TakeClaim => Action::TakeClaim,
             EditingAction::ReleaseClaim => Action::ReleaseClaim,
         }
@@ -323,6 +378,11 @@ pub enum Action {
     /// Replace one whole field of what editing mode is acting on, which opens a
     /// surface on that field's text as the store holds it now.
     Edit(FreeForm),
+    /// Put what editing mode is acting on into another state, which opens a
+    /// surface whose picker starts on the state the store holds now — and which
+    /// asks for whatever that new state needs: a reason, and whether closing takes
+    /// the row's open descendants with it.
+    SetState,
     /// Take the claim on what editing mode is acting on, which opens a surface
     /// for the holder. A claim has one holder, so taking an already-held claim
     /// reassigns it.
@@ -396,6 +456,7 @@ mod tests {
             match action {
                 EditingAction::Add
                 | EditingAction::Delete
+                | EditingAction::SetState
                 | EditingAction::TakeClaim
                 | EditingAction::ReleaseClaim => {}
                 // Every replaceable field is an action of its own, so a field
@@ -406,7 +467,7 @@ mod tests {
                 },
             }
         }
-        assert_eq!(EditingAction::ALL.len(), 4 + FreeForm::ALL.len());
+        assert_eq!(EditingAction::ALL.len(), 5 + FreeForm::ALL.len());
         for field in FreeForm::ALL {
             assert!(
                 EditingAction::ALL.contains(&EditingAction::Edit(*field)),
@@ -431,6 +492,24 @@ mod tests {
             }
         }
         assert_eq!(Lines::ALL.len(), 2);
+        for kind in FieldKind::ALL {
+            match kind {
+                FieldKind::OneLine | FieldKind::ManyLines | FieldKind::Pick => {}
+            }
+        }
+        assert_eq!(FieldKind::ALL.len(), 3);
+    }
+
+    #[test]
+    fn a_field_of_text_is_the_kind_its_line_count_names_and_never_the_picker() {
+        // Derived one from the other, so the two axes cannot disagree: a field the
+        // reader types into is never described to the key map as one they pick from,
+        // which would make a line break vanish and the vertical keys change a value.
+        assert_eq!(FieldKind::text(Lines::One), FieldKind::OneLine);
+        assert_eq!(FieldKind::text(Lines::Many), FieldKind::ManyLines);
+        for lines in Lines::ALL.iter().copied() {
+            assert_ne!(FieldKind::text(lines), FieldKind::Pick, "{lines:?}");
+        }
     }
 
     #[test]
@@ -442,10 +521,10 @@ mod tests {
             .iter()
             .copied()
             .flat_map(|fields| {
-                Lines::ALL
+                FieldKind::ALL
                     .iter()
                     .copied()
-                    .map(move |lines| Shape { fields, lines })
+                    .map(move |kind| Shape { fields, kind })
             })
             .collect();
         assert_eq!(Shape::ALL.len(), combinations.len());
@@ -486,6 +565,12 @@ mod tests {
         assert_eq!(EditingAction::for_intent(Action::MoveUp), None);
         assert_eq!(EditingAction::for_intent(Action::MoveDown), None);
         assert_eq!(EditingAction::for_intent(Action::Overwrite), None);
+        // And a state pick is one action rather than one per state: which state is
+        // picked is the surface's business, so no key carries it.
+        assert_eq!(
+            EditingAction::for_intent(Action::SetState),
+            Some(EditingAction::SetState)
+        );
         // And the two halves of the claim pair are two actions rather than one
         // with a direction: an intent that took a claim where it should release it
         // would be the one letter answering for the other.

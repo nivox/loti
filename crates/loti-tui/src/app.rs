@@ -11,7 +11,9 @@ use anyhow::Result;
 use loti_core::store::Store;
 use ratatui_markdown::viewer::MarkdownViewer;
 
-use crate::action::{Action, AnswerWords, Answers, EditingAction, Fields, Lines, Mode, Shape};
+use crate::action::{
+    Action, AnswerWords, Answers, EditingAction, FieldKind, Fields, Lines, Mode, Shape,
+};
 use crate::data::{self, Collection, Container, Level, ReadOnly, Selection};
 use crate::keymap;
 use crate::nav::Nav;
@@ -86,10 +88,49 @@ const LABEL_FIELD: &str = "label";
 /// out, so the field says so: what the reader types is a token the store
 /// resolves, not prose.
 const BLOCKER_FIELD: &str = "blocker reference";
+/// See [`LABEL_FIELD`]. The store's own word for the field a state is held in, on
+/// an epic as on a unit of work.
+const STATE_FIELD: &str = "status";
+/// See [`LABEL_FIELD`]. What a state that says why says it in. Revealed by the
+/// states that carry one and required while it is on screen, so the accept-time
+/// check that guards every other required field guards this one too.
+const REASON_FIELD: &str = "reason";
 /// See [`LABEL_FIELD`]. A claim's holder is freeform text and is not attribution:
 /// it says who is on the work rather than who wrote the change, so the field is
 /// named for the holder and never for an author.
 const CLAIM_FIELD: &str = "claim holder";
+
+/// What the field offering a cascade is called: the question it asks, with the
+/// number of nodes it would close in it.
+///
+/// The count is in the label rather than in a notice, because it is the whole of
+/// what the reader is deciding about — and it is what the plan said when the surface
+/// opened, which the store may recompute under the lock.
+fn cascade_label(open_descendants: usize) -> String {
+    match open_descendants {
+        1 => "also close 1 open descendant".to_string(),
+        count => format!("also close {count} open descendants"),
+    }
+}
+
+/// What a notice says once the write it reports has run: the words the surface
+/// chose, finished with whatever only the store could say.
+///
+/// A cascade's size is not knowable before the write — the count the field named was
+/// the plan as it stood when the surface opened, and the store recomputes it under
+/// the lock — so the notice is completed here rather than fixed with the question.
+/// That is also why the cascade is asked on a surface's field: a dialog's answer
+/// carries a notice worded before its write runs, which could not name this count.
+///
+/// It names the row and how many went with it rather than every reference: the strip
+/// holds one line, and the reloaded tree already shows which rows moved.
+fn reported(done: String, effect: data::Effect) -> String {
+    match effect {
+        data::Effect::AsAsked => done,
+        data::Effect::AlsoClosed(1) => format!("{done}, and 1 descendant with it"),
+        data::Effect::AlsoClosed(count) => format!("{done}, and {count} descendants with it"),
+    }
+}
 
 /// A transient one-line notice, holding the hint strip's line until its deadline
 /// passes.
@@ -143,10 +184,10 @@ enum Offer {
     ///
     /// A variant of its own because this offer is asked on every frame — the hint
     /// strip asks it — and a read per frame would be a read the reader never asked
-    /// for. So the offer says which text is wanted and the read happens when the
-    /// letter is pressed, which is also the moment the freshness rule names: the
-    /// buffer starts from the current text and the stamp is as fresh as the edit.
-    Compose(data::FreeForm),
+    /// for. So the offer says what is wanted and the read happens when the letter is
+    /// pressed, which is also the moment the freshness rule names: the buffer starts
+    /// from the current text and the stamp is as fresh as the edit.
+    Compose(Composed),
     /// A write with nothing to fill in and nothing to ask, because the row carries
     /// everything the write needs: the letter performs it.
     ///
@@ -162,6 +203,21 @@ enum Offer {
     /// reader who presses the letter anyway gets an answer better than "not an
     /// editing action" rather than being left to guess where else to look.
     Signpost(String),
+}
+
+/// What a surface has to be told by the store before it can open.
+///
+/// Invariant: every one of these is read when the letter is pressed and never
+/// earlier, because a surface must start from what the store holds now: a buffer
+/// opened on a stale preview writes back text nobody is looking at, and a picker
+/// opened on a stale state marks a state the row has already left.
+enum Composed {
+    /// One whole field's text, and the stamp it was read at.
+    Field(data::FreeForm),
+    /// The state the row is in, the states it may be put into, and how many of its
+    /// descendants are still open — the state to mark, and what a cascade would have
+    /// to close.
+    State,
 }
 
 /// A dialog: what it says, how it may be answered, what its answers are called,
@@ -377,37 +433,86 @@ impl Dialog {
     }
 }
 
-/// One text field of an editing surface.
+/// One value a picker offers.
 ///
-/// Invariant: a field says how many lines it holds, and that answer is the whole
-/// of the difference. A field holding one line never holds a line break, whichever
-/// door text arrives through — a keystroke or an external editor's result — and
-/// breaks are dropped rather than turned into spaces, because a space is content
-/// the reader did not type. A field holding many keeps them, and its cursor moves
-/// between lines as well as along one.
+/// Invariant: a picker's value is one of these rather than a word read back out of
+/// a field, so the write carries the value the reader marked and never a string
+/// parsed into a meaning — two pickers offer the word `closed` and mean different
+/// things by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Choice {
+    /// A state the frozen row is put into.
+    State(data::State),
+    /// Whether closing the frozen row takes its open descendants with it.
+    Cascade(bool),
+}
+
+impl Choice {
+    /// The word the reader picks it by. A state's word is the store's own; the
+    /// cascade's two are a plain answer to the question its label asks.
+    fn word(self) -> &'static str {
+        match self {
+            Choice::State(state) => state.wire_name(),
+            Choice::Cascade(true) => "yes",
+            Choice::Cascade(false) => "no",
+        }
+    }
+}
+
+/// What one field of a surface holds.
+///
+/// Invariant: the kinds are exclusive by construction rather than by a flag beside
+/// a shared value, so a picker has no cursor to move and no line break to drop,
+/// and a field of text has no highlight anything could be marked with. A field
+/// holding one line never holds a line break, whichever door text arrives through
+/// — a keystroke or an external editor's result — and breaks are dropped rather
+/// than turned into spaces, because a space is content the reader did not type. A
+/// field holding many keeps them, and its cursor moves between lines as well as
+/// along one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Content {
+    /// Text the reader types, and where in it the next character lands — counted
+    /// in characters and not bytes, so a multi-byte character is never split.
+    ///
+    /// How many lines it holds is not a property of what is in it: an empty field
+    /// that holds many lines is still a text area, and a one-line field stays one
+    /// however long its value grows.
+    Text {
+        value: String,
+        cursor: usize,
+        lines: Lines,
+    },
+    /// The values on offer, in the order the vertical keys move through them, and
+    /// which of them is marked.
+    ///
+    /// The marked one *is* the value: a picker has no confirming key, so moving
+    /// the mark is itself the change, and what is on screen is what a save writes.
+    Pick { options: Vec<Choice>, at: usize },
+}
+
+/// One field of an editing surface: something to type into, or something to pick
+/// from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field {
     /// What the field is called wherever it has to be named: on the surface, and
     /// in a warning about it. A warning is raised over the surface and the frozen
     /// row is covered, so a warning that named no field would not say which.
-    label: &'static str,
-    value: String,
-    /// Where the next character lands, counted in characters and not bytes, so a
-    /// multi-byte character is never split.
-    cursor: usize,
+    ///
+    /// Owned rather than borrowed, because a field's name may carry something read
+    /// from the store — how many descendants a cascade would close.
+    label: String,
     /// Whether the store cannot be given this surface with the field left empty.
     required: bool,
-    /// How many lines it holds. Not a property of what is in it: an empty field
-    /// that holds many lines is still a text area, and a one-line field stays one
-    /// however long its value grows.
-    lines: Lines,
+    /// What it holds, which is the whole of the difference between the kinds.
+    content: Content,
     /// Whether a content-mutating keystroke has landed here.
     ///
     /// Invariant: a flag, never a comparison against what the field started from.
     /// It is sticky — typing a character and deleting it again leaves the field
-    /// dirty — and cursor motion never sets it. So the way out warns about a field
-    /// that would lose nothing, which is accepted deliberately: a spurious warning
-    /// is cheap, and a flag costs no per-keystroke compare of a whole body against
+    /// dirty, as does marking a value and marking the first one back — and no
+    /// motion within a field ever sets it. So the way out warns about a field that
+    /// would lose nothing, which is accepted deliberately: a spurious warning is
+    /// cheap, and a flag costs no per-keystroke compare of a whole body against
     /// its original.
     dirty: bool,
 }
@@ -415,8 +520,28 @@ pub struct Field {
 impl Field {
     /// An empty field, which is where every surface starts: nothing the browser
     /// puts there itself could be text the reader meant to write.
-    fn new(label: &'static str, required: bool, lines: Lines) -> Self {
+    fn new(label: impl Into<String>, required: bool, lines: Lines) -> Self {
         Self::filled(label, required, lines, String::new())
+    }
+
+    /// A field the reader picks a value in, starting on the value given — which is
+    /// the value the store holds, so a save that changes nothing writes what is
+    /// there rather than whatever happened to be listed first.
+    ///
+    /// Never required: a picker always holds one of its values, so there is no
+    /// state of it the store could be given nothing from.
+    fn pick(label: impl Into<String>, options: Vec<Choice>, on: Choice) -> Self {
+        Self {
+            label: label.into(),
+            required: false,
+            content: Content::Pick {
+                // A value the list does not offer marks the first one instead: a
+                // picker with nothing marked would have no value at all.
+                at: options.iter().position(|o| *o == on).unwrap_or(0),
+                options,
+            },
+            dirty: false,
+        }
     }
 
     /// A field starting from text the store holds, which is where a field that
@@ -429,43 +554,79 @@ impl Field {
     /// cursor starts at the top rather than at the end, because the reader reads
     /// the document before changing it and a cursor at the end of a long body would
     /// open the buffer scrolled past everything in it.
-    fn filled(label: &'static str, required: bool, lines: Lines, value: String) -> Self {
+    fn filled(label: impl Into<String>, required: bool, lines: Lines, value: String) -> Self {
         let mut field = Self {
-            label,
-            value: String::new(),
-            cursor: 0,
+            label: label.into(),
             required,
-            lines,
+            content: Content::Text {
+                value: String::new(),
+                cursor: 0,
+                lines,
+            },
             dirty: false,
         };
-        field.value = value.chars().filter(|c| field.accepts(*c)).collect();
+        let kept: String = value.chars().filter(|c| field.accepts(*c)).collect();
+        field.content = Content::Text {
+            value: kept,
+            cursor: 0,
+            lines,
+        };
         field
     }
 
     /// What the field is called.
-    pub fn label(&self) -> &'static str {
-        self.label
+    pub fn label(&self) -> &str {
+        &self.label
     }
 
-    /// How many lines it holds, which is what decides whether a line break in it
-    /// is content and whether there is anywhere to move vertically.
-    pub fn lines(&self) -> Lines {
-        self.lines
+    /// What kind of field it is, which is what decides whether a line break in it
+    /// is content, what the vertical keys reach, and whether an external editor has
+    /// anything to take.
+    pub fn kind(&self) -> FieldKind {
+        match &self.content {
+            Content::Text { lines, .. } => FieldKind::text(*lines),
+            Content::Pick { .. } => FieldKind::Pick,
+        }
     }
 
-    /// What it holds.
-    pub fn value(&self) -> &str {
-        &self.value
+    /// What the reader is looking at in it, for the drawing. Derived from what the
+    /// field holds, so a picker cannot be drawn as a line of text nor a line of
+    /// text as a list of values.
+    pub fn shown(&self) -> Shown<'_> {
+        match &self.content {
+            Content::Text { value, cursor, .. } => Shown::Text {
+                value,
+                cursor: *cursor,
+            },
+            Content::Pick { options, at } => Shown::Pick {
+                options: options.iter().map(|o| o.word()).collect(),
+                at: *at,
+            },
+        }
     }
 
-    /// Where the cursor sits, in characters from the start.
-    pub fn cursor(&self) -> usize {
-        self.cursor
-    }
-
-    /// Whether anything has been typed into it. See [`Field::dirty`].
+    /// Whether anything has been typed into it, or marked in it. See
+    /// [`Field::dirty`].
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    /// The text it holds, and `None` for a picker — which holds a value rather
+    /// than text, so there is nothing in it to hand to an editor or to send as a
+    /// reason.
+    fn text(&self) -> Option<&str> {
+        match &self.content {
+            Content::Text { value, .. } => Some(value),
+            Content::Pick { .. } => None,
+        }
+    }
+
+    /// The value a picker holds, and `None` for a field of text.
+    fn chosen(&self) -> Option<Choice> {
+        match &self.content {
+            Content::Pick { options, at } => options.get(*at).copied(),
+            Content::Text { .. } => None,
+        }
     }
 
     /// Whether a required field has nothing in it to send.
@@ -474,74 +635,123 @@ impl Field {
     /// from a blank one on screen, so warning is more honest than writing
     /// something invisible. What makes a *non-blank* value acceptable is the
     /// store's rule, and the browser reimplements none of those.
+    ///
+    /// A picker is never unfilled — it always holds one of its values — which is
+    /// why it is never required.
     fn unfilled(&self) -> bool {
-        self.required && self.value.trim().is_empty()
+        self.required && self.text().is_some_and(|text| text.trim().is_empty())
+    }
+
+    /// Whether a character may land in a field of text at all.
+    ///
+    /// A line break is content where the field holds many lines and is dropped
+    /// where it holds one. A carriage return is never content: nothing types one,
+    /// and an editor that hands back CRLF means one line break rather than a break
+    /// and a character no terminal shows.
+    fn accepts(&self, c: char) -> bool {
+        match &self.content {
+            Content::Text { lines, .. } => accepts(c, *lines),
+            // A picker holds no text, so no character is content in it.
+            Content::Pick { .. } => false,
+        }
     }
 
     /// Apply a key's intent to the field.
     ///
-    /// Invariant: every intent that can change the content sets the dirty flag and
-    /// no motion ever does — including an intent that happened to change nothing,
-    /// a deletion with nothing left to delete among them, because dirty is what was
-    /// *pressed* and not what differs.
+    /// Invariant: every intent that changes what the field would save sets the
+    /// dirty flag and no motion within the field ever does. In a field of text that
+    /// includes an intent which happened to change nothing — a deletion with
+    /// nothing left to delete — because dirty there is what was *pressed* and not
+    /// what differs. In a picker the vertical keys are not motion at all: the mark
+    /// is the value, so moving it is the change, and a key that finds no value that
+    /// way has changed nothing to warn about.
     fn apply(&mut self, action: Action) {
-        match action {
-            Action::Insert(c) => {
-                // A character the field does not hold is dropped rather than
-                // refused: the keystroke still counts as typing, because dirty is
-                // what was pressed and not what differs.
-                if self.accepts(c) {
-                    let at = self.byte_at(self.cursor);
-                    self.value.insert(at, c);
-                    self.cursor += 1;
+        match &mut self.content {
+            Content::Text {
+                value,
+                cursor,
+                lines,
+            } => {
+                let lines = *lines;
+                match action {
+                    Action::Insert(c) => {
+                        // A character the field does not hold is dropped rather than
+                        // refused: the keystroke still counts as typing, because
+                        // dirty is what was pressed and not what differs.
+                        if accepts(c, lines) {
+                            let at = byte_at(value, *cursor);
+                            value.insert(at, c);
+                            *cursor += 1;
+                        }
+                        self.dirty = true;
+                    }
+                    Action::DeleteBefore => {
+                        if *cursor > 0 {
+                            *cursor -= 1;
+                            let at = byte_at(value, *cursor);
+                            value.remove(at);
+                        }
+                        self.dirty = true;
+                    }
+                    Action::DeleteAfter => {
+                        if *cursor < char_count(value) {
+                            let at = byte_at(value, *cursor);
+                            value.remove(at);
+                        }
+                        self.dirty = true;
+                    }
+                    Action::MoveLeft => *cursor = cursor.saturating_sub(1),
+                    Action::MoveRight => *cursor = (*cursor + 1).min(char_count(value)),
+                    // The line's ends, which in a field holding one line are the
+                    // value's: one rule covers both kinds rather than one rule per
+                    // kind that could come to disagree.
+                    Action::MoveToStart => *cursor = line_bounds(value, *cursor).0,
+                    Action::MoveToEnd => *cursor = line_bounds(value, *cursor).1,
+                    // Vertical motion keeps the column, clamped to what the line it
+                    // lands on has: a short line puts the cursor at its end rather
+                    // than past it. A field with no line that way leaves the cursor
+                    // alone — a field holding one line has none in either direction.
+                    Action::MoveUp => {
+                        let (start, _) = line_bounds(value, *cursor);
+                        let column = *cursor - start;
+                        if start > 0 {
+                            let (above, above_end) = line_bounds(value, start - 1);
+                            *cursor = (above + column).min(above_end);
+                        }
+                    }
+                    Action::MoveDown => {
+                        let (start, end) = line_bounds(value, *cursor);
+                        let column = *cursor - start;
+                        if end < char_count(value) {
+                            let (below, below_end) = line_bounds(value, end + 1);
+                            *cursor = (below + column).min(below_end);
+                        }
+                    }
+                    // Everything else is the surface's business or nobody's: a key
+                    // the field does not answer must not silently change what it
+                    // holds.
+                    _ => {}
                 }
-                self.dirty = true;
             }
-            Action::DeleteBefore => {
-                if self.cursor > 0 {
-                    self.cursor -= 1;
-                    let at = self.byte_at(self.cursor);
-                    self.value.remove(at);
-                }
-                self.dirty = true;
-            }
-            Action::DeleteAfter => {
-                if self.cursor < self.len() {
-                    let at = self.byte_at(self.cursor);
-                    self.value.remove(at);
-                }
-                self.dirty = true;
-            }
-            Action::MoveLeft => self.cursor = self.cursor.saturating_sub(1),
-            Action::MoveRight => self.cursor = (self.cursor + 1).min(self.len()),
-            // The line's ends, which in a field holding one line are the value's:
-            // one rule covers both kinds rather than one rule per kind that could
-            // come to disagree.
-            Action::MoveToStart => self.cursor = self.line(self.cursor).0,
-            Action::MoveToEnd => self.cursor = self.line(self.cursor).1,
-            // Vertical motion keeps the column, clamped to what the line it lands
-            // on has: a short line puts the cursor at its end rather than past it.
-            // A field with no line that way leaves the cursor alone — a field
-            // holding one line has none in either direction.
-            Action::MoveUp => {
-                let (start, _) = self.line(self.cursor);
-                let column = self.cursor - start;
-                if start > 0 {
-                    let (above, above_end) = self.line(start - 1);
-                    self.cursor = (above + column).min(above_end);
+            Content::Pick { options, at } => {
+                // The list has ends rather than wrapping round, exactly as a text
+                // cursor does at the first and last line: the values are drawn as a
+                // list, so a mark that leapt from the bottom to the top would be a
+                // screen arguing with the keyboard.
+                let moved = match action {
+                    Action::MoveUp => at.checked_sub(1),
+                    Action::MoveDown => Some(*at + 1).filter(|next| *next < options.len()),
+                    // Nothing else reaches a picker. There is no text in it to type
+                    // into, delete from or move along, so the keys that would do
+                    // those leave it untouched — and leave it clean, because nothing
+                    // in it could have changed.
+                    _ => None,
+                };
+                if let Some(next) = moved {
+                    *at = next;
+                    self.dirty = true;
                 }
             }
-            Action::MoveDown => {
-                let (start, end) = self.line(self.cursor);
-                let column = self.cursor - start;
-                if end < self.len() {
-                    let (below, below_end) = self.line(end + 1);
-                    self.cursor = (below + column).min(below_end);
-                }
-            }
-            // Everything else is the surface's business or nobody's: a key the
-            // field does not answer must not silently change what it holds.
-            _ => {}
         }
     }
 
@@ -549,61 +759,84 @@ impl Field {
     /// the way out warns about it exactly as it does about typing.
     ///
     /// It goes through the same sieve a keystroke does, so a field holding one line
-    /// cannot be given a line break by the editor either — see [`Field`].
+    /// cannot be given a line break by the editor either — see [`Content`]. A
+    /// picker is left exactly as it was: it holds no text, so there was nothing to
+    /// hand over and there is nothing to take back.
     fn replace(&mut self, text: &str) {
         let kept: String = text.chars().filter(|c| self.accepts(*c)).collect();
-        self.value = kept;
-        self.cursor = self.len();
-        self.dirty = true;
-    }
-
-    /// Whether a character may land in this field at all.
-    ///
-    /// A line break is content where the field holds many lines and is dropped
-    /// where it holds one. A carriage return is never content: nothing types one,
-    /// and an editor that hands back CRLF means one line break rather than a break
-    /// and a character no terminal shows.
-    fn accepts(&self, c: char) -> bool {
-        match c {
-            '\r' => false,
-            '\n' => matches!(self.lines, Lines::Many),
-            _ => true,
+        if let Content::Text { value, cursor, .. } = &mut self.content {
+            *cursor = char_count(&kept);
+            *value = kept;
+            self.dirty = true;
         }
     }
+}
 
-    /// The line a character offset is on: where it starts, and the offset just past
-    /// its last character. A field holding one line has exactly one, spanning the
-    /// whole value.
-    fn line(&self, cursor: usize) -> (usize, usize) {
-        let chars: Vec<char> = self.value.chars().collect();
-        let cursor = cursor.min(chars.len());
-        let start = chars[..cursor]
-            .iter()
-            .rposition(|c| *c == '\n')
-            .map(|at| at + 1)
-            .unwrap_or(0);
-        let end = chars[cursor..]
-            .iter()
-            .position(|c| *c == '\n')
-            .map(|at| cursor + at)
-            .unwrap_or(chars.len());
-        (start, end)
-    }
+/// What the reader is looking at in one field, for the drawing.
+///
+/// Invariant: derived from what the field holds rather than chosen by the drawing,
+/// so a picker is never drawn as a line of text — which would show one of its
+/// values and hide the rest — and a line of text is never drawn as a list.
+pub enum Shown<'a> {
+    /// Text, and where in it the next character lands.
+    Text {
+        /// What the field holds.
+        value: &'a str,
+        /// Where the next character lands, in characters from the start.
+        cursor: usize,
+    },
+    /// The values on offer, in the order the vertical keys move through them, and
+    /// which of them the field holds.
+    Pick {
+        /// The words the values go by.
+        options: Vec<&'static str>,
+        /// Which of them is marked, which is the field's value.
+        at: usize,
+    },
+}
 
-    /// How many characters the field holds, which is where the cursor may go up to.
-    fn len(&self) -> usize {
-        self.value.chars().count()
+/// Whether a character may land in a field of text holding this many lines; see
+/// [`Field::accepts`].
+fn accepts(c: char, lines: Lines) -> bool {
+    match c {
+        '\r' => false,
+        '\n' => matches!(lines, Lines::Many),
+        _ => true,
     }
+}
 
-    /// The byte offset of a character offset, so an insertion or a removal never
-    /// lands inside a multi-byte character.
-    fn byte_at(&self, cursor: usize) -> usize {
-        self.value
-            .char_indices()
-            .nth(cursor)
-            .map(|(at, _)| at)
-            .unwrap_or(self.value.len())
-    }
+/// The line a character offset is on: where it starts, and the offset just past
+/// its last character. A field holding one line has exactly one, spanning the
+/// whole value.
+fn line_bounds(value: &str, cursor: usize) -> (usize, usize) {
+    let chars: Vec<char> = value.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let start = chars[..cursor]
+        .iter()
+        .rposition(|c| *c == '\n')
+        .map(|at| at + 1)
+        .unwrap_or(0);
+    let end = chars[cursor..]
+        .iter()
+        .position(|c| *c == '\n')
+        .map(|at| cursor + at)
+        .unwrap_or(chars.len());
+    (start, end)
+}
+
+/// How many characters a value holds, which is where its cursor may go up to.
+fn char_count(value: &str) -> usize {
+    value.chars().count()
+}
+
+/// The byte offset of a character offset, so an insertion or a removal never
+/// lands inside a multi-byte character.
+fn byte_at(value: &str, cursor: usize) -> usize {
+    value
+        .char_indices()
+        .nth(cursor)
+        .map(|(at, _)| at)
+        .unwrap_or(value.len())
 }
 
 /// An open editing surface: the fields the reader fills in, and what accepting it
@@ -670,6 +903,30 @@ enum Commit {
     /// holds. No stamp: a claim is not a free-form replacement, and a claim has one
     /// holder, so taking an already-held one reassigns it.
     TakeClaim(Selection),
+    /// Put the epic or node the frozen row names into the state its picker holds,
+    /// with the reason and the cascade the fields that state revealed hold.
+    ///
+    /// No stamp: a state pick is not a free-form replacement, and its conflict is
+    /// the later of two deliberate choices rather than text silently lost.
+    SetState {
+        /// The epic or node whose state is set.
+        target: Selection,
+        /// The state the row was in when the surface opened.
+        ///
+        /// Not the state being written — the picker holds that, and it is read from
+        /// the picker so that what the reader has marked is what goes. This is what
+        /// a surface that had somehow lost its picker would write instead: the state
+        /// the row already has, rather than one nobody chose.
+        current: data::State,
+        /// How many of the row's descendants were still open when the surface
+        /// opened, which is what the cascade field names and offers.
+        ///
+        /// Advisory: the store recomputes the plan under the lock, so it may close
+        /// more or fewer than the field promised. Kept as read rather than
+        /// re-asked, because a count that changed under the reader would move a
+        /// field in and out from under the keyboard.
+        open_descendants: usize,
+    },
     /// Replace one whole field of the epic or node the frozen row names, guarded by
     /// the stamp that field's text was read at.
     ///
@@ -729,6 +986,40 @@ impl Surface {
         }
     }
 
+    /// The surface that picks a row's state: a picker, and after it whatever the
+    /// picked state needs — a reason for a state that says why, and, on a unit of
+    /// work being closed with open descendants below it, whether to close those too.
+    ///
+    /// A float rather than the preview pane: what a reader needs in front of them is
+    /// the states on offer, and none of the fields holds prose.
+    ///
+    /// The picker leads and the conditional fields follow, which is the order they
+    /// depend in: the reader picks, and the surface then asks for whatever that pick
+    /// needs. See [`Surface::revise`].
+    fn set_state(target: data::StateTarget) -> Self {
+        let options: Vec<Choice> = target.offered.iter().copied().map(Choice::State).collect();
+        let mut surface = Self {
+            title: format!(" status of {} ", target.selection.reference()),
+            fields: vec![Field::pick(
+                STATE_FIELD,
+                options,
+                Choice::State(target.current),
+            )],
+            focus: 0,
+            placement: Placement::Float,
+            commit: Commit::SetState {
+                target: target.selection,
+                current: target.current,
+                open_descendants: target.open_descendants,
+            },
+        };
+        // The state the row is already in may itself be one that says why, so the
+        // surface opens with whatever that state asks for rather than only revealing
+        // it once the reader has moved the mark.
+        surface.revise();
+        surface
+    }
+
     /// The surface that replaces one whole field of an epic or a node: one field,
     /// starting from the text the read returned and carrying that read's stamp, so
     /// it is the current value rather than a rendered preview of an older one.
@@ -782,12 +1073,18 @@ impl Surface {
     }
 
     /// Which of them the keyboard is in.
+    ///
+    /// Invariant: always a field this surface actually holds. A conditional field
+    /// that disappears can leave the stored index past the end of what is left, so
+    /// the clamp lives here, where the focus is read, rather than in each place the
+    /// fields may change — which is what makes it something no later conditional
+    /// field has to remember.
     pub fn focus(&self) -> usize {
-        self.focus
+        self.focus.min(self.fields.len().saturating_sub(1))
     }
 
     /// Its shape, to the precision a key's meaning turns on: how many fields it
-    /// holds, and how many lines the focused one holds. This is the whole of what
+    /// holds, and what kind of field the focused one is. This is the whole of what
     /// the key map is told about a surface, so the map decides which keys have
     /// somewhere to go and which of them writes a line break, rather than the
     /// surface deciding it after the fact.
@@ -801,11 +1098,11 @@ impl Surface {
             // A surface with no fields is not a surface, and the one-line kind is
             // the answer that holds no line break: a keyboard with nowhere to type
             // must not be the keyboard a line break is content in.
-            lines: self
+            kind: self
                 .fields
-                .get(self.focus)
-                .map(Field::lines)
-                .unwrap_or(Lines::One),
+                .get(self.focus())
+                .map(Field::kind)
+                .unwrap_or(FieldKind::OneLine),
         }
     }
 
@@ -841,11 +1138,131 @@ impl Surface {
         self.fields.iter().position(Field::unfilled)
     }
 
+    /// Give the focused field a key's intent, and bring the field list back in line
+    /// with what the fields now hold.
+    ///
+    /// The one door into a field: every key that belongs to a field arrives here, so
+    /// a pick that reveals or hides a conditional field cannot land without the
+    /// surface being revised for it.
+    fn apply(&mut self, action: Action) {
+        self.focused_mut().apply(action);
+        self.revise();
+    }
+
+    /// Bring the fields in line with what its picker now holds: a state that says
+    /// why reveals a reason, and closing a unit of work that still has open
+    /// descendants offers to close them too, naming how many.
+    ///
+    /// Invariant: a surface holds exactly the fields on screen. A field appears the
+    /// moment the mark lands on a value that wants it and goes the moment the mark
+    /// moves off, so it can never hold text the reader cannot see — coming back asks
+    /// afresh. That is the accepted cost of a picker with no confirming key, where
+    /// looking at another value is choosing it.
+    ///
+    /// A field that is still wanted is carried over rather than rebuilt, because this
+    /// runs after every keystroke: a list rebuilt from the mark alone would swallow
+    /// each character as the reader typed it.
+    ///
+    /// Only a state surface has anything to revise; every other surface's fields are
+    /// fixed when it opens.
+    fn revise(&mut self) {
+        let Commit::SetState {
+            current,
+            open_descendants,
+            ..
+        } = &self.commit
+        else {
+            return;
+        };
+        let (current, open_descendants) = (*current, *open_descendants);
+        let state = self.picked_state(current);
+        // Carried over rather than rebuilt, so a reason survives a pick that still
+        // wants one. Found by being the surface's field of text, which the picker
+        // and the cascade field are not.
+        let reason = self
+            .fields
+            .iter()
+            .find(|field| field.text().is_some())
+            .cloned();
+        let cascade = self.cascade_field();
+        // The picker leads and is never rebuilt: it is the surface's own value, and
+        // rebuilding it would drop where its mark is and that the reader moved it.
+        self.fields.truncate(1);
+        if state.needs_reason() {
+            self.fields
+                .push(reason.unwrap_or_else(|| Field::new(REASON_FIELD, true, Lines::One)));
+        }
+        // Only where there is something for it to close: a leaf, or a row whose
+        // descendants are all resolved already, is closed without a question. The
+        // count is what the plan said when the surface opened and the store may
+        // recompute it, so the field asks for a cascade rather than for these nodes.
+        if state.cascades() && open_descendants > 0 {
+            self.fields.push(cascade.unwrap_or_else(|| {
+                Field::pick(
+                    cascade_label(open_descendants),
+                    vec![Choice::Cascade(false), Choice::Cascade(true)],
+                    // No by default, which is the store's own default: closing a row
+                    // resolves that row, and taking a subtree with it is the wider
+                    // thing a reader has to ask for.
+                    Choice::Cascade(false),
+                )
+            }));
+        }
+        // The list may be shorter than it was, so the stored focus is brought back
+        // inside it here as well as clamped where it is read: a field that vanished
+        // must not leave the keyboard pointing past the end, nor jump back to a field
+        // that reappears later.
+        self.focus = self.focus();
+    }
+
+    /// The state its picker holds.
+    ///
+    /// Invariant: a state surface leads with its picker and keeps it there while the
+    /// fields after it come and go, so there is always a marked state to read. A
+    /// surface that had lost its picker falls back to the state the row is already
+    /// in — writing what is there rather than a state nobody chose — and any other
+    /// kind of surface has no state at all.
+    fn picked_state(&self, current: data::State) -> data::State {
+        match self.fields.first().and_then(Field::chosen) {
+            Some(Choice::State(state)) => state,
+            Some(Choice::Cascade(_)) | None => current,
+        }
+    }
+
+    /// Its cascade field, if it has one; see [`Surface::revise`].
+    fn cascade_field(&self) -> Option<Field> {
+        self.fields
+            .iter()
+            .find(|field| matches!(field.chosen(), Some(Choice::Cascade(_))))
+            .cloned()
+    }
+
+    /// Whether its cascade field says to close the row's open descendants too. No
+    /// wherever the field is not revealed, which is the store's own default.
+    fn cascading(&self) -> bool {
+        self.cascade_field().and_then(|field| field.chosen()) == Some(Choice::Cascade(true))
+    }
+
+    /// What its one field of text holds, and nothing where it has none revealed —
+    /// which is what a state that says nothing about why sends as its reason.
+    ///
+    /// Every surface but the state picker holds exactly one field and it is text, so
+    /// this is that field; on a state picker it is the reason, which is the only text
+    /// there is to type.
+    fn typed(&self) -> String {
+        self.fields
+            .iter()
+            .find_map(Field::text)
+            .unwrap_or_default()
+            .to_string()
+    }
+
     /// The field taking keystrokes.
     fn focused_mut(&mut self) -> &mut Field {
-        // The focus is only ever set to a field this surface carries, so there is
+        // The focus is read clamped to the fields the surface holds, so there is
         // always one to type into.
-        &mut self.fields[self.focus]
+        let focus = self.focus();
+        &mut self.fields[focus]
     }
 
     /// The write accepting the surface performs, and what the notice says once it
@@ -853,7 +1270,7 @@ impl Surface {
     fn write(&self) -> (data::Write, String) {
         match &self.commit {
             Commit::AddLabel(set) => {
-                let label = self.fields[0].value.clone();
+                let label = self.typed();
                 (
                     data::Write::AddLabel(set.clone(), label.clone()),
                     // The notice names the label, because by the time it is read
@@ -862,7 +1279,7 @@ impl Surface {
                 )
             }
             Commit::AddBlocker(list) => {
-                let reference = self.fields[0].value.clone();
+                let reference = self.typed();
                 (
                     data::Write::AddBlocker(list.clone(), reference.clone()),
                     // The notice names the blocker as the store records it, which a
@@ -872,7 +1289,7 @@ impl Surface {
                 )
             }
             Commit::TakeClaim(node) => {
-                let holder = self.fields[0].value.clone();
+                let holder = self.typed();
                 let reference = node.reference();
                 (
                     data::Write::TakeClaim(node.clone(), holder.clone()),
@@ -880,6 +1297,28 @@ impl Surface {
                     // held the holder is gone by the time it is read, and the row it
                     // was taken on is one of several that look alike.
                     format!("claim on {reference} taken by {holder}"),
+                )
+            }
+            Commit::SetState {
+                target,
+                current,
+                open_descendants: _,
+            } => {
+                let state = self.picked_state(*current);
+                let reference = target.reference();
+                (
+                    data::Write::SetState {
+                        target: target.clone(),
+                        state,
+                        reason: self.typed(),
+                        cascade: self.cascading(),
+                    },
+                    // The notice names the row and the state it is now in, because by
+                    // the time it is read the surface is gone and the row it was
+                    // opened on is one of several that look alike. What a cascade
+                    // took with it is added once the write has run: the count is the
+                    // store's answer and not the plan's.
+                    format!("{reference} is now {}", state.wire_name()),
                 )
             }
             Commit::Replace {
@@ -892,7 +1331,7 @@ impl Surface {
                     data::Write::Replace {
                         target: target.clone(),
                         field: *field,
-                        value: self.fields[0].value.clone(),
+                        value: self.typed(),
                         expect: Some(*stamp),
                     },
                     // The notice names the field and the entity: the surface that
@@ -1186,7 +1625,18 @@ impl App {
             // here — the hint strip asks this on every frame, and a read belongs to
             // the keypress.
             EditingAction::Edit(field) => match target {
-                Selection::Epic(_) | Selection::Node(_) => Some(Offer::Compose(field)),
+                Selection::Epic(_) | Selection::Node(_) => {
+                    Some(Offer::Compose(Composed::Field(field)))
+                }
+                _ => None,
+            },
+            // Only an epic and a node have a state of their own: a collection is
+            // structure and its members carry no state, so no row of one offers the
+            // letter. What the states are, which one the row is in, and how much a
+            // cascade would close are all read when the letter is pressed — the hint
+            // strip asks this offer on every frame.
+            EditingAction::SetState => match target {
+                Selection::Epic(_) | Selection::Node(_) => Some(Offer::Compose(Composed::State)),
                 _ => None,
             },
             // A claim is taken on a unit of work, so an epic's row is never offered
@@ -1332,6 +1782,7 @@ impl App {
             Action::Add
             | Action::Delete
             | Action::Edit(_)
+            | Action::SetState
             | Action::TakeClaim
             | Action::ReleaseClaim
             | Action::Overwrite
@@ -1518,11 +1969,11 @@ impl App {
     /// re-read that follows it cannot fail for exactly that reason.
     fn commit(&mut self, write: &data::Write, done: String) {
         let refusal = match data::perform(&self.store, write) {
-            Ok(()) => {
+            Ok(effect) => {
                 self.surface = None;
                 self.editing = None;
                 self.reload();
-                self.flash(done);
+                self.flash(reported(done, effect));
                 return;
             }
             Err(refusal) => refusal,
@@ -1556,14 +2007,21 @@ impl App {
             // a question and goes at once.
             Action::Unwind => match self.surface.as_ref().and_then(Surface::dirtied) {
                 Some(field) => {
-                    self.modal = Some(Modal::Dialog(Box::new(Dialog::discard(field.label))));
+                    self.modal = Some(Modal::Dialog(Box::new(Dialog::discard(&field.label))));
                 }
                 None => self.surface = None,
             },
             Action::Accept => self.accept(),
+            // Only a field made of text has anything to hand over. The key is not
+            // bound in a picker at all, so this is the same answer said twice rather
+            // than a rule the field has to enforce.
             Action::ExternalEditor => {
-                if let Some(surface) = &self.surface {
-                    self.editor_handoff = Some(surface.fields[surface.focus].value.clone());
+                if let Some(text) = self
+                    .surface
+                    .as_ref()
+                    .and_then(|surface| surface.fields[surface.focus()].text())
+                {
+                    self.editor_handoff = Some(text.to_string());
                 }
             }
             // Moving between fields is the surface's business rather than a field's,
@@ -1580,7 +2038,7 @@ impl App {
             Action::ToggleHelp => self.modal = Some(Modal::Help),
             _ => {
                 if let Some(surface) = &mut self.surface {
-                    surface.focused_mut().apply(action);
+                    surface.apply(action);
                 }
             }
         }
@@ -1598,7 +2056,7 @@ impl App {
             return;
         };
         if let Some(index) = surface.unfilled() {
-            let dialog = Dialog::required(surface.fields[index].label, index);
+            let dialog = Dialog::required(&surface.fields[index].label, index);
             self.modal = Some(Modal::Dialog(Box::new(dialog)));
             return;
         }
@@ -1686,7 +2144,7 @@ impl App {
             _ => match EditingAction::for_intent(action).and_then(|a| self.offer(a)) {
                 Some(Offer::Ask(dialog)) => self.modal = Some(Modal::Dialog(Box::new(dialog))),
                 Some(Offer::Fill(surface)) => self.surface = Some(surface),
-                Some(Offer::Compose(field)) => self.compose(field),
+                Some(Offer::Compose(composed)) => self.compose(composed),
                 // Nothing to fill in and nothing to ask: the row carried the whole
                 // write, so the letter is the whole interaction.
                 Some(Offer::Perform { write, done }) => self.commit(&write, done),
@@ -1712,12 +2170,18 @@ impl App {
     /// the entity may have gone between the letter being offered and pressed, which
     /// is the same class of thing as any other part of a store the browser cannot
     /// read.
-    fn compose(&mut self, field: data::FreeForm) {
+    fn compose(&mut self, composed: Composed) {
         let Some(target) = self.editing.clone() else {
             return;
         };
-        match data::edit_target(&self.store, &target) {
-            Ok(target) => self.surface = Some(Surface::replace(field, target)),
+        let opened = match composed {
+            Composed::Field(field) => {
+                data::edit_target(&self.store, &target).map(|read| Surface::replace(field, read))
+            }
+            Composed::State => data::state_target(&self.store, &target).map(Surface::set_state),
+        };
+        match opened {
+            Ok(surface) => self.surface = Some(surface),
             Err(e) => self.store_unreadable(e.to_string()),
         }
     }
@@ -2083,8 +2547,50 @@ mod tests {
 
     /// The mode an open surface of this shape puts the keyboard under, so a test
     /// names the shape rather than assembling one.
-    fn surface_mode(fields: Fields, lines: Lines) -> Mode {
-        Mode::Surface(Shape { fields, lines })
+    fn surface_mode(fields: Fields, kind: FieldKind) -> Mode {
+        Mode::Surface(Shape { fields, kind })
+    }
+
+    /// What a field of text holds and where its cursor sits.
+    ///
+    /// A picker is a failure rather than an empty answer: a test about typed text
+    /// must not quietly pass on a field nothing can be typed into.
+    fn text_and_cursor(field: &Field) -> (&str, usize) {
+        match field.shown() {
+            Shown::Text { value, cursor } => (value, cursor),
+            Shown::Pick { .. } => {
+                panic!("{} is a picker rather than a field of text", field.label())
+            }
+        }
+    }
+
+    /// What a field of text holds; see [`text_and_cursor`].
+    fn text_of(field: &Field) -> &str {
+        text_and_cursor(field).0
+    }
+
+    /// Where a field of text's cursor sits, in characters from the start.
+    fn cursor_of(field: &Field) -> usize {
+        text_and_cursor(field).1
+    }
+
+    /// The values a picker offers and which of them it holds, which is its value.
+    ///
+    /// A field of text is a failure rather than an empty answer, for the same reason
+    /// the other way round is.
+    fn options_of(field: &Field) -> (Vec<&'static str>, usize) {
+        match field.shown() {
+            Shown::Pick { options, at } => (options, at),
+            Shown::Text { .. } => {
+                panic!("{} is a field of text rather than a picker", field.label())
+            }
+        }
+    }
+
+    /// The value a picker holds, which is the value it has marked.
+    fn marked(field: &Field) -> &'static str {
+        let (options, at) = options_of(field);
+        options[at]
     }
 
     /// The name of a field invented for a test, so a rule about one field has a
@@ -2156,7 +2662,8 @@ mod tests {
     fn cursor_at(app: &App) -> (usize, usize) {
         let surface = app.surface().expect("a surface is open");
         let field = &surface.fields()[surface.focus()];
-        let before: String = field.value().chars().take(field.cursor()).collect();
+        let (value, cursor) = text_and_cursor(field);
+        let before: String = value.chars().take(cursor).collect();
         (
             before.matches('\n').count(),
             before.chars().rev().take_while(|c| *c != '\n').count(),
@@ -2166,7 +2673,7 @@ mod tests {
     /// What the open surface's focused field holds.
     fn field_value(app: &App) -> String {
         let surface = app.surface().expect("a surface is open");
-        surface.fields()[surface.focus()].value().to_string()
+        text_of(&surface.fields()[surface.focus()]).to_string()
     }
 
     /// The answers the open dialog lists, as the float shows them: the key map's
@@ -3119,14 +3626,14 @@ mod tests {
         assert_eq!(surface.fields().len(), 1);
         assert_eq!(surface.focus(), 0);
         let field = &surface.fields()[0];
-        assert_eq!(field.value(), "");
+        assert_eq!(text_of(field), "");
         assert!(!field.is_dirty());
         // The float says what is being added and to what, since it covers the row
         // it was opened from.
         assert!(surface.title().contains(&fx.epic), "{:?}", surface.title());
         // Every key now belongs to the field: the mode the keyboard is under is the
         // only bridge from this state to the key table.
-        assert_eq!(app.mode(), surface_mode(Fields::One, Lines::One));
+        assert_eq!(app.mode(), surface_mode(Fields::One, FieldKind::OneLine));
         assert!(fx.epic_labels().iter().all(|l| !l.is_empty()));
 
         // A row that is not a label set offers no addition: this surface writes a
@@ -3265,7 +3772,7 @@ mod tests {
         // what the warning was about, so typing the answer is a straight line.
         app.apply(Action::Unwind).unwrap();
         assert_eq!(app.modal(), None);
-        assert_eq!(app.mode(), surface_mode(Fields::One, Lines::One));
+        assert_eq!(app.mode(), surface_mode(Fields::One, FieldKind::OneLine));
         assert_eq!(app.surface().map(Surface::focus), Some(0));
         type_into(&mut app, "ui-2");
         assert_eq!(field_value(&app), "ui-2");
@@ -3302,7 +3809,10 @@ mod tests {
         );
         // Several fields, and the key map is told so: which keys apply is decided
         // from the shape rather than guessed at.
-        assert_eq!(app.mode(), surface_mode(Fields::Several, Lines::One));
+        assert_eq!(
+            app.mode(),
+            surface_mode(Fields::Several, FieldKind::OneLine)
+        );
 
         app.apply(Action::Accept).unwrap();
         let Some(Modal::Dialog(dialog)) = app.modal() else {
@@ -3328,9 +3838,9 @@ mod tests {
         assert_eq!(app.surface().map(Surface::focus), Some(1));
         type_into(&mut app, "ui-2");
         let fields = app.surface().expect("the buffer is still open").fields();
-        assert_eq!(fields[1].value(), "ui-2");
+        assert_eq!(text_of(&fields[1]), "ui-2");
         assert_eq!(
-            fields[0].value(),
+            text_of(&fields[0]),
             "",
             "the answer was typed into the field the warning was not about"
         );
@@ -3391,7 +3901,7 @@ mod tests {
         type_into(&mut app, "middle");
         let fields = app.surface().expect("a surface is open").fields();
         assert_eq!(
-            fields.iter().map(Field::value).collect::<Vec<_>>(),
+            fields.iter().map(text_of).collect::<Vec<_>>(),
             vec!["", "middle", ""]
         );
         // And moving is not writing: a field the keyboard only passed through is
@@ -3532,14 +4042,23 @@ mod tests {
                 Field::new(A_SECOND_FIELD, false, Lines::Many),
             ],
         );
-        assert_eq!(app.mode(), surface_mode(Fields::Several, Lines::One));
+        assert_eq!(
+            app.mode(),
+            surface_mode(Fields::Several, FieldKind::OneLine)
+        );
         app.apply(Action::NextField).unwrap();
-        assert_eq!(app.mode(), surface_mode(Fields::Several, Lines::Many));
+        assert_eq!(
+            app.mode(),
+            surface_mode(Fields::Several, FieldKind::ManyLines)
+        );
         // Recomputed on every ask rather than captured when the surface opened, so
         // the key map and the surface cannot come to disagree about where the
         // keyboard is.
         app.apply(Action::PreviousField).unwrap();
-        assert_eq!(app.mode(), surface_mode(Fields::Several, Lines::One));
+        assert_eq!(
+            app.mode(),
+            surface_mode(Fields::Several, FieldKind::OneLine)
+        );
     }
 
     #[test]
@@ -3573,7 +4092,7 @@ mod tests {
         app.apply(Action::Unwind).unwrap();
         assert_eq!(app.modal(), None);
         assert_eq!(field_value(&app), "half a thought");
-        assert_eq!(app.mode(), surface_mode(Fields::One, Lines::One));
+        assert_eq!(app.mode(), surface_mode(Fields::One, FieldKind::OneLine));
 
         // The destructive letter throws the buffer away, and only the buffer: the
         // mode stays on the row, and nothing reached the store.
@@ -3609,17 +4128,17 @@ mod tests {
         for _ in 0..3 {
             app.apply(Action::MoveRight).unwrap();
         }
-        assert_eq!(app.surface().unwrap().fields()[0].cursor(), 0);
+        assert_eq!(cursor_of(&app.surface().unwrap().fields()[0]), 0);
         type_into(&mut app, "ab");
         for _ in 0..3 {
             app.apply(Action::MoveRight).unwrap();
         }
-        assert_eq!(app.surface().unwrap().fields()[0].cursor(), 2);
+        assert_eq!(cursor_of(&app.surface().unwrap().fields()[0]), 2);
         app.apply(Action::MoveToStart).unwrap();
         for _ in 0..3 {
             app.apply(Action::MoveLeft).unwrap();
         }
-        assert_eq!(app.surface().unwrap().fields()[0].cursor(), 0);
+        assert_eq!(cursor_of(&app.surface().unwrap().fields()[0]), 0);
 
         // Back to a field nothing was typed into, which is what the way out is
         // silent about.
@@ -3714,7 +4233,7 @@ mod tests {
         assert!(app.surface().unwrap().fields()[0].is_dirty());
         // The cursor is left where the text ends, which is where typing continues.
         assert_eq!(
-            app.surface().unwrap().fields()[0].cursor(),
+            cursor_of(&app.surface().unwrap().fields()[0]),
             "firstsecond".chars().count()
         );
 
@@ -3759,7 +4278,7 @@ mod tests {
         // And the answer that is never destructive lands back on the text intact.
         app.apply(Action::Unwind).unwrap();
         assert_eq!(field_value(&app), "written in the editor");
-        assert_eq!(app.mode(), surface_mode(Fields::One, Lines::One));
+        assert_eq!(app.mode(), surface_mode(Fields::One, FieldKind::OneLine));
         assert_eq!(fx.epic_labels(), before, "the round-trip wrote something");
     }
 
@@ -3786,7 +4305,7 @@ mod tests {
         app.apply(Action::Unwind).unwrap();
         assert_eq!(app.modal(), None);
         assert_eq!(field_value(&app), "never written");
-        assert_eq!(app.mode(), surface_mode(Fields::One, Lines::One));
+        assert_eq!(app.mode(), surface_mode(Fields::One, FieldKind::OneLine));
         assert!(app.editing_target().is_some());
     }
 
@@ -3805,7 +4324,7 @@ mod tests {
         // One field holding many lines, which is the whole of what the key map is
         // told: it is what makes the reflex key a line break here, while the save
         // key accepts here exactly as it does everywhere else.
-        assert_eq!(app.mode(), surface_mode(Fields::One, Lines::Many));
+        assert_eq!(app.mode(), surface_mode(Fields::One, FieldKind::ManyLines));
         // Nothing has been typed, so the way out has nothing to warn about: text
         // the store already held is not text the reader wrote.
         assert!(!app.surface().unwrap().fields()[0].is_dirty());
@@ -3917,7 +4436,7 @@ mod tests {
         // text exactly as it was.
         app.apply(Action::Unwind).unwrap();
         assert!(field_value(&app).starts_with("a first line"));
-        assert_eq!(app.mode(), surface_mode(Fields::One, Lines::Many));
+        assert_eq!(app.mode(), surface_mode(Fields::One, FieldKind::ManyLines));
 
         // And the destructive letter throws away the buffer and only the buffer:
         // nothing reached the store, and the mode stays on its frozen row.
@@ -3974,7 +4493,7 @@ mod tests {
         app.apply(Action::Unwind).unwrap();
         assert_eq!(app.modal(), None);
         assert!(field_value(&app).starts_with("mine"));
-        assert_eq!(app.mode(), surface_mode(Fields::One, Lines::Many));
+        assert_eq!(app.mode(), surface_mode(Fields::One, FieldKind::ManyLines));
         assert!(
             app.editing_target().is_some(),
             "a refusal ended the session"
@@ -4059,7 +4578,7 @@ mod tests {
                 // One field holding one line, which is the whole of what the key map
                 // is told: a value that may hold no break is one the reflex key does
                 // not reach at all, and the save key is what finishes it.
-                assert_eq!(app.mode(), surface_mode(Fields::One, Lines::One));
+                assert_eq!(app.mode(), surface_mode(Fields::One, FieldKind::OneLine));
                 // Nothing has been typed, so the way out asks nothing: text the
                 // store already held is not text the reader wrote.
                 assert!(!app.surface().unwrap().fields()[0].is_dirty());
@@ -4168,6 +4687,267 @@ mod tests {
         }
     }
 
+    /// Open the state picker on the frozen row, the way a reader does.
+    fn open_the_state_picker(app: &mut App) {
+        app.apply(Action::SetState).unwrap();
+        assert!(app.surface().is_some(), "the state key opened no surface");
+    }
+
+    /// Mark the state that goes by this word, moving the way a reader does, and fail
+    /// rather than run on if the picker will not reach it.
+    ///
+    /// Bounded by how many values there are: a mark that stopped moving would
+    /// otherwise spin with nothing to say.
+    fn mark_the_state(app: &mut App, wanted: &str) {
+        let picker = |app: &App| options_of(&app.surface().expect("a surface is open").fields()[0]);
+        let (options, _) = picker(app);
+        let at = options
+            .iter()
+            .position(|option| *option == wanted)
+            .unwrap_or_else(|| panic!("{wanted:?} is not offered: {options:?}"));
+        for _ in 0..options.len() {
+            let (_, on) = picker(app);
+            match on.cmp(&at) {
+                std::cmp::Ordering::Less => app.apply(Action::MoveDown).unwrap(),
+                std::cmp::Ordering::Greater => app.apply(Action::MoveUp).unwrap(),
+                std::cmp::Ordering::Equal => break,
+            };
+        }
+        assert_eq!(
+            marked(&app.surface().unwrap().fields()[0]),
+            wanted,
+            "the mark would not reach {wanted:?}"
+        );
+    }
+
+    /// The labels of the fields the open surface holds, top to bottom — which is what
+    /// a reader is being asked for.
+    fn field_labels(app: &App) -> Vec<String> {
+        app.surface()
+            .expect("a surface is open")
+            .fields()
+            .iter()
+            .map(|field| field.label().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn nothing_typed_reaches_a_picker_and_no_editor_is_ever_handed_one() {
+        let (_fx, mut app) = app();
+        freeze_a_ticket_row(&mut app);
+        open_the_state_picker(&mut app);
+        let was = marked(&app.surface().unwrap().fields()[0]);
+
+        // A picker holds no text, so the keys that write text change nothing in it —
+        // and leave it clean, because nothing in it could have changed. The way out is
+        // then silent, as it is on any field nothing has been done to.
+        for action in [
+            Action::Insert('x'),
+            Action::Insert('\n'),
+            Action::DeleteBefore,
+            Action::DeleteAfter,
+            Action::MoveLeft,
+            Action::MoveRight,
+            Action::MoveToStart,
+            Action::MoveToEnd,
+        ] {
+            app.apply(action).unwrap();
+            assert_eq!(
+                marked(&app.surface().unwrap().fields()[0]),
+                was,
+                "{action:?} changed what the picker holds"
+            );
+            assert!(
+                !app.surface().unwrap().fields()[0].is_dirty(),
+                "{action:?} dirtied a picker it could not change"
+            );
+        }
+
+        // And there is nothing to hand an external editor: the key that hands a field
+        // over is not bound in a picker, and the handoff refuses one in any case — an
+        // editor opened on a picker would ask the reader to type a value they can only
+        // mark.
+        app.apply(Action::ExternalEditor).unwrap();
+        assert_eq!(app.take_editor_handoff(), None);
+
+        // The way out of a picker nothing has been done to goes at once, with no
+        // question: there is nothing in it that could be lost.
+        app.apply(Action::Unwind).unwrap();
+        assert!(
+            app.surface().is_none(),
+            "an untouched picker asked a question"
+        );
+        assert!(app.editing_target().is_some(), "the way out left the mode");
+    }
+
+    #[test]
+    fn marking_a_value_is_a_change_and_the_list_of_values_has_ends() {
+        let (_fx, mut app) = app();
+        freeze_a_ticket_row(&mut app);
+        open_the_state_picker(&mut app);
+        let (options, opened_on) = options_of(&app.surface().unwrap().fields()[0]);
+
+        // The mark is the value, so moving it is what changes what a save would write:
+        // the way out has to warn about it exactly as it does about typing.
+        app.apply(Action::MoveDown).unwrap();
+        assert_eq!(
+            marked(&app.surface().unwrap().fields()[0]),
+            options[opened_on + 1]
+        );
+        assert!(app.surface().unwrap().fields()[0].is_dirty());
+        app.apply(Action::Unwind).unwrap();
+        assert!(
+            matches!(app.modal(), Some(Modal::Dialog(_))),
+            "moving the mark asked nothing on the way out"
+        );
+        // The question is about the field the mark is in, so it names it.
+        let Some(Modal::Dialog(dialog)) = app.modal() else {
+            panic!("a question is open")
+        };
+        assert!(
+            dialog.message().contains(STATE_FIELD),
+            "{:?}",
+            dialog.message()
+        );
+
+        // Answered by throwing the pick away, which leaves the mode standing: the
+        // question was about the surface, and the way out unwinds one layer at a time.
+        app.apply(Action::Delete).unwrap();
+        assert!(app.surface().is_none(), "the discard kept the surface");
+
+        // The list has ends rather than wrapping round: a mark that leapt from the
+        // last value to the first would be a screen arguing with the keyboard, since
+        // the values are drawn as the list these keys walk.
+        open_the_state_picker(&mut app);
+        assert_eq!(
+            opened_on, 0,
+            "this ticket does not open on the first value, so pushing up cannot stay put"
+        );
+        for _ in 0..options.len() + 2 {
+            app.apply(Action::MoveUp).unwrap();
+        }
+        assert_eq!(marked(&app.surface().unwrap().fields()[0]), options[0]);
+        // And a key that finds no value that way has changed nothing, so it leaves the
+        // field clean: the way out of a picker the reader only pushed at is silent.
+        assert!(
+            !app.surface().unwrap().fields()[0].is_dirty(),
+            "a mark that never moved dirtied the field"
+        );
+        for _ in 0..options.len() + 2 {
+            app.apply(Action::MoveDown).unwrap();
+        }
+        assert_eq!(
+            marked(&app.surface().unwrap().fields()[0]),
+            options[options.len() - 1]
+        );
+    }
+
+    #[test]
+    fn the_reason_typed_is_what_the_store_holds_and_the_next_picker_opens_on_it() {
+        let (fx, mut app) = app();
+        freeze_a_ticket_row(&mut app);
+        open_the_state_picker(&mut app);
+
+        // A state that has to say why, and the words that say it. They are the whole
+        // record of why the row stopped, so they reach the store as the reader wrote
+        // them: a surface that mangled or mislaid them would lose the only copy.
+        let was = marked(&app.surface().unwrap().fields()[0]);
+        mark_the_state(&mut app, "blocked");
+        app.apply(Action::NextField).unwrap();
+        type_into(&mut app, "waiting on the store");
+        app.apply(Action::Accept).unwrap();
+        assert!(app.surface().is_none(), "the pick did not go through");
+        assert_eq!(
+            fx.node_state(&fx.node),
+            (
+                "blocked".to_string(),
+                Some("waiting on the store".to_string()),
+                None
+            )
+        );
+
+        // And the next picker opens marked on what the store now holds rather than on
+        // the first value it lists: opening on the first would mean the save key alone
+        // moved a row nobody asked to move, and said so as though it were meant.
+        freeze_a_ticket_row(&mut app);
+        open_the_state_picker(&mut app);
+        let (options, at) = options_of(&app.surface().unwrap().fields()[0]);
+        assert_eq!(options[at], "blocked");
+        assert_ne!(at, 0, "blocked is the first value, so this proves nothing");
+        assert_ne!(
+            was, "blocked",
+            "the row was already blocked, so this proves nothing"
+        );
+    }
+
+    #[test]
+    fn a_field_the_mark_reveals_again_does_not_take_the_keyboard_with_it() {
+        let (_fx, mut app) = app();
+        freeze_a_ticket_row(&mut app);
+        open_the_state_picker(&mut app);
+
+        // A state that says why reveals the field it says it in, and the keyboard
+        // stays in the picker: the reader is marking values, not filling in a form
+        // that moves under them.
+        mark_the_state(&mut app, "blocked");
+        assert_eq!(field_labels(&app), vec![STATE_FIELD, REASON_FIELD]);
+        assert_eq!(app.surface().unwrap().focus(), 0);
+
+        // The reader fills the reason in, then goes back to the picker — the two keys
+        // that move between fields are the only way to — and marks a state that says
+        // nothing about why. The reason goes with the mark.
+        app.apply(Action::NextField).unwrap();
+        type_into(&mut app, "waiting");
+        app.apply(Action::PreviousField).unwrap();
+        assert_eq!(app.surface().unwrap().focus(), 0);
+        mark_the_state(&mut app, "done");
+        assert_eq!(field_labels(&app), vec![STATE_FIELD]);
+
+        // Marking a state that says why again reveals the field again — and the
+        // keyboard is still in the picker rather than having been pulled into the
+        // field that came back, so the next key moves the mark and does not type.
+        mark_the_state(&mut app, "blocked");
+        assert_eq!(field_labels(&app), vec![STATE_FIELD, REASON_FIELD]);
+        assert_eq!(app.surface().unwrap().focus(), 0);
+        app.apply(Action::MoveDown).unwrap();
+        assert_eq!(marked(&app.surface().unwrap().fields()[0]), "done");
+    }
+
+    #[test]
+    fn a_revealed_field_holds_what_is_typed_into_it_and_goes_when_the_mark_moves_off() {
+        let (_fx, mut app) = app();
+        freeze_a_ticket_row(&mut app);
+        open_the_state_picker(&mut app);
+        mark_the_state(&mut app, "blocked");
+
+        // Every keystroke brings the field list back in line with what the picker
+        // holds, so a revealed field has to survive the reader typing into it: a list
+        // rebuilt from the mark alone would swallow each character as it landed.
+        app.apply(Action::NextField).unwrap();
+        type_into(&mut app, "waiting on review");
+        let reason = app.surface().unwrap().fields()[1].clone();
+        assert_eq!(reason.label(), REASON_FIELD);
+        assert_eq!(text_of(&reason), "waiting on review");
+        assert!(
+            reason.is_dirty(),
+            "the field the reader typed into is clean"
+        );
+
+        // A surface holds exactly the fields on screen: the field appears the moment
+        // the mark lands on a state that wants it and goes the moment the mark moves
+        // off, so it can never hold words the reader cannot see. Coming back therefore
+        // asks afresh — the accepted cost of a picker with no confirming key, where
+        // looking at another value is choosing it.
+        app.apply(Action::PreviousField).unwrap();
+        mark_the_state(&mut app, "done");
+        assert_eq!(field_labels(&app), vec![STATE_FIELD]);
+        mark_the_state(&mut app, "blocked");
+        let reason = app.surface().unwrap().fields()[1].clone();
+        assert_eq!(reason.label(), REASON_FIELD);
+        assert_eq!(text_of(&reason), "");
+        assert!(!reason.is_dirty(), "a field nobody has typed into is dirty");
+    }
+
     #[test]
     fn an_affirmative_answer_that_belongs_to_another_question_performs_nothing() {
         let (fx, mut app) = app();
@@ -4267,13 +5047,13 @@ mod tests {
         // it is a layer above the buffer, not a way out of it.
         app.apply(Action::ToggleHelp).unwrap();
         assert_eq!(app.modal(), Some(&Modal::Help));
-        assert_eq!(app.mode(), surface_mode(Fields::One, Lines::One));
+        assert_eq!(app.mode(), surface_mode(Fields::One, FieldKind::OneLine));
 
         // One layer at a time: the overlay goes and the buffer stays, text and all.
         app.apply(Action::Unwind).unwrap();
         assert_eq!(app.modal(), None);
         assert_eq!(field_value(&app), "kept");
-        assert_eq!(app.mode(), surface_mode(Fields::One, Lines::One));
+        assert_eq!(app.mode(), surface_mode(Fields::One, FieldKind::OneLine));
     }
 
     #[test]
@@ -4342,13 +5122,13 @@ mod tests {
         assert_eq!(surface.fields().len(), 1);
         assert_eq!(surface.focus(), 0);
         let field = &surface.fields()[0];
-        assert_eq!(field.value(), "");
+        assert_eq!(text_of(field), "");
         assert!(!field.is_dirty());
         // The float says what is being added and to what, since it covers the row
         // it was opened from.
         let (_, node) = fx.node_reference_forms();
         assert!(surface.title().contains(&node), "{:?}", surface.title());
-        assert_eq!(app.mode(), surface_mode(Fields::One, Lines::One));
+        assert_eq!(app.mode(), surface_mode(Fields::One, FieldKind::OneLine));
 
         // There is nothing to send without a reference, so an accepted empty field
         // warns naming it and writes nothing — which is the browser refusing to send
@@ -4491,7 +5271,7 @@ mod tests {
         // ends it, so the reference is still there to be corrected.
         app.apply(Action::Unwind).unwrap();
         assert_eq!(field_value(&app), "999");
-        assert_eq!(app.mode(), surface_mode(Fields::One, Lines::One));
+        assert_eq!(app.mode(), surface_mode(Fields::One, FieldKind::OneLine));
         assert!(app.editing_target().is_some());
 
         // A node blocking itself is the store's judgement in the same way — the
@@ -4892,7 +5672,7 @@ mod tests {
         // already on the row included — could be who is picking the work up now.
         assert_eq!(surface.fields().len(), 1);
         assert_eq!(surface.focus(), 0);
-        assert_eq!(surface.fields()[0].value(), "");
+        assert_eq!(text_of(&surface.fields()[0]), "");
         assert!(!surface.fields()[0].is_dirty());
         assert_eq!(surface.placement(), Placement::Float);
         // The float says which ticket is being claimed, since it covers the row it
@@ -4903,7 +5683,7 @@ mod tests {
             "{:?}",
             surface.title()
         );
-        assert_eq!(app.mode(), surface_mode(Fields::One, Lines::One));
+        assert_eq!(app.mode(), surface_mode(Fields::One, FieldKind::OneLine));
 
         // A claim with no holder is a row marked for nobody, so an accepted empty
         // field warns naming it and sends nothing — the browser refusing to send a
@@ -4929,7 +5709,7 @@ mod tests {
         // reader who meant to take it would be told they had while nothing moved.
         // Who is picking the work up is never something the browser can supply.
         assert_eq!(
-            surface.fields()[0].value(),
+            text_of(&surface.fields()[0]),
             "",
             "the field was seeded with the holder it is replacing"
         );

@@ -702,6 +702,15 @@ mod tests {
 
     #[test]
     fn what_the_editor_saved_reaches_the_field_and_an_abandoned_edit_leaves_it_alone() {
+        // What a field of text holds. A picker is a failure rather than an empty
+        // answer: an editor's result must not be checked against a field nothing can
+        // be typed into.
+        fn text_of(field: &app::Field) -> &str {
+            match field.shown() {
+                app::Shown::Text { value, .. } => value,
+                app::Shown::Pick { .. } => panic!("a picker holds no text"),
+            }
+        }
         // Driven through the wiring the loop uses, not through the surface's own
         // method: an outcome arm that drops the reader's text loses it silently, and
         // the surface cannot tell the difference between a blank return and none.
@@ -717,7 +726,7 @@ mod tests {
         let mut app = open(&fx);
         editor_outcome(&mut app, Ok(Some("carried".into())));
         let surface = app.surface().expect("the buffer is still open");
-        assert_eq!(surface.fields()[surface.focus()].value(), "carried");
+        assert_eq!(text_of(&surface.fields()[surface.focus()]), "carried");
         // Text arriving from the editor is a change like any other, so leaving
         // without saving has to warn rather than throw it away in silence.
         assert!(surface.fields()[surface.focus()].is_dirty());
@@ -727,7 +736,7 @@ mod tests {
         let mut app = open(&fx);
         editor_outcome(&mut app, Ok(None));
         let surface = app.surface().expect("the buffer is still open");
-        assert_eq!(surface.fields()[surface.focus()].value(), "");
+        assert_eq!(text_of(&surface.fields()[surface.focus()]), "");
         assert!(!surface.fields()[surface.focus()].is_dirty());
         assert!(app.modal().is_none(), "{:?}", app.modal());
     }

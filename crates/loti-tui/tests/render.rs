@@ -2640,3 +2640,581 @@ fn the_assets_row_teaches_no_letter_and_names_the_command_that_attaches_one() {
         on_a_ticket[23]
     );
 }
+
+/// The states the store says a row may be put into, and the one it is in — read
+/// through the same seam the picker opens on, so a test asserts against what the
+/// browser will show rather than against words spelled out here.
+fn offered_states(store: &Store, selection: &Selection) -> (Vec<&'static str>, String) {
+    let target = loti_tui::data::state_target(store, selection).expect("the row has a state");
+    (
+        target
+            .offered
+            .iter()
+            .map(|state| state.wire_name())
+            .collect(),
+        target.current.wire_name().to_string(),
+    )
+}
+
+/// How many descendants of a row a cascade has left to close, as the store counts
+/// them.
+fn open_descendants(store: &Store, selection: &Selection) -> usize {
+    loti_tui::data::state_target(store, selection)
+        .expect("the row has a state")
+        .open_descendants
+}
+
+/// The lines of the open surface's float, read off the frame: everything from its
+/// own top border down to its bottom one.
+///
+/// Bounded to the float, because a frame line spans both panes — an assertion about
+/// a field would otherwise be satisfied by the preview beside it.
+fn float_lines(terminal: &Terminal<TestBackend>, title: &str) -> Vec<String> {
+    let frame = cells(terminal);
+    let top = frame
+        .iter()
+        .position(|row| row.concat().contains(title))
+        .unwrap_or_else(|| panic!("no float titled {title:?}: {:#?}", frame_lines(terminal)));
+    let left = frame[top]
+        .iter()
+        .position(|cell| cell == "\u{250c}")
+        .expect("the float's own corner");
+    let width = frame[top][left..]
+        .iter()
+        .position(|cell| cell == "\u{2510}")
+        .expect("the float's other corner")
+        + 1;
+    let height = frame[top..]
+        .iter()
+        .position(|row| row[left] == "\u{2514}")
+        .expect("the float's foot")
+        + 1;
+    box_lines(&frame, (left, top, width, height))
+}
+
+/// Mark the state that goes by this word, moving the way a reader does: the mark is
+/// the value, so the keys that move it are the keys that pick.
+///
+/// Bounded by how many values there are, so a mark that stopped moving fails here
+/// rather than spinning with nothing to say.
+fn mark_the_state(app: &mut App, store: &Store, selection: &Selection, wanted: &str) {
+    let (options, _) = offered_states(store, selection);
+    let at = options
+        .iter()
+        .position(|option| *option == wanted)
+        .unwrap_or_else(|| panic!("{wanted:?} is not offered: {options:?}"));
+    let title = format!("status of {}", selection.reference());
+    for _ in 0..=options.len() {
+        let (terminal, _) = draw(app);
+        let float = float_lines(&terminal, &title);
+        let on = float
+            .iter()
+            .position(|line| line.contains(PICK_MARKER))
+            .expect("the float marks a value");
+        // The values are drawn one to a line, in the order the store offers them,
+        // after the float's own top border.
+        match (on - 1).cmp(&at) {
+            std::cmp::Ordering::Less => app.apply(Action::MoveDown).unwrap(),
+            std::cmp::Ordering::Greater => app.apply(Action::MoveUp).unwrap(),
+            std::cmp::Ordering::Equal => return,
+        };
+    }
+    panic!("the mark would not reach {wanted:?}");
+}
+
+/// The mark on the value a picker holds, as the browser draws it.
+const PICK_MARKER: &str = "\u{25b8}";
+
+/// The line of an open float that names a field, and `None` where the float does not
+/// hold one — which is how a conditional field's absence is read off a frame.
+fn field_line(terminal: &Terminal<TestBackend>, title: &str, label: &str) -> Option<String> {
+    float_lines(terminal, title)
+        .into_iter()
+        .find(|line| line.contains(label))
+}
+
+#[test]
+fn the_state_surface_lists_the_states_the_row_offers_and_marks_the_one_it_is_in() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    freeze_a_ticket(&mut app);
+    let (before, frozen) = draw(&mut app);
+    // The row offers the letter and the strip teaches it: a letter a reader cannot
+    // discover is a letter nobody presses.
+    assert!(frozen[23].contains("s state"), "{:?}", frozen[23]);
+
+    app.apply(Action::SetState).unwrap();
+    let (after, _) = draw(&mut app);
+    let (before, after) = (cells(&before), cells(&after));
+    // Bounded to everything above the hint strip: the strip legitimately changes,
+    // because the keys that apply are now the surface's own.
+    let body = ..after.len() - 1;
+    let region @ (x, y, width, height) = changed_box(&before[body], &after[body]);
+    let float = box_lines(&after, region);
+    // A picker holds no prose, so it is a float and not the preview pane, and it
+    // names the row it was opened on — which the float itself covers.
+    assert_eq!(after[y][x], "\u{250c}", "{float:#?}");
+    assert!(float[0].contains("status of browser/1"), "{float:#?}");
+    // Nothing underneath moved: the panes and the frozen row are where they were,
+    // merely covered.
+    let (columns, rows) = (after[0].len(), after.len());
+    assert!(x > 0 && y > 0, "{region:?}");
+    assert!(x + width < columns && y + height < rows - 1, "{region:?}");
+
+    // Every state the store offers is on screen, one to a line and in the store's
+    // own order: a picker that showed only what it holds would hide what a reader is
+    // choosing between.
+    let (options, current) = offered_states(&store, &the_ticket());
+    let (_t, _) = draw(&mut app);
+    assert!(
+        float[1].contains("status"),
+        "the field is not named: {float:#?}"
+    );
+    for (line, option) in float[1..1 + options.len()].iter().zip(&options) {
+        assert!(line.contains(option), "{option:?}: {float:#?}");
+    }
+    // And exactly the one the store holds is marked, because the mark is the value:
+    // there is no confirming key, so what is marked is what a save would write.
+    let marked: Vec<&String> = float
+        .iter()
+        .filter(|line| line.contains(PICK_MARKER))
+        .collect();
+    assert_eq!(marked.len(), 1, "{float:#?}");
+    assert!(marked[0].contains(&current), "{current:?}: {float:#?}");
+
+    // The terminal's own cursor says which field has the keyboard, and in a picker
+    // there is no place for the next character: it sits on the mark.
+    let (mut terminal, _) = draw(&mut app);
+    let position = terminal.get_cursor_position().unwrap();
+    let frame = cells(&terminal);
+    assert_eq!(
+        frame[position.y as usize][position.x as usize],
+        PICK_MARKER,
+        "the cursor is not on the marked value: {:#?}",
+        frame_lines(&terminal)
+    );
+}
+
+#[test]
+fn the_reason_appears_with_the_states_that_say_why_and_goes_when_the_mark_moves_off() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    freeze_a_ticket(&mut app);
+    app.apply(Action::SetState).unwrap();
+    let title = "status of browser/1";
+
+    // The state the row is already in says nothing about why, so nothing is asked.
+    let (terminal, _) = draw(&mut app);
+    assert_eq!(field_line(&terminal, title, "reason"), None);
+
+    // Blocking says why, and the field appears the moment the mark lands on it.
+    mark_the_state(&mut app, &store, &the_ticket(), "blocked");
+    let (terminal, _) = draw(&mut app);
+    assert!(
+        field_line(&terminal, title, "reason").is_some(),
+        "{:#?}",
+        float_lines(&terminal, title)
+    );
+
+    // What the reader types lands in it, and on the field's own line: the picker is
+    // above it and holds no text at all.
+    app.apply(Action::NextField).unwrap();
+    type_into(&mut app, "waiting on review");
+    let (terminal, _) = draw(&mut app);
+    let reason = field_line(&terminal, title, "reason").expect("the reason is on screen");
+    assert!(reason.contains("waiting on review"), "{reason:?}");
+
+    // And it goes the moment the mark moves off, so a state that says nothing about
+    // why cannot be saved with a reason the reader can no longer see.
+    app.apply(Action::PreviousField).unwrap();
+    mark_the_state(&mut app, &store, &the_ticket(), "done");
+    let (terminal, _) = draw(&mut app);
+    assert_eq!(
+        field_line(&terminal, title, "reason"),
+        None,
+        "{:#?}",
+        float_lines(&terminal, title)
+    );
+    // Coming back asks afresh rather than showing the words again.
+    mark_the_state(&mut app, &store, &the_ticket(), "blocked");
+    let (terminal, _) = draw(&mut app);
+    let reason = field_line(&terminal, title, "reason").expect("the reason is asked again");
+    assert!(!reason.contains("waiting"), "{reason:?}");
+}
+
+#[test]
+fn the_cascade_is_offered_only_where_there_is_something_to_close_and_names_how_many() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    freeze_a_ticket(&mut app);
+    app.apply(Action::SetState).unwrap();
+    let title = "status of browser/1";
+
+    // A close that has something under it to resolve asks whether to, naming how
+    // many — the number is what the reader is deciding about, and it is the plan as
+    // the store counted it when the surface opened.
+    let open = open_descendants(&store, &the_ticket());
+    assert!(open > 0, "this ticket has nothing to cascade to");
+    mark_the_state(&mut app, &store, &the_ticket(), "closed");
+    let (terminal, _) = draw(&mut app);
+    let cascade =
+        field_line(&terminal, title, "also close").expect("the cascade field is on screen");
+    assert!(cascade.contains(&open.to_string()), "{cascade:?}");
+    // Defaulting to no, which is the store's own default: closing a row resolves
+    // that row, and taking its subtree with it is the wider thing a reader asks for.
+    assert!(
+        cascade.contains(&format!("{PICK_MARKER} no")),
+        "the cascade does not default to no: {cascade:?}"
+    );
+    // And it is offered only for the state that can cascade: no other state carries
+    // a subtree with it.
+    mark_the_state(&mut app, &store, &the_ticket(), "done");
+    let (terminal, _) = draw(&mut app);
+    assert_eq!(field_line(&terminal, title, "also close"), None);
+    app.apply(Action::Unwind).unwrap();
+    app.apply(Action::Delete).unwrap(); // the mark moved, so the way out asks
+
+    // A row with nothing open under it is closed without a question, so the common
+    // case stays a picker and a reason.
+    app.apply(Action::Unwind).unwrap();
+    to_the_roster(&mut app);
+    app.apply(Action::Descend).unwrap();
+    let leaf = Selection::Node(NodeRef::new("browser", 3));
+    to_row_named(&mut app, "Preview pane");
+    app.apply(Action::EnterEditing).unwrap();
+    app.apply(Action::SetState).unwrap();
+    assert_eq!(open_descendants(&store, &leaf), 0);
+    mark_the_state(&mut app, &store, &leaf, "closed");
+    let (terminal, _) = draw(&mut app);
+    let leaf_title = "status of browser/3";
+    assert!(
+        field_line(&terminal, leaf_title, "reason").is_some(),
+        "{:#?}",
+        float_lines(&terminal, leaf_title)
+    );
+    assert_eq!(field_line(&terminal, leaf_title, "also close"), None);
+}
+
+#[test]
+fn an_epics_picker_offers_its_own_flag_and_never_a_cascade_over_its_tickets() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    freeze_the_epics_row(&mut app);
+    app.apply(Action::SetState).unwrap();
+    let title = "status of browser";
+
+    // An epic has one stored flag and that is the whole of what anybody picks: the
+    // state its row shows is computed from its tickets and is offered by nobody.
+    let (options, current) = offered_states(&store, &the_epic());
+    let float = float_lines(&draw(&mut app).0, title);
+    for (line, option) in float[1..1 + options.len()].iter().zip(&options) {
+        assert!(line.contains(option), "{option:?}: {float:#?}");
+    }
+    assert_eq!(float.len(), options.len() + 2, "{float:#?}");
+    assert!(
+        float[1 + options.iter().position(|o| *o == current).unwrap()].contains(PICK_MARKER),
+        "{float:#?}"
+    );
+
+    // Closing an epic says why, and the browser will not send the field empty: the
+    // question is not whether the store would take it but that the reader left it
+    // blank, so the warning names the field rather than a rule.
+    mark_the_state(&mut app, &store, &the_epic(), "closed");
+    let (terminal, _) = draw(&mut app);
+    // An epic's flag never touches its tickets, so there is no cascade to offer —
+    // even though this epic has open tickets under it.
+    assert_eq!(field_line(&terminal, title, "also close"), None);
+    assert!(
+        loti_tui::data::state_target(&store, &the_epic())
+            .unwrap()
+            .open_descendants
+            == 0,
+        "an epic counted descendants a cascade could not reach"
+    );
+    app.apply(Action::Accept).unwrap();
+    let (_t, warned) = draw(&mut app);
+    assert!(
+        warned.iter().any(|l| l.contains("reason is required")),
+        "{warned:#?}"
+    );
+    assert_eq!(dialog_answer_set(&app), Answers::Acknowledge);
+
+    // Dismissing lands in the field the warning named, so answering it is typing.
+    app.apply(Action::Unwind).unwrap();
+    type_into(&mut app, "shipped");
+    let (terminal, _) = draw(&mut app);
+    let reason = field_line(&terminal, title, "reason").expect("the reason is on screen");
+    assert!(reason.contains("shipped"), "{reason:?}");
+
+    app.apply(Action::Accept).unwrap();
+    let (_t, lines) = draw(&mut app);
+    // The mode indicator going, the float going and the notice arriving are one
+    // frame, which is what reads as "that finished".
+    assert!(!lines[0].contains("EDITING"), "{:?}", lines[0]);
+    assert!(
+        !lines[1..23].iter().any(|l| l.contains(title)),
+        "the float outlived the write: {lines:#?}"
+    );
+    assert!(
+        lines[23].contains("browser is now closed"),
+        "{:?}",
+        lines[23]
+    );
+    // The store was re-read, so the row says what the store now holds: the flag
+    // outranks the state computed from the tickets.
+    let epic_row = lines[1..23]
+        .iter()
+        .find(|l| l.contains("The browser"))
+        .expect("the epic's row");
+    assert!(
+        epic_row.contains(loti_tui::theme::glyph("closed")),
+        "{epic_row:?}"
+    );
+}
+
+/// Put the cursor on the row whose name this is, on the level on screen.
+fn to_row_named(app: &mut App, name: &str) {
+    let index = app
+        .nav()
+        .rows()
+        .iter()
+        .position(|r| r.name == name)
+        .unwrap_or_else(|| panic!("no row named {name:?} on this level"));
+    app.apply(Action::CursorFirst).unwrap();
+    for _ in 0..index {
+        app.apply(Action::CursorDown).unwrap();
+    }
+}
+
+/// Walk back out to the epic roster, so a test that has been somewhere already can
+/// still say where it goes next from the top.
+///
+/// Bounded by how many crumbs there were to leave, so a key that stopped leaving a
+/// level fails here rather than spinning with nothing to say.
+fn to_the_roster(app: &mut App) {
+    for _ in 0..app.nav().crumbs().len() {
+        if app.nav().crumbs().len() == 1 {
+            return;
+        }
+        app.apply(Action::Ascend).unwrap();
+    }
+    panic!("leaving a level stopped reaching the roster");
+}
+
+#[test]
+fn a_cascade_says_how_many_went_with_it_and_the_rows_show_what_the_store_now_holds() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    freeze_a_ticket(&mut app);
+    app.apply(Action::SetState).unwrap();
+    let open = open_descendants(&store, &the_ticket());
+    mark_the_state(&mut app, &store, &the_ticket(), "closed");
+    app.apply(Action::NextField).unwrap();
+    type_into(&mut app, "not wanted");
+    // Onto the cascade field, and its other value: the mark is the answer, so moving
+    // it is what asks for the wider close.
+    app.apply(Action::NextField).unwrap();
+    app.apply(Action::MoveDown).unwrap();
+    let (terminal, _) = draw(&mut app);
+    let cascade = field_line(&terminal, "status of browser/1", "also close").unwrap();
+    assert!(cascade.contains("no"), "{cascade:?}");
+
+    app.apply(Action::Accept).unwrap();
+    let (_t, lines) = draw(&mut app);
+    // The notice names the row and how many went with it — a count only the write
+    // knows, since the store recomputes the plan under its own lock. Naming every
+    // reference would overflow the one line the strip has, and the reloaded tree
+    // already shows which rows moved.
+    assert!(
+        lines[23].contains("browser/1 is now closed"),
+        "{:?}",
+        lines[23]
+    );
+    assert!(
+        lines[23].contains(&format!("{open} descendant")),
+        "the notice does not say how many went with it: {:?}",
+        lines[23]
+    );
+    // The mode ended and the float is gone: a successful write is one session.
+    assert!(!lines[0].contains("EDITING"), "{:?}", lines[0]);
+    assert!(
+        !lines[1..23]
+            .iter()
+            .any(|l| l.contains("status of browser/1")),
+        "the float outlived the write: {lines:#?}"
+    );
+    // The store was re-read, so the row the reader is looking at shows the state the
+    // store now holds rather than the one it held a moment ago.
+    let row = lines[1..23]
+        .iter()
+        .find(|l| l.contains("Navigation pane"))
+        .expect("the ticket's row");
+    assert!(row.contains(loti_tui::theme::glyph("closed")), "{row:?}");
+    // And so does the descendant the cascade closed, on its own level.
+    app.apply(Action::Descend).unwrap();
+    let (_t, deeper) = draw(&mut app);
+    let child = deeper[1..23]
+        .iter()
+        .find(|l| l.contains("Row rendering"))
+        .expect("the subticket's row");
+    assert!(
+        child.contains(loti_tui::theme::glyph("closed")),
+        "{child:?}"
+    );
+}
+
+#[test]
+fn a_cascade_that_stops_partway_shows_the_stores_words_and_says_nothing_on_the_strip() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    freeze_a_ticket(&mut app);
+    app.apply(Action::SetState).unwrap();
+    mark_the_state(&mut app, &store, &the_ticket(), "closed");
+    app.apply(Action::NextField).unwrap();
+    type_into(&mut app, "not wanted");
+    app.apply(Action::NextField).unwrap();
+    app.apply(Action::MoveDown).unwrap();
+
+    // A cascade is not atomic: it closes each descendant on its own and stops at the
+    // first failure, leaving a half-closed subtree. A node is written by writing
+    // beside it and renaming over it, so a directory that may not be added to is the
+    // way to stop one — here at its first step.
+    let unseal = seal(&store, "browser");
+    app.apply(Action::Accept).unwrap();
+    let (_t, lines) = draw(&mut app);
+    // The store's own message, verbatim: it names the node it stopped on and says to
+    // re-run, and re-running is the whole of the recovery because each step is
+    // idempotent. Taken from the operation itself rather than spelled out here — and
+    // while the store is still sealed, or it would not be the same answer.
+    let refusal = ops::set_node_status(
+        &store,
+        &NodeRef::new("browser", 1),
+        ops::NodeStatusChange::Closed {
+            reason: Some("not wanted".into()),
+            cascade: true,
+        },
+    )
+    .map(|_| ())
+    .expect_err("the cascade could not run")
+    .to_string();
+    // Restored before any assertion, or a failing one would leave a store that
+    // cannot be removed with the fixture.
+    unseal();
+    let said = float_text(&_t, "refused");
+    assert!(
+        said.contains(&refusal.split_whitespace().collect::<Vec<_>>().join(" ")),
+        "{refusal:?} is not what the float says: {said:?}"
+    );
+    assert_eq!(dialog_answer_set(&app), Answers::Acknowledge);
+
+    // A partial cascade is a write *and* a failure, so the two rules collide and the
+    // critical one wins: no notice at all. A strip saying "closed" beside a float
+    // saying "stopped partway" would actively mislead.
+    assert_eq!(app.flash_message(), None);
+    assert!(lines[23].contains("Esc cancel"), "{:?}", lines[23]);
+
+    // The surface is still open behind the float with what the reader picked, and the
+    // session with it: only a successful write ends one, and re-running is the same
+    // three keystrokes.
+    app.apply(Action::Unwind).unwrap();
+    let (terminal, _) = draw(&mut app);
+    let float = float_lines(&terminal, "status of browser/1");
+    assert!(
+        float.iter().any(|line| line.contains("also close")),
+        "the surface lost the cascade question: {float:#?}"
+    );
+    assert!(
+        float
+            .iter()
+            .any(|line| line.contains(&format!("{PICK_MARKER} yes"))),
+        "the surface lost the cascade the reader asked for: {float:#?}"
+    );
+    assert!(
+        app.editing_target().is_some(),
+        "the refusal ended the session"
+    );
+}
+
+#[test]
+fn the_gate_on_a_state_is_the_stores_refusal_and_not_a_state_the_picker_withholds() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    freeze_a_ticket(&mut app);
+    app.apply(Action::SetState).unwrap();
+
+    // The state is offered even where the store will refuse it: only the store can
+    // judge, so the browser offers, attempts, and shows what comes back — which is
+    // the one place that rule lives.
+    let (options, _) = offered_states(&store, &the_ticket());
+    assert!(options.contains(&"done"), "{options:?}");
+    mark_the_state(&mut app, &store, &the_ticket(), "done");
+    app.apply(Action::Accept).unwrap();
+    let (terminal, lines) = draw(&mut app);
+
+    // Verbatim, so the browser and the command line teach the same rule in the same
+    // words, and a long refusal wraps inside the float rather than running off it.
+    let refusal = ops::set_node_status(
+        &store,
+        &NodeRef::new("browser", 1),
+        ops::NodeStatusChange::Done,
+    )
+    .map(|_| ())
+    .expect_err("the store gates this state")
+    .to_string();
+    let said = float_text(&terminal, "refused");
+    assert!(
+        said.contains(&refusal.split_whitespace().collect::<Vec<_>>().join(" ")),
+        "{refusal:?} is not what the float says: {said:?}"
+    );
+    // A failure is a float and never a notice: the strip is untouched.
+    assert_eq!(app.flash_message(), None);
+    assert!(lines[23].contains("Esc cancel"), "{:?}", lines[23]);
+
+    // The pick survives the refusal, so fixing it is one keystroke rather than
+    // opening the surface again.
+    app.apply(Action::Unwind).unwrap();
+    let (terminal, _) = draw(&mut app);
+    let float = float_lines(&terminal, "status of browser/1");
+    assert!(
+        float
+            .iter()
+            .any(|l| l.contains(&format!("{PICK_MARKER} done"))),
+        "{float:#?}"
+    );
+    assert!(
+        app.editing_target().is_some(),
+        "the refusal ended the session"
+    );
+}
+
+/// Stop the store from taking a write to any node of an epic, and hand back the way
+/// to let it again; see the cascade that stops partway.
+fn seal(store: &Store, epic: &str) -> impl FnOnce() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = store.epic_dir(epic);
+    let was = std::fs::metadata(&dir).unwrap().permissions();
+    let mut sealed = was.clone();
+    sealed.set_mode(0o555);
+    std::fs::set_permissions(&dir, sealed).unwrap();
+    move || std::fs::set_permissions(&dir, was).unwrap()
+}
+
+/// What a float says, its wrapped lines joined back into one and the runs of blanks
+/// squashed.
+///
+/// A store refusal is as long as the store made it and wraps inside the float, so a
+/// test that the words are the store's own has to read them across the wrap. Where
+/// the wrap falls is a separate claim, pinned where the float's geometry is.
+fn float_text(terminal: &Terminal<TestBackend>, title: &str) -> String {
+    float_lines(terminal, title)
+        .iter()
+        .skip(1)
+        .flat_map(|line| {
+            line.trim_matches(|c| "\u{2502}\u{2514}\u{2518}\u{2500}".contains(c))
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<String>>()
+        })
+        .collect::<Vec<String>>()
+        .join(" ")
+}

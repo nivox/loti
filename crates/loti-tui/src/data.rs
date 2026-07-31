@@ -8,12 +8,13 @@
 
 use anyhow::{Context, Result};
 use jiff::Timestamp;
-use loti_core::domain::NodeRef;
+use loti_core::domain::{EpicStatus, NodeRef};
 use loti_core::lock::VersionRefusal;
-use loti_core::ops::{self, CommentView, Target};
+use loti_core::ops::{self, CommentView, NodeStatusChange, Target};
 use loti_core::read;
 use loti_core::render;
 use loti_core::store::Store;
+use loti_core::NodeState;
 
 /// What a collection of meta hangs off. Labels, comments and assets are
 /// identical on an epic and on a node; a dependency list exists only on a node,
@@ -729,6 +730,159 @@ impl FreeForm {
     }
 }
 
+/// A state a row's own picker offers.
+///
+/// Invariant: the words are the store's own, taken from the store's types rather
+/// than spelled again here, so the browser can neither invent a state nor call one
+/// something the command line does not. A unit of work's states and an epic's are
+/// never the same value even where they share a word: an epic's `closed` is a
+/// stored flag that never touches its nodes, while a unit of work's `closed` is a
+/// resolution that may take its open descendants with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum State {
+    /// One of the five states a unit of work moves between.
+    Work(NodeState),
+    /// An epic carrying no closed flag. `completed` is computed from the epic's
+    /// nodes rather than stored, so it is a state no picker offers and no write
+    /// sets.
+    EpicOpen,
+    /// An epic whose stored closed flag is set.
+    EpicClosed,
+}
+
+/// The states a unit of work's picker offers, in the order the state machine
+/// reads: not started, under way, stuck, finished, abandoned.
+const WORK_STATES: &[State] = &[
+    State::Work(NodeState::ToDo),
+    State::Work(NodeState::InProgress),
+    State::Work(NodeState::Blocked),
+    State::Work(NodeState::Done),
+    State::Work(NodeState::Closed),
+];
+
+/// The states an epic's picker offers: the stored flag, off and on.
+const EPIC_STATES: &[State] = &[State::EpicOpen, State::EpicClosed];
+
+impl State {
+    /// The states the row a selection points at may be put into, in the order a
+    /// picker moves through them, and `None` for a row that has no state of its
+    /// own.
+    ///
+    /// An epic and a unit of work differ here and nowhere else in this module: an
+    /// epic has one stored flag, a unit of work has the state machine.
+    pub fn offered(selection: &Selection) -> Option<&'static [State]> {
+        match selection {
+            Selection::Epic(_) => Some(EPIC_STATES),
+            Selection::Node(_) => Some(WORK_STATES),
+            Selection::Collection(..)
+            | Selection::Label(..)
+            | Selection::Comment(..)
+            | Selection::Asset(..)
+            | Selection::Blocker(..) => None,
+        }
+    }
+
+    /// What the state is called wherever the reader is shown it, which is the
+    /// store's own word for it.
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            State::Work(state) => state.wire_name(),
+            State::EpicOpen => EpicStatus::Open.wire_name(),
+            State::EpicClosed => EpicStatus::Closed.wire_name(),
+        }
+    }
+
+    /// Whether this state says why, so a surface picking it asks for a reason.
+    ///
+    /// Blocking and resolving-without-completing both record why; the states that
+    /// carry no reason clear whatever the row was holding.
+    pub fn needs_reason(self) -> bool {
+        match self {
+            State::Work(NodeState::Blocked | NodeState::Closed) | State::EpicClosed => true,
+            State::Work(NodeState::ToDo | NodeState::InProgress | NodeState::Done)
+            | State::EpicOpen => false,
+        }
+    }
+
+    /// Whether picking this state can take the row's open descendants with it.
+    ///
+    /// Only a unit of work's close: an epic's closed flag never touches its nodes,
+    /// so an epic's picker has nothing to offer here.
+    pub fn cascades(self) -> bool {
+        matches!(self, State::Work(NodeState::Closed))
+    }
+}
+
+/// One row's state as a picker starts from it: the states it offers, the one it
+/// is in, and how much a cascade would have to close.
+///
+/// Read when the letter is pressed rather than when the cursor last moved, for the
+/// same reason a replaced field's text is: the picker must start on the state the
+/// store holds now. No stamp travels with it — a state pick carries no
+/// precondition, because its conflict is the later of two deliberate choices
+/// rather than text silently lost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateTarget {
+    /// What was read, so a surface can name its target and write back to it.
+    pub selection: Selection,
+    /// The states this row's picker offers, in the order it moves through them.
+    pub offered: &'static [State],
+    /// The state the row is in now, which is where the picker's highlight starts.
+    pub current: State,
+    /// How many of the row's descendants are still open, which is what a cascade
+    /// would close.
+    ///
+    /// Advisory: a state pick carries no precondition, so the store recomputes the
+    /// plan under the lock and may close more or fewer than this promised. Always
+    /// none for an epic — an epic's closed flag never touches its nodes, so nothing
+    /// of an epic's cascades.
+    pub open_descendants: usize,
+}
+
+/// Re-read one row's state for a picker; see [`StateTarget`].
+///
+/// An epic's state is its stored flag and not the state its row shows: `completed`
+/// is computed from its nodes, so the flag is what a reader picks and the computed
+/// word is not offered at all.
+pub fn state_target(store: &Store, selection: &Selection) -> Result<StateTarget> {
+    let Some(offered) = State::offered(selection) else {
+        anyhow::bail!("{} has no state of its own", selection.reference())
+    };
+    let (current, open_descendants) = match selection {
+        Selection::Epic(id) => {
+            let epic = ops::read_epic(store, id)?;
+            let current = match epic.frontmatter.closed {
+                true => State::EpicClosed,
+                false => State::EpicOpen,
+            };
+            (current, 0)
+        }
+        Selection::Node(r) => {
+            let node = ops::read_node(store, r)?;
+            let open = ops::descendants_of(store, r)?
+                .iter()
+                .filter(|d| !d.state.is_terminal())
+                .count();
+            (State::Work(node.frontmatter.status), open)
+        }
+        // Every selection [`State::offered`] answers for is covered above, so a row
+        // with no state never reaches here.
+        Selection::Collection(..)
+        | Selection::Label(..)
+        | Selection::Comment(..)
+        | Selection::Asset(..)
+        | Selection::Blocker(..) => {
+            anyhow::bail!("{} has no state of its own", selection.reference())
+        }
+    };
+    Ok(StateTarget {
+        selection: selection.clone(),
+        offered,
+        current,
+        open_descendants,
+    })
+}
+
 /// One entity as an editing surface starts from it: the fields a surface can
 /// replace, plus the stamp they were read at.
 ///
@@ -833,6 +987,24 @@ pub enum Write {
     /// Give up the claim on the node the row names, holder and timestamp
     /// together.
     ReleaseClaim(Selection),
+    /// Put the epic or node the row names into a state.
+    ///
+    /// No stamp: a state pick is not a free-form replacement, and its conflict
+    /// story is that the later of two deliberate choices wins.
+    SetState {
+        /// The epic or node whose state is set.
+        target: Selection,
+        /// The state to put it in, which is the one the picker holds.
+        state: State,
+        /// Why, for a state that says why. Written as the reader left it: what
+        /// makes a reason acceptable is the store's rule, and a state that carries
+        /// none discards this rather than storing an unread word.
+        reason: String,
+        /// Whether closing takes the row's open descendants with it. The store
+        /// recomputes the plan under the lock, so what this asks for is a cascade
+        /// and never a particular set of nodes.
+        cascade: bool,
+    },
     /// Replace one whole field of the epic or node the row names.
     ///
     /// The one write here that can silently discard text somebody else wrote —
@@ -867,6 +1039,7 @@ impl Write {
             | Write::DeleteAsset(target)
             | Write::TakeClaim(target, _)
             | Write::ReleaseClaim(target)
+            | Write::SetState { target, .. }
             | Write::Replace { target, .. } => target,
         }
     }
@@ -895,6 +1068,35 @@ impl Write {
     }
 }
 
+/// What a write did that the browser could not have said in advance.
+///
+/// Invariant: a notice about a write is finished *after* the write rather than
+/// worded with the question that raised it, because the size of a cascade is
+/// something only the write knows — the count a surface showed was the plan as it
+/// stood when the surface opened, and the store recomputes it under the lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effect {
+    /// Exactly what was asked for and nothing besides, which is every write the
+    /// browser makes but one.
+    AsAsked,
+    /// A close that resolved this many of the row's open descendants with it.
+    ///
+    /// Never none: a cascade that finds nothing left to close — somebody else got
+    /// there first — is an ordinary single close and is reported as one rather than
+    /// as a cascade of nothing.
+    AlsoClosed(usize),
+}
+
+impl Effect {
+    /// What a close did, given how many descendants went with it.
+    fn of_cascade(closed: usize) -> Self {
+        match closed {
+            0 => Effect::AsAsked,
+            closed => Effect::AlsoClosed(closed),
+        }
+    }
+}
+
 /// Why the store would not take a write.
 ///
 /// Invariant: the one refusal the browser reacts to differently is told apart
@@ -917,22 +1119,38 @@ pub enum Refusal {
 /// The browser never judges a write itself: only the store can, so the action is
 /// offered, attempted, and whatever comes back is shown — which is why nothing
 /// here pre-checks a store rule.
-pub fn perform(store: &Store, write: &Write) -> Result<(), Refusal> {
+pub fn perform(store: &Store, write: &Write) -> Result<Effect, Refusal> {
     match write {
-        Write::AddLabel(selection, label) => add_label(store, selection, label),
-        Write::RemoveLabel(selection) => remove_label(store, selection),
-        Write::AddBlocker(selection, reference) => add_blocker(store, selection, reference),
-        Write::RemoveBlocker(selection) => remove_blocker(store, selection),
-        Write::DeleteAsset(selection) => delete_asset(store, selection),
-        Write::TakeClaim(selection, holder) => take_claim(store, selection, holder),
-        Write::ReleaseClaim(selection) => release_claim(store, selection),
+        // Only a state pick can do more than it was asked for, so every other write
+        // reports what it was asked for: the one place a notice is finished by the
+        // store cannot then be forgotten for the one write that needs it.
+        Write::AddLabel(selection, label) => as_asked(add_label(store, selection, label)),
+        Write::RemoveLabel(selection) => as_asked(remove_label(store, selection)),
+        Write::AddBlocker(selection, reference) => {
+            as_asked(add_blocker(store, selection, reference))
+        }
+        Write::RemoveBlocker(selection) => as_asked(remove_blocker(store, selection)),
+        Write::DeleteAsset(selection) => as_asked(delete_asset(store, selection)),
+        Write::TakeClaim(selection, holder) => as_asked(take_claim(store, selection, holder)),
+        Write::ReleaseClaim(selection) => as_asked(release_claim(store, selection)),
+        Write::SetState {
+            target,
+            state,
+            reason,
+            cascade,
+        } => set_state(store, target, *state, reason, *cascade),
         Write::Replace {
             target,
             field,
             value,
             expect,
-        } => replace(store, target, *field, value, *expect),
+        } => as_asked(replace(store, target, *field, value, *expect)),
     }
+}
+
+/// A write that can only ever do what it was asked for.
+fn as_asked(result: Result<(), Refusal>) -> Result<Effect, Refusal> {
+    result.map(|()| Effect::AsAsked)
 }
 
 /// The refusal an operation's failure is reported as: a stale precondition, or
@@ -1019,6 +1237,81 @@ fn replace(
             field.noun()
         ))),
     }
+}
+
+/// Put an epic or a node into a state, with the reason that state carries and
+/// whether closing takes the row's open descendants with it.
+///
+/// Every rule about a state is the store's: that `done` waits on open descendants,
+/// that blocking and closing say why, and how much a cascade closes. So nothing is
+/// checked here — the pick is attempted and whatever comes back is what the reader
+/// is shown, which is why the browser cannot go stale when one of those rules gains
+/// a nuance.
+///
+/// A cascade is not atomic. It closes each descendant on its own and stops at the
+/// first failure, leaving a half-closed subtree; the store's refusal names where it
+/// stopped and says to re-run, and every step is idempotent, so re-running is the
+/// whole of the recovery.
+///
+/// No stamp guards this write: a stamp is the precondition of a free-form
+/// replacement, and a state pick's conflict is the later of two deliberate choices.
+fn set_state(
+    store: &Store,
+    selection: &Selection,
+    state: State,
+    reason: &str,
+    cascade: bool,
+) -> Result<Effect, Refusal> {
+    // A state that carries no reason takes none: the reason field is not on screen
+    // for those states, so anything left in it is text the reader is not looking at.
+    let reason = state.needs_reason().then(|| reason.to_string());
+    match selection {
+        Selection::Node(node) => match state {
+            State::Work(work) => {
+                let change = match work {
+                    NodeState::ToDo => NodeStatusChange::ToDo,
+                    NodeState::InProgress => NodeStatusChange::InProgress,
+                    NodeState::Blocked => NodeStatusChange::Blocked { reason },
+                    NodeState::Done => NodeStatusChange::Done,
+                    NodeState::Closed => NodeStatusChange::Closed { reason, cascade },
+                };
+                let outcome = ops::set_node_status(store, node, change).map_err(refusal)?;
+                // How many descendants went with it is the store's answer and not
+                // the plan's: it recomputed that plan under the lock.
+                Ok(Effect::of_cascade(outcome.cascaded_closed.len()))
+            }
+            // An epic's flag is not a state of the work: a caller offering it here
+            // has lost track of what its row points at.
+            State::EpicOpen | State::EpicClosed => Err(wrong_state(selection, state)),
+        },
+        Selection::Epic(id) => match state {
+            State::EpicOpen | State::EpicClosed => {
+                let closed = matches!(state, State::EpicClosed);
+                ops::set_epic_closed(store, id, closed, reason).map_err(refusal)?;
+                // An epic's flag never touches its nodes, so an epic's close is
+                // always exactly what was asked for.
+                Ok(Effect::AsAsked)
+            }
+            State::Work(_) => Err(wrong_state(selection, state)),
+        },
+        // Only an epic and a node have a state of their own, and only their rows
+        // offer the letter, so any other selection is a caller that has lost track
+        // of what its row points at.
+        Selection::Collection(..)
+        | Selection::Label(..)
+        | Selection::Comment(..)
+        | Selection::Asset(..)
+        | Selection::Blocker(..) => Err(wrong_state(selection, state)),
+    }
+}
+
+/// A state aimed at a row that has no such state; see [`misdirected`].
+fn wrong_state(selection: &Selection, state: State) -> Refusal {
+    misdirected(format!(
+        "{} cannot be {}",
+        selection.reference(),
+        state.wire_name()
+    ))
 }
 
 /// Put one label on a container's label set.
@@ -1474,6 +1767,62 @@ pub(crate) mod fixture {
         /// The ticket as a selection, which is how a surface addresses it.
         pub(crate) fn node_selection(&self) -> Selection {
             Selection::Node(self.node.clone())
+        }
+
+        /// The subticket as a selection, which is how a surface addresses it.
+        pub(crate) fn subnode_selection(&self) -> Selection {
+            Selection::Node(self.subnode.clone())
+        }
+
+        /// The state a node is in and the reasons it holds, as the store holds them.
+        ///
+        /// A test asserts against these rather than against what it asked for, so a
+        /// write aimed at the wrong node, or one that dropped the reason on the way,
+        /// cannot look right.
+        pub(crate) fn node_state(
+            &self,
+            node: &NodeRef,
+        ) -> (String, Option<String>, Option<String>) {
+            let node = ops::read_node(&self.store, node).expect("the node can be read");
+            (
+                node.frontmatter.status.wire_name().to_string(),
+                node.frontmatter.block_reason,
+                node.frontmatter.close_reason,
+            )
+        }
+
+        /// Whether the epic carries its closed flag, and the reason it holds with it.
+        pub(crate) fn epic_closed(&self) -> (bool, Option<String>) {
+            let epic = ops::read_epic(&self.store, &self.epic).expect("the epic can be read");
+            (epic.frontmatter.closed, epic.frontmatter.close_reason)
+        }
+
+        /// How many of a node's descendants are still open, as the store counts
+        /// them: what a cascade has left to close.
+        pub(crate) fn open_descendants(&self, node: &NodeRef) -> usize {
+            ops::descendants_of(&self.store, node)
+                .expect("the subtree can be read")
+                .iter()
+                .filter(|d| !d.state.is_terminal())
+                .count()
+        }
+
+        /// Stop the store from taking a write to any node of the epic, and hand back
+        /// the way to let it again.
+        ///
+        /// A node is written by writing beside it and renaming over it, so a
+        /// directory that may not be added to is a node that cannot be written —
+        /// which is how a cascade is made to stop partway without corrupting
+        /// anything. Restoring is the caller's, and has to happen before the fixture
+        /// is dropped: the store's own directory has to be writable to be removed.
+        pub(crate) fn seal_the_epics_directory(&self) -> impl FnOnce() + '_ {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = self.store.epic_dir(&self.epic);
+            let was = std::fs::metadata(&dir).unwrap().permissions();
+            let mut sealed = was.clone();
+            sealed.set_mode(0o555);
+            std::fs::set_permissions(&dir, sealed).unwrap();
+            move || std::fs::set_permissions(&dir, was).unwrap()
         }
 
         /// One replaceable field of an entity as the store holds it, read through
@@ -3294,6 +3643,388 @@ mod tests {
         }
     }
 
+    /// A state pick, as the surface builds one.
+    fn pick(selection: &Selection, state: State, reason: &str, cascade: bool) -> Write {
+        Write::SetState {
+            target: selection.clone(),
+            state,
+            reason: reason.to_string(),
+            cascade,
+        }
+    }
+
+    #[test]
+    fn the_states_a_row_offers_are_its_own_kinds_and_are_named_as_the_store_names_them() {
+        let fx = Fixture::build();
+
+        // A unit of work offers the five states of the state machine, in the order it
+        // reads. Their words come from the store's own type rather than being spelled
+        // again here, so the browser cannot call a state something the command line
+        // does not.
+        let work = State::offered(&fx.node_selection()).expect("a ticket has a state");
+        assert_eq!(
+            work,
+            [
+                NodeState::ToDo,
+                NodeState::InProgress,
+                NodeState::Blocked,
+                NodeState::Done,
+                NodeState::Closed,
+            ]
+            .map(State::Work)
+        );
+        for state in work {
+            let State::Work(held) = state else {
+                panic!("{state:?} is not a unit of work's state")
+            };
+            assert_eq!(state.wire_name(), held.wire_name());
+        }
+
+        // An epic offers its stored flag, off and on, and nothing else — in
+        // particular not the state computed from its nodes, which nobody sets.
+        let epic = State::offered(&fx.epic_selection()).expect("an epic has a state");
+        assert_eq!(epic, [State::EpicOpen, State::EpicClosed]);
+        assert_eq!(epic[0].wire_name(), EpicStatus::Open.wire_name());
+        assert_eq!(epic[1].wire_name(), EpicStatus::Closed.wire_name());
+        for offered in [work, epic].concat() {
+            assert_ne!(
+                offered.wire_name(),
+                EpicStatus::Completed.wire_name(),
+                "a computed state is offered as one to pick"
+            );
+        }
+
+        // And nothing else has a state of its own: a collection is structure and its
+        // members carry none, so no row of one is offered a picker at all.
+        for stateless in [
+            fx.blocked_by_selection(),
+            Selection::Label(
+                Container::Epic(fx.epic.clone()),
+                fx.epic_labels()[0].clone(),
+            ),
+        ] {
+            assert_eq!(State::offered(&stateless), None, "{stateless:?}");
+            state_target(&fx.store, &stateless).expect_err("a row with no state opens no picker");
+        }
+    }
+
+    #[test]
+    fn every_state_the_store_will_not_take_without_a_reason_is_one_the_surface_asks_for_one_in() {
+        // Derived from the store rather than restated: whether a state says why is a
+        // store rule, and the surface reveals its reason field for exactly the states
+        // that rule refuses without one. A leaf, so that the one state with a
+        // precondition of its own is refused for the reason under test or not at all.
+        for state in State::offered(&Selection::Node(Fixture::build().subnode.clone()))
+            .expect("a ticket has states")
+            .iter()
+            .copied()
+        {
+            let fx = Fixture::build();
+            let refused = perform(
+                &fx.store,
+                &pick(&fx.subnode_selection(), state, "  ", false),
+            );
+            assert_eq!(
+                refused.is_err(),
+                state.needs_reason(),
+                "{state:?} with no reason: {refused:?}"
+            );
+        }
+
+        // A reason the store takes is written as the reader left it, on the state that
+        // says why and on no other: leaving a state that carries one clears it, which
+        // is what stops a resolved row explaining itself with somebody's old words.
+        let fx = Fixture::build();
+        let blocked = State::Work(NodeState::Blocked);
+        perform(
+            &fx.store,
+            &pick(&fx.node_selection(), blocked, "waiting on review", false),
+        )
+        .unwrap();
+        assert_eq!(
+            fx.node_state(&fx.node),
+            (
+                blocked.wire_name().to_string(),
+                Some("waiting on review".to_string()),
+                None
+            )
+        );
+        let closed = State::Work(NodeState::Closed);
+        perform(
+            &fx.store,
+            &pick(&fx.node_selection(), closed, "not wanted", false),
+        )
+        .unwrap();
+        assert_eq!(
+            fx.node_state(&fx.node),
+            (
+                closed.wire_name().to_string(),
+                None,
+                Some("not wanted".to_string())
+            )
+        );
+        let started = State::Work(NodeState::InProgress);
+        perform(&fx.store, &pick(&fx.node_selection(), started, "", false)).unwrap();
+        assert_eq!(
+            fx.node_state(&fx.node),
+            (started.wire_name().to_string(), None, None)
+        );
+    }
+
+    #[test]
+    fn a_state_pick_moves_the_row_it_names_and_leaves_every_other_row_alone() {
+        let fx = Fixture::build();
+        let before = fx.node_state(&fx.subnode);
+        let done = State::Work(NodeState::Done);
+
+        // The leaf, because a state pick aimed at the wrong node of an epic looks
+        // right for as long as only one of them is read back.
+        let effect = perform(&fx.store, &pick(&fx.subnode_selection(), done, "", false)).unwrap();
+        assert_eq!(
+            fx.node_state(&fx.subnode).0,
+            done.wire_name(),
+            "the row the pick named did not move"
+        );
+        // Nothing about it was more than what was asked for, so the notice about it
+        // is the one the surface worded.
+        assert_eq!(effect, Effect::AsAsked);
+        // Its parent and its sibling are where they were: one pick moves one row.
+        assert_eq!(fx.node_state(&fx.node), before);
+        assert_eq!(fx.node_state(&fx.blocker), before);
+        assert_eq!(fx.epic_closed(), (false, None));
+    }
+
+    #[test]
+    fn an_epics_flag_is_what_its_pick_sets_and_its_nodes_are_never_touched_by_it() {
+        let fx = Fixture::build();
+        let states: Vec<(String, Option<String>, Option<String>)> = [&fx.node, &fx.subnode]
+            .iter()
+            .map(|node| fx.node_state(node))
+            .collect();
+
+        let effect = perform(
+            &fx.store,
+            &pick(&fx.epic_selection(), State::EpicClosed, "shipped", true),
+        )
+        .unwrap();
+        assert_eq!(fx.epic_closed(), (true, Some("shipped".to_string())));
+        // An epic's closed flag never touches its nodes, so nothing under it moves —
+        // even when the pick was asked to cascade, which an epic has no way to do.
+        for (node, was) in [&fx.node, &fx.subnode].iter().zip(&states) {
+            assert_eq!(&fx.node_state(node), was, "{node} moved with its epic");
+        }
+        assert_eq!(effect, Effect::AsAsked);
+
+        // And reopening clears the flag and the reason together: a reopened epic must
+        // not still say why it was closed.
+        perform(
+            &fx.store,
+            &pick(&fx.epic_selection(), State::EpicOpen, "", false),
+        )
+        .unwrap();
+        assert_eq!(fx.epic_closed(), (false, None));
+    }
+
+    #[test]
+    fn closing_alone_leaves_an_open_descendant_and_a_cascade_closes_it_and_says_how_many() {
+        let fx = Fixture::build();
+        let closed = State::Work(NodeState::Closed);
+        let open = fx.open_descendants(&fx.node);
+        assert!(open > 0, "the fixture's ticket has nothing to cascade to");
+
+        // A plain close resolves the row and nothing under it, so the row can be
+        // reopened later without its subtree having been rewritten.
+        let effect = perform(&fx.store, &pick(&fx.node_selection(), closed, "a", false)).unwrap();
+        assert_eq!(fx.node_state(&fx.node).0, closed.wire_name());
+        assert_eq!(fx.open_descendants(&fx.node), open, "a close cascaded");
+        assert_eq!(effect, Effect::AsAsked);
+
+        // A cascade closes them, and how many it closed is the store's answer: the
+        // count a surface showed was the plan as it stood when the surface opened.
+        let effect = perform(&fx.store, &pick(&fx.node_selection(), closed, "a", true)).unwrap();
+        assert_eq!(fx.open_descendants(&fx.node), 0);
+        assert_eq!(effect, Effect::AlsoClosed(open));
+
+        // A cascade that finds nothing left to close — somebody else got there first —
+        // is an ordinary close and is reported as one rather than as a cascade of
+        // nothing.
+        let effect = perform(&fx.store, &pick(&fx.node_selection(), closed, "a", true)).unwrap();
+        assert_eq!(effect, Effect::AsAsked);
+    }
+
+    #[test]
+    fn the_gate_on_a_row_with_open_descendants_is_the_stores_own_refusal_word_for_word() {
+        let fx = Fixture::build();
+        let done = State::Work(NodeState::Done);
+        assert!(fx.open_descendants(&fx.node) > 0, "nothing gates the pick");
+        let was = fx.node_state(&fx.node);
+
+        // Nothing is pre-checked here: the state is offered, the pick is attempted,
+        // and what comes back is the store's own words — which is why the browser
+        // cannot go stale when the rule gains a nuance. Compared against the words the
+        // operation itself produces rather than against a copy written out here.
+        let expected = ops::set_node_status(&fx.store, &fx.node, NodeStatusChange::Done)
+            .expect_err("the store gates this pick")
+            .to_string();
+        let refused = refusal_words(
+            perform(&fx.store, &pick(&fx.node_selection(), done, "", false))
+                .expect_err("the store gates this pick"),
+        );
+        assert_eq!(refused, expected);
+        assert_eq!(
+            fx.node_state(&fx.node),
+            was,
+            "a refused pick wrote something"
+        );
+    }
+
+    #[test]
+    fn a_cascade_that_stops_partway_comes_back_in_the_stores_own_words() {
+        let fx = Fixture::build();
+        let closed = State::Work(NodeState::Closed);
+        assert!(fx.open_descendants(&fx.node) > 0, "nothing to cascade to");
+
+        // A cascade is not atomic: it closes each descendant on its own and stops at
+        // the first failure. With the store unable to take a node write at all, the
+        // first step is where it stops — and the words are the store's, which name
+        // where it stopped and say to re-run.
+        let unseal = fx.seal_the_epics_directory();
+        let expected = ops::set_node_status(
+            &fx.store,
+            &fx.node,
+            NodeStatusChange::Closed {
+                reason: Some("a".into()),
+                cascade: true,
+            },
+        )
+        .map(|_| ())
+        .expect_err("the store cannot take the cascade")
+        .to_string();
+        let refused = perform(&fx.store, &pick(&fx.node_selection(), closed, "a", true));
+        // Before any assertion, or a failing one would leave a store that cannot be
+        // removed with the fixture.
+        unseal();
+
+        assert_eq!(
+            refusal_words(refused.expect_err("the cascade cannot run")),
+            expected
+        );
+        // The row the reader was closing is left as it was: the descendants go first,
+        // so a cascade that could not start has changed nothing at all.
+        assert_eq!(fx.node_state(&fx.node).0, NodeState::ToDo.wire_name());
+        assert!(fx.open_descendants(&fx.node) > 0);
+    }
+
+    #[test]
+    fn a_state_no_row_of_that_kind_has_is_refused_by_name_and_writes_nothing() {
+        let fx = Fixture::build();
+        let was = (fx.node_state(&fx.node), fx.epic_closed());
+
+        // An epic's flag is not a state of the work and the state machine is not an
+        // epic's, so each aimed at the other is a caller that has lost track of what
+        // its row points at — refused by name, with nothing written on the way.
+        for wrong in [
+            pick(&fx.node_selection(), State::EpicClosed, "a", false),
+            pick(
+                &fx.epic_selection(),
+                State::Work(NodeState::Done),
+                "",
+                false,
+            ),
+            pick(
+                &fx.blocked_by_selection(),
+                State::Work(NodeState::Done),
+                "",
+                false,
+            ),
+        ] {
+            let err = refusal_words(perform(&fx.store, &wrong).expect_err("no such state here"));
+            assert!(
+                err.contains(&wrong.target().reference()),
+                "{wrong:?} refused without naming what it was aimed at: {err}"
+            );
+            assert_eq!(
+                (fx.node_state(&fx.node), fx.epic_closed()),
+                was,
+                "{wrong:?} wrote something"
+            );
+        }
+    }
+
+    #[test]
+    fn a_picker_opens_on_the_state_the_store_holds_and_on_how_much_a_cascade_would_close() {
+        let fx = Fixture::build();
+
+        // The state the store holds now, and the plan as it stands now: both are read
+        // when the letter is pressed, so a picker never marks a state the row has
+        // already left.
+        let ticket = state_target(&fx.store, &fx.node_selection()).unwrap();
+        assert_eq!(ticket.current.wire_name(), fx.node_state(&fx.node).0);
+        assert_eq!(ticket.open_descendants, fx.open_descendants(&fx.node));
+        assert!(ticket.open_descendants > 0);
+
+        // It follows the store: a descendant resolved behind the browser's back is a
+        // descendant the next picker does not offer to close.
+        perform(
+            &fx.store,
+            &pick(
+                &fx.subnode_selection(),
+                State::Work(NodeState::Done),
+                "",
+                false,
+            ),
+        )
+        .unwrap();
+        let ticket = state_target(&fx.store, &fx.node_selection()).unwrap();
+        assert_eq!(ticket.open_descendants, 0);
+
+        // An epic's picker opens on its stored flag rather than on the state its row
+        // shows: an epic whose every node is resolved reads as completed, and
+        // completed is not a state anybody picks — the flag is still off.
+        perform(
+            &fx.store,
+            &pick(
+                &fx.node_selection(),
+                State::Work(NodeState::Done),
+                "",
+                false,
+            ),
+        )
+        .unwrap();
+        perform(
+            &fx.store,
+            &pick(
+                &Selection::Node(fx.blocker.clone()),
+                State::Work(NodeState::Done),
+                "",
+                false,
+            ),
+        )
+        .unwrap();
+        let shown = rows(&fx.store, &Level::Epics).unwrap();
+        let RowKind::Work { status, .. } = &shown[0].kind else {
+            panic!("an epic's row is work")
+        };
+        assert_eq!(status, EpicStatus::Completed.wire_name());
+        let epic = state_target(&fx.store, &fx.epic_selection()).unwrap();
+        assert_eq!(epic.current, State::EpicOpen);
+        // And an epic never offers a cascade: its flag does not reach its nodes, so
+        // there is nothing for the count to be about.
+        assert_eq!(epic.open_descendants, 0);
+
+        perform(
+            &fx.store,
+            &pick(&fx.epic_selection(), State::EpicClosed, "done with", false),
+        )
+        .unwrap();
+        assert_eq!(
+            state_target(&fx.store, &fx.epic_selection())
+                .unwrap()
+                .current,
+            State::EpicClosed
+        );
+    }
+
     #[test]
     fn every_write_says_what_it_is_aimed_at_and_only_a_stamped_one_drops_a_precondition() {
         let fx = Fixture::build();
@@ -3314,6 +4045,12 @@ mod tests {
             Write::DeleteAsset(fx.epic_selection()),
             Write::TakeClaim(fx.node_selection(), "a human".into()),
             Write::ReleaseClaim(fx.node_selection()),
+            Write::SetState {
+                target: fx.node_selection(),
+                state: State::Work(NodeState::Done),
+                reason: String::new(),
+                cascade: false,
+            },
             body.clone(),
         ] {
             // Dropping the precondition changes the precondition and nothing else:
