@@ -87,6 +87,11 @@ pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
         // the name, `S` the summary. The summary takes the shifted key because the
         // unshifted one belongs to the state a reader changes far more often, at the
         // cost of two unrelated nouns sharing a letter.
+        //
+        // `b` is the long-form text *of the row it is pressed on* — a body on an
+        // epic or a node, a comment's text on a comment — so a comment needs no
+        // letter of its own and one key still carries one intent. Which field the
+        // intent reaches is the row's answer, decided where a row's offers are.
         (KeyCode::Char('b'), false) if matches!(mode, Mode::Editing) => {
             Action::Edit(FreeForm::Body)
         }
@@ -297,10 +302,12 @@ pub const HELP: &[(&str, &str)] = &[
     ("a / d", "editing mode: add a member / remove it, confirmed"),
     // Three keys on one row, because the list is as tall as the shortest terminal
     // the browser supports and a row past that is clipped without saying so: the
-    // three replace a whole field between them and are read as one group.
+    // three replace a whole field between them and are read as one group. The last
+    // of them is named for what it edits on any row rather than for a body, because
+    // on a comment it is the comment's own text.
     (
         "n / S / b",
-        "editing mode: the name / the summary / the body",
+        "editing mode: the name / the summary / the text",
     ),
     // Three keys on one row, for the same reason the fields above share one: the
     // list is as tall as the shortest terminal the browser supports and a row past
@@ -355,7 +362,10 @@ pub const FOOTER_HINTS_EDITING: &[(EditingAction, &str)] = &[
     (EditingAction::Delete, "d remove"),
     (EditingAction::Edit(FreeForm::Name), "n name"),
     (EditingAction::Edit(FreeForm::Summary), "S summary"),
-    (EditingAction::Edit(FreeForm::Body), "b body"),
+    // Named for the long-form text rather than for a body: the same letter edits a
+    // comment's text on a comment row, and the strip must not name a field the row
+    // it is drawn beside has not got.
+    (EditingAction::Edit(FreeForm::Body), "b text"),
     (EditingAction::SetState, "s state"),
     (EditingAction::TakeClaim, "c claim"),
     (EditingAction::ReleaseClaim, "C release"),

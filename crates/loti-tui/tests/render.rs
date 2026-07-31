@@ -2137,8 +2137,10 @@ fn a_saved_body_leaves_the_mode_and_the_notice_names_the_entity() {
     freeze_the_epics_row(&mut app);
     let (_t, frozen) = draw(&mut app);
     // The row offers the letter, and the strip teaches it: a letter a reader cannot
-    // discover is a letter nobody presses.
-    assert!(frozen[23].contains("b body"), "{:?}", frozen[23]);
+    // discover is a letter nobody presses. It is named for the long-form text of
+    // the row rather than for a body, because the same letter edits a comment's
+    // text on a comment row.
+    assert!(frozen[23].contains("b text"), "{:?}", frozen[23]);
 
     app.apply(Action::Edit(FreeForm::Body)).unwrap();
     // A line break is content in a buffer that holds many lines, so what a reader
@@ -3217,4 +3219,268 @@ fn float_text(terminal: &Terminal<TestBackend>, title: &str) -> String {
         })
         .collect::<Vec<String>>()
         .join(" ")
+}
+
+/// Stand on the epic's own `comments` row, which is where a comment is added:
+/// creation acts on the container row the cursor stands on.
+///
+/// It walks out to the roster first, so a test that has already been down a level
+/// can still say where it goes next from the top. Bounded by the crumbs there are
+/// to leave, so a key that stops leaving levels fails here rather than spinning.
+fn to_the_comments_row(app: &mut App) {
+    for _ in 0..app.nav().crumbs().len() {
+        if app.nav().crumbs().len() == 1 {
+            break;
+        }
+        app.apply(Action::Ascend).unwrap();
+    }
+    assert_eq!(app.nav().crumbs().len(), 1, "the roster is out of reach");
+    app.apply(Action::CursorFirst).unwrap();
+    app.apply(Action::Descend).unwrap(); // into the epic
+    let index = app
+        .nav()
+        .rows()
+        .iter()
+        .position(|r| matches!(&r.kind, RowKind::Collection(c) if c.name() == "comments"))
+        .expect("every epic level carries a comments row");
+    app.apply(Action::CursorFirst).unwrap();
+    for _ in 0..index {
+        app.apply(Action::CursorDown).unwrap();
+    }
+}
+
+/// Stand on the comment row bearing this number, whoever wrote it: a comment is
+/// addressed by the number the store gave it and never by where it sits.
+fn to_the_comment_numbered(app: &mut App, id: u64) {
+    to_the_comments_row(app);
+    app.apply(Action::Descend).unwrap();
+    let index = app
+        .nav()
+        .rows()
+        .iter()
+        .position(|r| r.label == id.to_string())
+        .unwrap_or_else(|| panic!("comment {id} is not on the level"));
+    app.apply(Action::CursorFirst).unwrap();
+    for _ in 0..index {
+        app.apply(Action::CursorDown).unwrap();
+    }
+}
+
+/// Every comment the epic holds, tombstones included, straight out of the store.
+fn stored_comments(store: &Store) -> Vec<loti_core::model::Comment> {
+    ops::read_epic(store, "browser")
+        .expect("the epic can be read")
+        .frontmatter
+        .comments
+}
+
+/// The number of the epic's one comment written by the human, which is the only
+/// one the browser may rewrite or withdraw.
+fn the_humans_comment(store: &Store) -> u64 {
+    stored_comments(store)
+        .into_iter()
+        .find(|c| !c.deleted && c.author == Actor::Human)
+        .expect("the fixture writes one comment as the human")
+        .id
+}
+
+#[test]
+fn a_comment_is_written_in_the_preview_pane_and_the_notice_names_its_number() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    // A split the reader chose, so a buffer that widened the pane is told from one
+    // that drew where the panes already were.
+    app.apply(Action::ShrinkNav).unwrap();
+    let divider = usize::from(nav_pane_width(&app));
+    to_the_comments_row(&mut app);
+    app.apply(Action::EnterEditing).unwrap();
+    let (before, on_the_list) = draw(&mut app);
+    // The row offers the addition and the strip teaches it: a letter a reader
+    // cannot discover is a letter nobody presses.
+    assert!(on_the_list[23].contains("a add"), "{:?}", on_the_list[23]);
+
+    app.apply(Action::Add).unwrap();
+    let (terminal, _) = draw(&mut app);
+    let (before, after) = (cells(&before), cells(&terminal));
+    // A comment is prose, so it is written in the preview pane's own cells, corner
+    // to corner — the list's row stays visible beside it and the divider does not
+    // move.
+    let last_column = after[0].len() - 1;
+    let last_row = after.len() - 2;
+    let buffer = box_lines(&after, (divider, 1, last_column + 1 - divider, last_row));
+    assert!(
+        buffer[0].starts_with('\u{250c}') && buffer[0].ends_with('\u{2510}'),
+        "the buffer is not the pane's own frame: {buffer:#?}"
+    );
+    assert!(buffer[0].contains("new comment on browser"), "{buffer:#?}");
+    for (row, was) in after.iter().zip(&before).take(last_row) {
+        assert_eq!(row[..divider], was[..divider], "the navigation pane moved");
+    }
+
+    // A line break is content in a buffer that holds many lines, and the lines the
+    // reader writes are the lines drawn.
+    for c in "first line".chars() {
+        app.apply(Action::Insert(c)).unwrap();
+    }
+    app.apply(Action::Insert('\n')).unwrap();
+    for c in "second line".chars() {
+        app.apply(Action::Insert(c)).unwrap();
+    }
+    let (typed, _) = draw(&mut app);
+    let typed = box_lines(
+        &cells(&typed),
+        (divider, 1, last_column + 1 - divider, last_row),
+    );
+    assert!(typed[1].contains("first line"), "{typed:#?}");
+    assert!(typed[2].contains("second line"), "{typed:#?}");
+
+    let before_save = stored_comments(&store);
+    app.apply(Action::Accept).unwrap();
+    let (_t, lines) = draw(&mut app);
+    // The mode indicator going, the buffer going and the notice arriving are one
+    // frame, which is what reads as "that finished".
+    assert!(!lines[0].contains("EDITING"), "{:?}", lines[0]);
+    assert!(
+        !lines[1..23].iter().any(|l| l.contains("new comment on")),
+        "the buffer outlived the write: {lines:#?}"
+    );
+    // The notice names the comment by the number the store gave it, which is how it
+    // is addressed from now on and which the browser could not have known before
+    // the write: the number is derived from the store here for the same reason.
+    let added = stored_comments(&store)
+        .into_iter()
+        .find(|c| !before_save.iter().any(|had| had.id == c.id))
+        .expect("the comment was added");
+    assert!(
+        lines[23].contains(&format!("numbered {}", added.id)),
+        "{:?}",
+        lines[23]
+    );
+    // And the row is on the level the reader was standing on, written as the human
+    // and holding the breaks they typed.
+    assert_eq!(added.author, Actor::Human);
+    assert_eq!(added.text, "first line\nsecond line");
+    app.apply(Action::Descend).unwrap();
+    let (_t, listed) = draw(&mut app);
+    assert!(
+        listed.iter().any(|l| l.contains(&added.id.to_string())),
+        "the new comment is not on the level: {listed:#?}"
+    );
+}
+
+#[test]
+fn only_the_comment_the_human_wrote_teaches_a_letter_on_the_strip() {
+    let (_dir, store) = fixture();
+    let epic = Target::Epic("browser".into());
+    // A comment of somebody else's and one already withdrawn, beside the human's
+    // own: what the browser offers on a comment turns on who wrote it, so a store
+    // holding only the human's could not tell an offer made to everyone from one
+    // made to its author.
+    let agents = ops::add_comment(
+        &store,
+        &epic,
+        Actor::Agent("builder".into()),
+        "somebody else wrote this\n".to_string(),
+    )
+    .unwrap()
+    .id;
+    let withdrawn = ops::add_comment(&store, &epic, Actor::Human, "withdrawn since\n".to_string())
+        .unwrap()
+        .id;
+    ops::delete_comment(&store, &epic, withdrawn, Actor::Human).unwrap();
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+
+    // The author's own live comment teaches both letters it offers.
+    to_the_comment_numbered(&mut app, the_humans_comment(&store));
+    app.apply(Action::EnterEditing).unwrap();
+    let (_t, mine) = draw(&mut app);
+    assert!(mine[23].contains("b text"), "{:?}", mine[23]);
+    assert!(mine[23].contains("d remove"), "{:?}", mine[23]);
+    app.apply(Action::Unwind).unwrap();
+
+    // Nobody else's teaches either: the keys are absent rather than shown and
+    // refused, so the strip beside them carries only the way out and the key list.
+    for (id, whose) in [(agents, "an agent's comment"), (withdrawn, "a tombstone")] {
+        to_the_comment_numbered(&mut app, id);
+        app.apply(Action::EnterEditing).unwrap();
+        let (_t, theirs) = draw(&mut app);
+        assert!(!theirs[23].contains("b text"), "{whose}: {:?}", theirs[23]);
+        assert!(
+            !theirs[23].contains("d remove"),
+            "{whose}: {:?}",
+            theirs[23]
+        );
+        // The mode is still on, and its own way out is still on the strip: the row
+        // offers nothing, which is not the same as the mode having ended.
+        assert!(theirs[0].contains("EDITING"), "{whose}: {:?}", theirs[0]);
+        assert!(
+            theirs[23].contains("Esc leave"),
+            "{whose}: {:?}",
+            theirs[23]
+        );
+        app.apply(Action::Unwind).unwrap();
+    }
+}
+
+#[test]
+fn a_comment_withdrawal_asks_by_number_and_the_row_keeps_the_number_it_had() {
+    let (_dir, store) = fixture();
+    let epic = Target::Epic("browser".into());
+    // A second comment to stand beside: one member could not tell the comment the
+    // row names from the whole level.
+    ops::add_comment(&store, &epic, Actor::Human, "a second remark\n".to_string()).unwrap();
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    let id = the_humans_comment(&store);
+    to_the_comment_numbered(&mut app, id);
+    app.apply(Action::EnterEditing).unwrap();
+    let (before, _) = draw(&mut app);
+
+    app.apply(Action::Delete).unwrap();
+    let (after, _) = draw(&mut app);
+    let (before, after) = (cells(&before), cells(&after));
+    let float = box_lines(&after, changed_box(&before, &after));
+    // The question names the comment by its number, because the frozen row is
+    // dimmed and the members of a collection read alike.
+    assert!(
+        float
+            .iter()
+            .any(|l| l.contains(&format!("Delete comment {id}?"))),
+        "{float:#?}"
+    );
+    assert_eq!(dialog_answer_set(&app), Answers::Destructive);
+    for answer in listed_answers(&app) {
+        assert!(
+            float.iter().any(|l| l.contains(&answer)),
+            "{answer:?} is not listed: {float:#?}"
+        );
+    }
+
+    app.apply(Action::Delete).unwrap();
+    let (terminal, lines) = draw(&mut app);
+    assert!(!lines[0].contains("EDITING"), "{:?}", lines[0]);
+    assert!(
+        lines[23].contains(&format!("comment {id} deleted")),
+        "{:?}",
+        lines[23]
+    );
+    // Hidden, never removed: the row stays where it was, under the number it keeps,
+    // and says in a word that it is gone — the text is what went. Read off the
+    // navigation pane's own cells, because the preview beside it names the same
+    // comment on the same line.
+    let rows = nav_pane(&terminal, nav_pane_width(&app));
+    let row = rows
+        .iter()
+        .find(|l| l.trim_start().starts_with(&format!("{id} ")))
+        .unwrap_or_else(|| panic!("the withdrawn comment left the level: {rows:#?}"));
+    assert!(row.contains("deleted"), "{row:?}");
+    let held = stored_comments(&store);
+    assert!(
+        held.iter().any(|c| c.id == id && c.deleted),
+        "the slot went with the text: {held:?}"
+    );
+    assert_eq!(
+        held.len(),
+        2,
+        "a withdrawal took a slot, so the number could be reused: {held:?}"
+    );
 }

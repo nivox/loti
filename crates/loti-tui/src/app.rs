@@ -95,6 +95,9 @@ const STATE_FIELD: &str = "status";
 /// states that carry one and required while it is on screen, so the accept-time
 /// check that guards every other required field guards this one too.
 const REASON_FIELD: &str = "reason";
+/// See [`LABEL_FIELD`]. What a new comment is written into. A comment's text is
+/// the whole of it, so the field is named for the comment itself.
+const COMMENT_FIELD: &str = "comment";
 /// See [`LABEL_FIELD`]. A claim's holder is freeform text and is not attribution:
 /// it says who is on the work rather than who wrote the change, so the field is
 /// named for the holder and never for an author.
@@ -129,6 +132,10 @@ fn reported(done: String, effect: data::Effect) -> String {
         data::Effect::AsAsked => done,
         data::Effect::AlsoClosed(1) => format!("{done}, and 1 descendant with it"),
         data::Effect::AlsoClosed(count) => format!("{done}, and {count} descendants with it"),
+        // A comment is addressed by its number for the rest of its life, and the
+        // store assigns it under the lock, so the reader is told which comment they
+        // now have rather than merely that they have one.
+        data::Effect::Commented(id) => format!("{done}, numbered {id}"),
     }
 }
 
@@ -212,8 +219,10 @@ enum Offer {
 /// opened on a stale preview writes back text nobody is looking at, and a picker
 /// opened on a stale state marks a state the row has already left.
 enum Composed {
-    /// One whole field's text, and the stamp it was read at.
+    /// One of an entity's whole fields, and the stamp it was read at.
     Field(data::FreeForm),
+    /// One comment's text, and the stamp its container was read at.
+    CommentText,
     /// The state the row is in, the states it may be put into, and how many of its
     /// descendants are still open — the state to mark, and what a cascade would have
     /// to close.
@@ -899,6 +908,13 @@ enum Commit {
     /// row names. The browser judges nothing about the reference: what it names,
     /// and whether that may block this, come back from the store.
     AddBlocker(Selection),
+    /// Put the comment the field holds on the list the frozen row names, authored
+    /// by the human — the browser writes as the human and only the human.
+    ///
+    /// No stamp: an append takes a slot of its own, so it discards nobody's text.
+    /// Which number the comment takes is the store's answer, so the notice about it
+    /// is finished once the write has run.
+    AddComment(Selection),
     /// Take the claim on the node the frozen row names, for the holder the field
     /// holds. No stamp: a claim is not a free-form replacement, and a claim has one
     /// holder, so taking an already-held one reassigns it.
@@ -927,17 +943,17 @@ enum Commit {
         /// field in and out from under the keyboard.
         open_descendants: usize,
     },
-    /// Replace one whole field of the epic or node the frozen row names, guarded by
-    /// the stamp that field's text was read at.
+    /// Replace one whole field of what the frozen row names, guarded by the stamp
+    /// that field's text was read at.
     ///
     /// The stamp is captured when the surface opens and travels unread from there to
     /// the write: the window it guards is the edit itself, which is exactly the
     /// window the browser cannot see into.
     Replace {
-        /// The epic or node the field belongs to.
+        /// The epic, node or comment the field belongs to.
         target: Selection,
         /// Which of its fields the surface replaces.
-        field: data::FreeForm,
+        field: data::Replaceable,
         /// The stamp that field's text was read at.
         stamp: data::Stamp,
     },
@@ -967,6 +983,22 @@ impl Surface {
             focus: 0,
             placement: Placement::Float,
             commit: Commit::AddBlocker(list),
+        }
+    }
+
+    /// The surface that adds one comment: a buffer in the preview pane, because a
+    /// comment is prose and the row it is being written about should stay visible
+    /// beside it — the same reason a body is edited there.
+    ///
+    /// It starts empty and is required: a comment is one remark and its text is the
+    /// whole of it, so a comment with nothing in it says nothing.
+    fn add_comment(list: Selection, container: String) -> Self {
+        Self {
+            title: format!(" new comment on {container} "),
+            fields: vec![Field::new(COMMENT_FIELD, true, Lines::Many)],
+            focus: 0,
+            placement: Placement::Pane,
+            commit: Commit::AddComment(list),
         }
     }
 
@@ -1020,39 +1052,44 @@ impl Surface {
         surface
     }
 
-    /// The surface that replaces one whole field of an epic or a node: one field,
-    /// starting from the text the read returned and carrying that read's stamp, so
-    /// it is the current value rather than a rendered preview of an older one.
+    /// The surface that replaces one whole field: one field, starting from the text
+    /// the read returned and carrying that read's stamp, so it is the current value
+    /// rather than a rendered preview of an older one.
     ///
     /// One surface for every replaceable field, because everything but its shape is
     /// the same: the read, the stamp, the conflict it may be refused for. The shape
     /// is the field's own answer — the long-form text is many lines in the preview
     /// pane, so the frozen row stays visible beside the prose being rewritten, while
     /// a short line is a float, where keeping the row visible buys nothing.
-    fn replace(field: data::FreeForm, target: data::EditTarget) -> Self {
+    fn replace(
+        field: data::Replaceable,
+        target: Selection,
+        value: String,
+        stamp: data::Stamp,
+    ) -> Self {
         // A name may not be emptied: it is how every row addresses what it names,
-        // so a row with none is a row a reader cannot pick out. A summary and a body
-        // may — emptying either is a thing a reader may mean — and what makes a
-        // non-empty value acceptable is the store's rule and not this surface's.
+        // so a row with none is a row a reader cannot pick out. Nor may a comment,
+        // whose text is the whole of it and which is taken back by being withdrawn
+        // rather than by being emptied. A summary and a body may — emptying either
+        // is a thing a reader may mean — and what makes a non-empty value
+        // acceptable is the store's rule and not this surface's.
         let (placement, lines, required) = match field {
-            data::FreeForm::Name => (Placement::Float, Lines::One, true),
-            data::FreeForm::Summary => (Placement::Float, Lines::One, false),
-            data::FreeForm::Body => (Placement::Pane, Lines::Many, false),
+            data::Replaceable::Field(data::FreeForm::Name) => (Placement::Float, Lines::One, true),
+            data::Replaceable::Field(data::FreeForm::Summary) => {
+                (Placement::Float, Lines::One, false)
+            }
+            data::Replaceable::Field(data::FreeForm::Body) => (Placement::Pane, Lines::Many, false),
+            data::Replaceable::CommentText => (Placement::Pane, Lines::Many, true),
         };
         Self {
-            title: format!(" {} of {} ", field.noun(), target.selection.reference()),
-            fields: vec![Field::filled(
-                field.noun(),
-                required,
-                lines,
-                field.of(&target).to_string(),
-            )],
+            title: format!(" {} of {} ", field.noun(), target.reference()),
+            fields: vec![Field::filled(field.noun(), required, lines, value)],
             focus: 0,
             placement,
             commit: Commit::Replace {
-                target: target.selection,
+                target,
                 field,
-                stamp: target.stamp,
+                stamp,
             },
         }
     }
@@ -1288,6 +1325,13 @@ impl Surface {
                     format!("blocker {} added", data::blocker_name(list, &reference)),
                 )
             }
+            Commit::AddComment(list) => (
+                data::Write::AddComment(list.clone(), self.typed()),
+                // The notice names the container, and the number the store gave the
+                // comment is added once the write has run: only the store knows it,
+                // and it is how the comment is addressed from then on.
+                format!("comment on {} added", list.reference()),
+            ),
             Commit::TakeClaim(node) => {
                 let holder = self.typed();
                 let reference = node.reference();
@@ -1551,8 +1595,40 @@ impl App {
             data::RowKind::Work { claimed_by, .. } => claimed_by.as_deref(),
             data::RowKind::Collection(_)
             | data::RowKind::Member
+            | data::RowKind::Comment { .. }
             | data::RowKind::Withdrawn
             | data::RowKind::Unreadable => None,
+        }
+    }
+
+    /// Whether the frozen row is a live comment the human wrote, which is the whole
+    /// of whether a comment may be rewritten or withdrawn from here.
+    ///
+    /// Three rules meet in it: a comment is its author's alone to change, the
+    /// browser writes as the human and only the human, and a comment already
+    /// withdrawn has no text to rewrite and cannot be withdrawn twice. Where the
+    /// answer is no the letters are simply absent — the reader is never told the
+    /// rule by the browser, which is the accepted cost of offering only what it
+    /// believes it can perform.
+    ///
+    /// Read off the row the mode froze and matched against what the mode is acting
+    /// on, exactly as a claim's holder is: an author can never arrive from a row the
+    /// mode is not on, and the reader is looking at the same value the offer turns
+    /// on — the row names its own author.
+    fn frozen_comment_is_the_humans(&self, target: &Selection) -> bool {
+        let Some(row) = self.nav.frame().current() else {
+            return false;
+        };
+        if row.selection != *target {
+            return false;
+        }
+        match &row.kind {
+            data::RowKind::Comment { by_the_human } => *by_the_human,
+            data::RowKind::Work { .. }
+            | data::RowKind::Collection(_)
+            | data::RowKind::Member
+            | data::RowKind::Withdrawn
+            | data::RowKind::Unreadable => false,
         }
     }
 
@@ -1590,6 +1666,12 @@ impl App {
                 Selection::Collection(container, Collection::Labels) => Some(Offer::Fill(
                     Surface::add_label(target.clone(), container.selection().reference()),
                 )),
+                // A comment is prose, so it is written in the pane where the row it
+                // is about stays visible. The container's row is where it is added,
+                // for the same reason a label is added from the label set's row.
+                Selection::Collection(container, Collection::Comments) => Some(Offer::Fill(
+                    Surface::add_comment(target.clone(), container.selection().reference()),
+                )),
                 // A dependency list belongs to a node: an epic is not a unit of
                 // work that can be blocked, so it carries no such list and is
                 // never offered one.
@@ -1624,9 +1706,20 @@ impl App {
             // so no row of one offers these letters. The text itself is not fetched
             // here — the hint strip asks this on every frame, and a read belongs to
             // the keypress.
-            EditingAction::Edit(field) => match target {
-                Selection::Epic(_) | Selection::Node(_) => {
+            //
+            // The letter that names a row's long-form text is the exception: on a
+            // comment row it reaches the comment's own text, so which field it means
+            // is decided here, by the row, rather than by the key. It is offered only
+            // on a live comment the human wrote — a comment is its author's alone to
+            // rewrite — so on anyone else's the letter is simply not there.
+            EditingAction::Edit(field) => match (field, target) {
+                (_, Selection::Epic(_) | Selection::Node(_)) => {
                     Some(Offer::Compose(Composed::Field(field)))
+                }
+                (data::FreeForm::Body, Selection::Comment(..))
+                    if self.frozen_comment_is_the_humans(target) =>
+                {
+                    Some(Offer::Compose(Composed::CommentText))
                 }
                 _ => None,
             },
@@ -1702,6 +1795,22 @@ impl App {
                     },
                     "cancel",
                 ))),
+                // A comment is withdrawn rather than removed — the store keeps the
+                // slot, so the number stays taken — and only its author may withdraw
+                // it, so the letter is absent on anyone else's and on one already
+                // withdrawn. It is named by its number, which is the only name it
+                // has and the one it keeps.
+                Selection::Comment(_, id) if self.frozen_comment_is_the_humans(target) => {
+                    Some(Offer::Ask(Dialog::confirm(
+                        format!("Delete comment {id}?"),
+                        "delete",
+                        Performs::Write {
+                            write: data::Write::DeleteComment(target.clone()),
+                            done: format!("comment {id} deleted"),
+                        },
+                        "cancel",
+                    )))
+                }
                 _ => None,
             },
         }
@@ -2175,9 +2284,22 @@ impl App {
             return;
         };
         let opened = match composed {
-            Composed::Field(field) => {
-                data::edit_target(&self.store, &target).map(|read| Surface::replace(field, read))
-            }
+            Composed::Field(field) => data::edit_target(&self.store, &target).map(|read| {
+                Surface::replace(
+                    data::Replaceable::Field(field),
+                    read.selection.clone(),
+                    field.of(&read).to_string(),
+                    read.stamp,
+                )
+            }),
+            Composed::CommentText => data::comment_target(&self.store, &target).map(|read| {
+                Surface::replace(
+                    data::Replaceable::CommentText,
+                    read.selection,
+                    read.text,
+                    read.stamp,
+                )
+            }),
             Composed::State => data::state_target(&self.store, &target).map(Surface::set_state),
         };
         match opened {
@@ -2534,6 +2656,59 @@ mod tests {
         freeze_the_epics_row(app);
         app.apply(Action::Edit(FreeForm::Body)).unwrap();
         assert!(app.surface().is_some(), "the body key opened no buffer");
+    }
+
+    /// Stand on the epic's own `comments` row, which is where a comment is added:
+    /// creation acts on the container row the cursor stands on.
+    fn to_the_comments_row(app: &mut App) {
+        to_the_roster(app);
+        app.apply(Action::Descend).unwrap(); // into the epic
+        to_row(
+            app,
+            |kind| matches!(kind, RowKind::Collection(c) if c.name() == "comments"),
+        );
+    }
+
+    /// Stand on the first comment of the epic's own comments level, which the
+    /// fixture writes as the human.
+    fn to_a_comment_row(app: &mut App) {
+        to_the_comments_row(app);
+        app.apply(Action::Descend).unwrap();
+    }
+
+    /// Stand on the comment row whose number this is, whoever wrote it: a comment
+    /// is addressed by the number the store gave it and never by where it sits.
+    fn to_the_comment_numbered(app: &mut App, id: u64) {
+        to_the_comments_row(app);
+        app.apply(Action::Descend).unwrap();
+        let index = app
+            .nav()
+            .rows()
+            .iter()
+            .position(|row| row.label == id.to_string())
+            .unwrap_or_else(|| panic!("comment {id} is not on the level"));
+        app.apply(Action::CursorFirst).unwrap();
+        for _ in 0..index {
+            app.apply(Action::CursorDown).unwrap();
+        }
+    }
+
+    /// Open the buffer that adds a comment, the way a reader does: freeze the
+    /// comment list's row and press the letter that adds a member to it.
+    fn open_the_comment_buffer(app: &mut App) {
+        to_the_comments_row(app);
+        app.apply(Action::EnterEditing).unwrap();
+        app.apply(Action::Add).unwrap();
+        assert!(app.surface().is_some(), "the add key opened no buffer");
+    }
+
+    /// Open the buffer that rewrites the human's own comment, the way a reader
+    /// does: freeze its row and press the letter that edits a row's long-form text.
+    fn open_the_comment_edit(app: &mut App) {
+        to_a_comment_row(app);
+        app.apply(Action::EnterEditing).unwrap();
+        app.apply(Action::Edit(FreeForm::Body)).unwrap();
+        assert!(app.surface().is_some(), "the text key opened no buffer");
     }
 
     /// Open the label surface, the way a reader does: freeze the label set's row
@@ -3650,51 +3825,48 @@ mod tests {
         app.apply(Action::Unwind).unwrap();
         app.apply(Action::Ascend).unwrap();
 
-        // Every other collection of the epic's level opens nothing either, and
-        // none of them lists the letter. What each says when the letter is pressed
-        // anyway differs: the assets row has somewhere to send the reader and says
-        // so, which its own test pins.
-        for other in ["comments", "assets"] {
-            to_the_roster(&mut app);
-            app.apply(Action::Descend).unwrap(); // into the epic
-            to_row(
-                &mut app,
-                |kind| matches!(kind, RowKind::Collection(c) if c.name() == other),
-            );
-            app.apply(Action::EnterEditing).unwrap();
-            // Cleared first, because a notice lives five seconds: one left over
-            // from an earlier row would answer for this one.
-            app.clear_flash();
-            app.apply(Action::Add).unwrap();
-            assert!(
-                app.surface().is_none(),
-                "the {other} row opened the label surface"
-            );
-            // The exact wording, not merely that something was said: a row that
-            // raised another row's notice would send the reader to the wrong
-            // command, which is worse than saying nothing.
-            match other {
-                "assets" => assert!(
-                    app.flash_message()
-                        .is_some_and(|notice| notice.contains("asset add")),
-                    "{other} did not name the command that attaches one"
-                ),
-                _ => assert_eq!(
-                    app.flash_message(),
-                    Some(NOT_AN_EDITING_ACTION),
-                    "{other} said something other than the mode's own wording"
-                ),
-            }
-            assert!(app.editing_hints().is_empty(), "{other}");
-            app.apply(Action::Unwind).unwrap();
-        }
+        // The one collection of the epic's level that opens nothing at all is the
+        // assets row, and it does not list the letter either. It has somewhere to
+        // send the reader instead and says so, which its own test pins.
+        to_the_roster(&mut app);
+        app.apply(Action::Descend).unwrap(); // into the epic
+        to_row(
+            &mut app,
+            |kind| matches!(kind, RowKind::Collection(c) if c.name() == "assets"),
+        );
+        app.apply(Action::EnterEditing).unwrap();
+        // Cleared first, because a notice lives five seconds: one left over from an
+        // earlier row would answer for this one.
+        app.clear_flash();
+        app.apply(Action::Add).unwrap();
+        assert!(
+            app.surface().is_none(),
+            "the assets row opened the label surface"
+        );
+        // The exact wording, not merely that something was said: a row that raised
+        // another row's notice would send the reader to the wrong command, which is
+        // worse than saying nothing.
+        assert!(
+            app.flash_message()
+                .is_some_and(|notice| notice.contains("asset add")),
+            "the assets row did not name the command that attaches one"
+        );
+        assert!(app.editing_hints().is_empty(), "the assets row");
+        app.apply(Action::Unwind).unwrap();
 
-        // A dependency list does offer an addition, and it is not this one: each
-        // collection's member is its own shape of input, so the surface a row opens
-        // is the surface that writes what that row holds.
+        // A dependency list and a comment list do offer an addition, and neither is
+        // this one: each collection's member is its own shape of input, so the
+        // surface a row opens is the surface that writes what that row holds.
         open_the_blocker_surface(&mut app);
         let surface = app.surface().expect("the surface is open");
         assert_eq!(surface.fields()[0].label(), BLOCKER_FIELD);
+        assert!(!surface.title().contains("label"), "{:?}", surface.title());
+        app.apply(Action::Unwind).unwrap();
+        app.apply(Action::Unwind).unwrap();
+
+        open_the_comment_buffer(&mut app);
+        let surface = app.surface().expect("the surface is open");
+        assert_eq!(surface.fields()[0].label(), COMMENT_FIELD);
         assert!(!surface.title().contains("label"), "{:?}", surface.title());
     }
 
@@ -4651,14 +4823,175 @@ mod tests {
     }
 
     #[test]
+    fn a_comment_offers_its_author_two_letters_and_everyone_else_none() {
+        let (fx, mut app) = app();
+        let mine = fx.the_humans_comment();
+        let agents = fx.an_agents_comment();
+        let withdrawn = fx.a_withdrawn_comment();
+        app.apply(Action::Reload).unwrap();
+        let held = fx.epic_comments();
+
+        // The human's own live comment offers exactly two letters: the long-form
+        // text and the withdrawal. Not a name, a summary, a state or a claim — a
+        // comment has none of those — and not an addition, which belongs to the list
+        // its row sits on.
+        to_the_comment_numbered(&mut app, mine);
+        app.apply(Action::EnterEditing).unwrap();
+        assert_eq!(
+            app.editing_hints(),
+            vec![
+                hint_for(EditingAction::Delete),
+                hint_for(EditingAction::Edit(FreeForm::Body)),
+            ]
+        );
+        hints_and_keys_agree(&mut app);
+        app.apply(Action::Unwind).unwrap();
+
+        // A comment somebody else wrote, and one already withdrawn, offer nothing at
+        // all: a comment is its author's alone to change, and a tombstone has no
+        // text to rewrite and cannot be withdrawn twice. The keys are simply absent
+        // — pressed anyway they are as unknown as any key the mode never binds, and
+        // the reader is told in the mode's own words rather than by a refusal the
+        // browser invents, so the rule itself is never learned from the screen.
+        for (id, whose) in [(agents, "an agent's comment"), (withdrawn, "a tombstone")] {
+            to_the_comment_numbered(&mut app, id);
+            app.apply(Action::EnterEditing).unwrap();
+            assert!(app.editing_hints().is_empty(), "{whose} teaches a letter");
+            for intent in [Action::Edit(FreeForm::Body), Action::Delete] {
+                app.clear_flash();
+                app.apply(intent).unwrap();
+                assert!(app.surface().is_none(), "{whose} opened a buffer");
+                assert_eq!(app.modal(), None, "{whose} asked something");
+                assert_eq!(app.flash_message(), Some(NOT_AN_EDITING_ACTION), "{whose}");
+            }
+            hints_and_keys_agree(&mut app);
+            app.apply(Action::Unwind).unwrap();
+        }
+        // And nothing was written on the way: an offer nobody made must not have
+        // been half performed.
+        assert_eq!(fx.epic_comments(), held);
+    }
+
+    #[test]
+    fn a_comment_is_a_buffer_in_the_pane_and_is_never_written_empty() {
+        let (fx, mut app) = app();
+        let held = fx.epic_comments();
+
+        // A comment is prose, so it is written where a body is: many lines in the
+        // preview pane, with the list's row visible beside it. It starts empty —
+        // nothing the browser puts there could be text the reader meant.
+        open_the_comment_buffer(&mut app);
+        let surface = app.surface().expect("the buffer is open");
+        assert_eq!(surface.placement(), Placement::Pane);
+        assert_eq!(app.mode(), surface_mode(Fields::One, FieldKind::ManyLines));
+        assert_eq!(text_of(&surface.fields()[0]), "");
+        assert!(!surface.fields()[0].is_dirty());
+        assert!(surface.title().contains(&fx.epic), "{:?}", surface.title());
+
+        // A comment with nothing in it says nothing, so saving an empty one warns,
+        // naming the field, and the list is left as it was.
+        app.apply(Action::Accept).unwrap();
+        let Some(Modal::Dialog(dialog)) = app.modal() else {
+            panic!("an empty comment was written: {:?}", app.modal())
+        };
+        assert!(dialog.message().contains(COMMENT_FIELD), "{dialog:?}");
+        assert_eq!(fx.epic_comments(), held, "an empty comment was written");
+
+        // Typed into, the same save writes it: a reflex line break is content here,
+        // as it is in any buffer that holds many lines.
+        app.apply(Action::Unwind).unwrap();
+        type_into(&mut app, "a remark");
+        app.apply(Action::Insert('\n')).unwrap();
+        app.apply(Action::Accept).unwrap();
+        assert_eq!(app.modal(), None, "the store refused the comment");
+        let after = fx.epic_comments();
+        let added = after
+            .iter()
+            .find(|c| !held.iter().any(|had| had.id == c.id))
+            .expect("the comment was added");
+        assert_eq!(added.text, "a remark\n");
+
+        // The buffer that rewrites one opens on the text the store holds at that
+        // moment rather than on nothing, and is required for the same reason: a
+        // comment is taken back by being withdrawn, not by being emptied.
+        open_the_comment_edit(&mut app);
+        let surface = app.surface().expect("the buffer is open");
+        assert_eq!(surface.placement(), Placement::Pane);
+        let mine = fx.the_humans_comment();
+        assert_eq!(
+            text_of(&surface.fields()[0]),
+            after
+                .iter()
+                .find(|c| c.id == mine)
+                .expect("the human's comment is held")
+                .text,
+            "the buffer opened on text the store was not holding"
+        );
+        empty_the_field(&mut app);
+        app.apply(Action::Accept).unwrap();
+        let Some(Modal::Dialog(dialog)) = app.modal() else {
+            panic!("an emptied comment was written: {:?}", app.modal())
+        };
+        assert!(
+            dialog
+                .message()
+                .contains(data::Replaceable::CommentText.noun()),
+            "{dialog:?}"
+        );
+        assert_eq!(fx.epic_comments(), after, "emptying it wrote something");
+    }
+
+    #[test]
+    fn a_rewritten_comment_holds_what_was_typed_and_the_notice_names_it_by_number() {
+        let (fx, mut app) = app();
+        let mine = fx.the_humans_comment();
+
+        // The words that reach the store are the reader's own: a rewrite that saved
+        // anything else would report success over text nobody wrote, and the comment
+        // it replaced is gone by then.
+        open_the_comment_edit(&mut app);
+        empty_the_field(&mut app);
+        type_into(&mut app, "rewritten by hand");
+        app.apply(Action::Accept).unwrap();
+        assert_eq!(app.modal(), None, "the save asked something");
+        assert!(app.surface().is_none(), "the buffer outlived its own save");
+        assert!(
+            app.editing_target().is_none(),
+            "a successful save stayed in"
+        );
+        let held = fx
+            .epic_comments()
+            .into_iter()
+            .find(|c| c.id == mine)
+            .expect("the comment is still there");
+        assert_eq!(held.text, "rewritten by hand");
+
+        // And the notice says which of a list of comments moved, by the number the
+        // list shows — a comment has no name to be recognised by, and the reader is
+        // looking at a row that says nothing but a number and an author.
+        let notice = app.flash_message().expect("a successful save said nothing");
+        assert!(notice.contains("text"), "{notice:?}");
+        assert!(notice.contains(&format!("comment {mine}")), "{notice:?}");
+        assert!(notice.contains("saved"), "{notice:?}");
+    }
+
+    #[test]
     fn every_field_a_surface_replaces_is_written_under_the_stamp_it_was_read_at() {
         let (fx, mut app) = app();
         // Every replaceable field, because each opens on a read of its own and each
         // has to name that read's stamp: a field whose write named none would
-        // silently overwrite whatever landed while the reader was typing.
-        for field in FreeForm::ALL.iter().copied() {
-            freeze_the_epics_row(&mut app);
-            app.apply(Action::Edit(field)).unwrap();
+        // silently overwrite whatever landed while the reader was typing. A
+        // comment's text is one of them and is opened from its own row, by the
+        // letter that opens a body on an epic — and the stamp that guards it is its
+        // container's, so the same change underneath refuses it.
+        for field in data::Replaceable::ALL.iter().copied() {
+            match field {
+                data::Replaceable::Field(field) => {
+                    freeze_the_epics_row(&mut app);
+                    app.apply(Action::Edit(field)).unwrap();
+                }
+                data::Replaceable::CommentText => open_the_comment_edit(&mut app),
+            }
             type_into(&mut app, "mine");
             let typed = field_value(&app);
 

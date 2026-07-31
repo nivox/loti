@@ -14,7 +14,7 @@ use loti_core::ops::{self, CommentView, NodeStatusChange, Target};
 use loti_core::read;
 use loti_core::render;
 use loti_core::store::Store;
-use loti_core::NodeState;
+use loti_core::{Actor, NodeState};
 
 /// What a collection of meta hangs off. Labels, comments and assets are
 /// identical on an epic and on a node; a dependency list exists only on a node,
@@ -182,9 +182,23 @@ pub enum RowKind {
     Collection(Collection),
     /// A member of a collection, which has no state either.
     Member,
+    /// A live comment of a collection.
+    ///
+    /// A comment is the one member whose author decides what may be done to it:
+    /// only its author may rewrite or withdraw it, and the browser writes as the
+    /// human and only the human. So the row carries the answer to that one
+    /// question rather than a name for somewhere else to compare again — the
+    /// author is on the row for the reader too, in the row's own words.
+    Comment {
+        /// Whether the human wrote it, which is exactly when the browser may
+        /// rewrite or withdraw it.
+        by_the_human: bool,
+    },
     /// A withdrawn comment. Its text is withheld rather than destroyed — the
-    /// store retains it — so the row says so in a word as well as in colour,
-    /// because colour alone carries nothing in this crate.
+    /// store retains it, and its number is never reused — so the row says so in a
+    /// word as well as in colour, because colour alone carries nothing in this
+    /// crate. It offers nothing whoever wrote it: there is no text to rewrite,
+    /// and withdrawing twice means nothing.
     Withdrawn,
     /// A member the store lists but whose own data could not be read: an asset
     /// whose bytes are gone, a blocker naming a ticket that is not there.
@@ -488,12 +502,12 @@ fn member_rows(store: &Store, container: &Container, kind: Collection) -> Result
             let now = Timestamp::now();
             for view in ops::list_comments(store, &target, true)? {
                 let (id, author, created, withdrawn) = match view {
-                    CommentView::Live(c) => (c.id, c.author.to_string(), c.created, false),
+                    CommentView::Live(c) => (c.id, c.author, c.created, false),
                     CommentView::Tombstone {
                         id,
                         author,
                         created,
-                    } => (id, author.to_string(), created, true),
+                    } => (id, author, created, true),
                 };
                 // The marker leads, because the name column is what a narrow
                 // pane truncates: a withdrawn comment has to still read as
@@ -504,10 +518,14 @@ fn member_rows(store: &Store, container: &Container, kind: Collection) -> Result
                 };
                 out.push(Row {
                     selection: Selection::Comment(container.clone(), id),
-                    kind: if withdrawn {
-                        RowKind::Withdrawn
-                    } else {
-                        RowKind::Member
+                    // Who wrote it travels only on a live comment, because that is
+                    // the one case it decides anything: a tombstone offers nothing
+                    // whoever wrote it.
+                    kind: match withdrawn {
+                        true => RowKind::Withdrawn,
+                        false => RowKind::Comment {
+                            by_the_human: author == Actor::Human,
+                        },
                     },
                     label: id.to_string(),
                     name,
@@ -669,8 +687,27 @@ fn age(created: Timestamp, now: Timestamp) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stamp(pub Timestamp);
 
-/// One of the whole-field replacements: a field a reader rewrites outright
+/// One of an epic's or a node's own fields that a reader rewrites outright
 /// rather than adding an entry to.
+///
+/// Invariant: exactly the fields an entity's edit set can carry, so each is read
+/// off its own value and written into its own slot. These are the fields a letter
+/// of the keyboard names; every whole field the browser replaces, letter or not,
+/// is a [`Replaceable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreeForm {
+    /// The one-line name.
+    Name,
+    /// The one-line summary of scope.
+    Summary,
+    /// The markdown body, as long as the reader writes it. The letter that names
+    /// it names the long-form text of whatever row it is pressed on, so on a
+    /// comment row it reaches [`Replaceable::CommentText`] instead: which field
+    /// that letter means is the row's answer and not the key's.
+    Body,
+}
+
+/// One whole field the browser replaces outright.
 ///
 /// Invariant: these are exactly the writes that can silently discard text
 /// somebody else wrote, so they are exactly the writes that carry [`Stamp`] as a
@@ -678,18 +715,43 @@ pub struct Stamp(pub Timestamp);
 /// conflict to answer however many fields a reader may replace. A further
 /// replaceable field is a variant here rather than a second write of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FreeForm {
-    /// The one-line name.
-    Name,
-    /// The one-line summary of scope.
-    Summary,
-    /// The markdown body, as long as the reader writes it.
-    Body,
+pub enum Replaceable {
+    /// One of an epic's or a node's own fields.
+    Field(FreeForm),
+    /// One comment's text.
+    ///
+    /// A comment lives in its container's frontmatter, so the stamp that guards
+    /// it is the container's and any concurrent change to that container refuses
+    /// the edit — which is the same per-entity granularity every other
+    /// replacement is guarded at.
+    CommentText,
+}
+
+impl Replaceable {
+    /// Every whole field the browser replaces, so a surface that has to cover them
+    /// all — the shape each takes, the stamp each carries — cannot then miss one.
+    pub const ALL: &'static [Replaceable] = &[
+        Replaceable::Field(FreeForm::Name),
+        Replaceable::Field(FreeForm::Summary),
+        Replaceable::Field(FreeForm::Body),
+        Replaceable::CommentText,
+    ];
+
+    /// What the field is called wherever the reader is shown it; see
+    /// [`FreeForm::noun`]. A comment's is `text`, because the comment itself is
+    /// what the surface's title already names.
+    pub fn noun(self) -> &'static str {
+        match self {
+            Replaceable::Field(field) => field.noun(),
+            Replaceable::CommentText => "text",
+        }
+    }
 }
 
 impl FreeForm {
-    /// Every field a reader may replace, so a surface that has to cover them all
-    /// — the keys each answers, and the hints each lists — cannot then miss one.
+    /// Every field of an entity a letter reaches, so a surface that has to cover
+    /// them all — the keys each answers, and the hints each lists — cannot then
+    /// miss one.
     pub const ALL: &'static [FreeForm] = &[FreeForm::Name, FreeForm::Summary, FreeForm::Body];
 
     /// What the field is called wherever the reader is shown it: the surface's
@@ -952,6 +1014,52 @@ pub fn edit_target(store: &Store, selection: &Selection) -> Result<EditTarget> {
     })
 }
 
+/// One comment as an editing surface starts from it: the text it holds, and the
+/// stamp that text was read at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentTarget {
+    /// What was read, so a surface can name its target and write back to it.
+    pub selection: Selection,
+    /// The comment's text, verbatim as stored.
+    pub text: String,
+    /// The stamp the text was read at, which is the container's: a comment lives
+    /// in its container's frontmatter and has no stamp of its own, so what guards
+    /// the rewrite is the container not having moved on.
+    pub stamp: Stamp,
+}
+
+/// Re-read one comment for editing, at the instant the letter is pressed; see
+/// [`edit_target`] for why the read is not any earlier.
+///
+/// A comment that is not there, or that has been withdrawn since the letter was
+/// offered, is refused by name: its text is withheld once it is withdrawn, so
+/// there is nothing to open a buffer on. Nothing about the author is judged here
+/// — the row carries that, and the store enforces it.
+pub fn comment_target(store: &Store, selection: &Selection) -> Result<CommentTarget> {
+    let Selection::Comment(container, id) = selection else {
+        anyhow::bail!("{} is not a comment", selection.reference())
+    };
+    let (comments, updated) = match container {
+        Container::Epic(epic_id) => {
+            let epic = ops::read_epic(store, epic_id)?;
+            (epic.frontmatter.comments, epic.frontmatter.updated)
+        }
+        Container::Node(r) => {
+            let node = ops::read_node(store, r)?;
+            (node.frontmatter.comments, node.frontmatter.updated)
+        }
+    };
+    let held = comments
+        .into_iter()
+        .find(|comment| comment.id == *id && !comment.deleted)
+        .ok_or_else(|| anyhow::anyhow!("{} has no text to edit", selection.reference()))?;
+    Ok(CommentTarget {
+        selection: selection.clone(),
+        text: held.text,
+        stamp: Stamp(updated),
+    })
+}
+
 /// A change to the store, naming what is written and what it is written to.
 ///
 /// Invariant: a dialog carries the write its answer performs, so the state
@@ -977,6 +1085,22 @@ pub enum Write {
     RemoveBlocker(Selection),
     /// Take one asset off the container it hangs on, index entry and bytes alike.
     DeleteAsset(Selection),
+    /// Put one comment on the container whose comment list the row names, with the
+    /// text the reader wrote.
+    ///
+    /// Authored by the human, always: the browser writes as the human and only the
+    /// human, so who is writing is never something a surface asks or a caller
+    /// supplies.
+    ///
+    /// No stamp: an append takes a slot of its own rather than replacing one, so it
+    /// cannot discard text somebody else wrote and both survive.
+    AddComment(Selection, String),
+    /// Withdraw one comment of the container it sits on.
+    ///
+    /// The text goes and the comment does not: the store keeps the slot, so the
+    /// number stays taken and is never reused. No stamp, for the same reason an
+    /// append carries none — flagging one slot replaces nobody's text.
+    DeleteComment(Selection),
     /// Take the claim on the node the row names, for the holder the reader typed.
     ///
     /// A claim has one holder, so taking one that is already held reassigns it.
@@ -1005,16 +1129,16 @@ pub enum Write {
         /// and never a particular set of nodes.
         cascade: bool,
     },
-    /// Replace one whole field of the epic or node the row names.
+    /// Replace one whole field the row names.
     ///
     /// The one write here that can silently discard text somebody else wrote —
     /// which is what the stamp is for — and the only one, whichever field it
     /// names: one write shape means one conflict for a reader to answer.
     Replace {
-        /// The epic or node whose field is replaced.
+        /// The epic, node or comment whose field is replaced.
         target: Selection,
-        /// Which of its fields.
-        field: FreeForm,
+        /// Which whole field of it.
+        field: Replaceable,
         /// The replacement, exactly as the reader left it: what makes a value
         /// acceptable is the store's rule, and the browser normalises none of it.
         value: String,
@@ -1037,6 +1161,8 @@ impl Write {
             | Write::AddBlocker(target, _)
             | Write::RemoveBlocker(target)
             | Write::DeleteAsset(target)
+            | Write::AddComment(target, _)
+            | Write::DeleteComment(target)
             | Write::TakeClaim(target, _)
             | Write::ReleaseClaim(target)
             | Write::SetState { target, .. }
@@ -1085,6 +1211,12 @@ pub enum Effect {
     /// there first — is an ordinary single close and is reported as one rather than
     /// as a cascade of nothing.
     AlsoClosed(usize),
+    /// The number the store gave a comment as it was added.
+    ///
+    /// The browser cannot know it in advance: a comment's number is assigned under
+    /// the lock, from what the list already holds, and it is the only name the new
+    /// comment has.
+    Commented(u64),
 }
 
 impl Effect {
@@ -1131,6 +1263,10 @@ pub fn perform(store: &Store, write: &Write) -> Result<Effect, Refusal> {
         }
         Write::RemoveBlocker(selection) => as_asked(remove_blocker(store, selection)),
         Write::DeleteAsset(selection) => as_asked(delete_asset(store, selection)),
+        // The second write whose notice only the store can finish: which number the
+        // new comment took is decided under the lock.
+        Write::AddComment(selection, text) => add_comment(store, selection, text),
+        Write::DeleteComment(selection) => as_asked(delete_comment(store, selection)),
         Write::TakeClaim(selection, holder) => as_asked(take_claim(store, selection, holder)),
         Write::ReleaseClaim(selection) => as_asked(release_claim(store, selection)),
         Write::SetState {
@@ -1177,8 +1313,8 @@ fn misdirected(message: String) -> Refusal {
     Refusal::Rule(message)
 }
 
-/// Replace one whole field of an epic or a node with the text the reader left,
-/// applying only while the entity still carries the stamp that text was read at.
+/// Replace one whole field with the text the reader left, applying only while the
+/// entity that holds it still carries the stamp that text was read at.
 ///
 /// These are the writes the browser makes that replace a whole field, so they are
 /// the ones that can discard text somebody else wrote: the stamp is the store's
@@ -1192,11 +1328,39 @@ fn misdirected(message: String) -> Refusal {
 fn replace(
     store: &Store,
     selection: &Selection,
-    field: FreeForm,
+    field: Replaceable,
     value: &str,
     expect: Option<Stamp>,
 ) -> Result<(), Refusal> {
     let expect_updated = expect.map(|stamp| stamp.0);
+    let field = match field {
+        Replaceable::Field(field) => field,
+        // A comment's text is replaced by its own operation, because a comment is
+        // not a field of the entity's frontmatter but one entry of a list in it —
+        // and because the store checks there what an entity's fields have no rule
+        // for: a comment is its author's alone to rewrite.
+        Replaceable::CommentText => {
+            let Selection::Comment(container, id) = selection else {
+                return Err(misdirected(format!(
+                    "{} is not a comment",
+                    selection.reference()
+                )));
+            };
+            return ops::edit_comment(
+                store,
+                &container.target(),
+                *id,
+                // The browser writes as the human and only the human, so the actor
+                // is fixed here rather than asked for: attribution is never
+                // something a surface offers to fill in.
+                Actor::Human,
+                value.to_string(),
+                expect_updated,
+            )
+            .map(|_| ())
+            .map_err(refusal);
+        }
+    };
     let (name, summary, body) = field.edits(value);
     match selection {
         Selection::Epic(id) => ops::edit_epic(
@@ -1422,6 +1586,56 @@ fn delete_asset(store: &Store, selection: &Selection) -> Result<(), Refusal> {
         )));
     };
     ops::delete_asset(store, &container.target(), name).map_err(refusal)?;
+    Ok(())
+}
+
+/// Put one comment on a container's comment list, authored by the human.
+///
+/// The browser writes as the human and only the human, so no attribution reaches
+/// this: an agent's comment is something the command line writes, and there is no
+/// channel here to write one by.
+///
+/// The text is written exactly as the reader left it, trailing newline and all:
+/// whether a given string is a comment the store will take is the store's rule.
+///
+/// The number is the store's to assign, from what the list already holds and under
+/// the lock, so it is answered back rather than predicted — the reader is told
+/// which comment theirs became.
+fn add_comment(store: &Store, selection: &Selection, text: &str) -> Result<Effect, Refusal> {
+    // Creation acts on the container row the cursor stands on, so any other
+    // selection is a caller that has lost track of what its row points at.
+    let Selection::Collection(container, Collection::Comments) = selection else {
+        return Err(misdirected(format!(
+            "{} is not a comment list",
+            selection.reference()
+        )));
+    };
+    let added = ops::add_comment(store, &container.target(), Actor::Human, text.to_string())
+        .map_err(refusal)?;
+    Ok(Effect::Commented(added.id))
+}
+
+/// Withdraw one comment of the container it sits on.
+///
+/// The comment is retained and flagged rather than removed, so its number stays
+/// taken and is never reused, and the row keeps standing where it stood with its
+/// text withheld. That is what makes this the one deletion the browser makes that
+/// destroys nothing — the confirmation in front of it is the uniform rule that
+/// every deletion asks, not a measure of what is at stake.
+///
+/// Who may withdraw a comment is the store's rule and is not re-checked here: only
+/// its author may, and the browser writes as the human, so a comment the human did
+/// not write is refused by the store in the store's own words.
+fn delete_comment(store: &Store, selection: &Selection) -> Result<(), Refusal> {
+    // Only a comment row offers a withdrawal, so any other selection is a caller
+    // that has lost track of what its row points at.
+    let Selection::Comment(container, id) = selection else {
+        return Err(misdirected(format!(
+            "{} is not a comment",
+            selection.reference()
+        )));
+    };
+    ops::delete_comment(store, &container.target(), *id, Actor::Human).map_err(refusal)?;
     Ok(())
 }
 
@@ -1929,6 +2143,108 @@ pub(crate) mod fixture {
                 .into_iter()
                 .map(|asset| asset.name)
                 .collect()
+        }
+
+        /// The epic's comment list as a selection: the row an addition acts on,
+        /// since creation acts on the container row the cursor stands on.
+        pub(crate) fn comments_selection(&self) -> Selection {
+            Selection::Collection(Container::Epic(self.epic.clone()), Collection::Comments)
+        }
+
+        /// The ticket's comment list as a selection. A node and an epic are
+        /// addressed differently, so a write aimed at the wrong one of the two looks
+        /// correct as long as only epics are asserted on.
+        pub(crate) fn node_comments_selection(&self) -> Selection {
+            Selection::Collection(Container::Node(self.node.clone()), Collection::Comments)
+        }
+
+        /// One comment of the epic as a selection, by the number the store gave it.
+        pub(crate) fn epic_comment_selection(&self, id: u64) -> Selection {
+            Selection::Comment(Container::Epic(self.epic.clone()), id)
+        }
+
+        /// The epic's comments as the store holds them, tombstones included, so a
+        /// test asserts what was written rather than what it asked for — and can see
+        /// that a withdrawn comment is still there under its own number.
+        pub(crate) fn epic_comments(&self) -> Vec<loti_core::model::Comment> {
+            self.comments(Target::Epic(self.epic.clone()))
+        }
+
+        /// The ticket's comments; a node and an epic are addressed differently, so a
+        /// write aimed at the wrong one of the two looks correct as long as only
+        /// epics are asserted on.
+        pub(crate) fn node_comments(&self) -> Vec<loti_core::model::Comment> {
+            self.comments(Target::Node(self.node.clone()))
+        }
+
+        /// Every comment one target holds, live and withdrawn alike, straight out of
+        /// the frontmatter: a listing hides the text of a withdrawn one, and whether
+        /// the text is retained is part of what a withdrawal has to be judged on.
+        fn comments(&self, target: Target) -> Vec<loti_core::model::Comment> {
+            match target {
+                Target::Epic(id) => {
+                    ops::read_epic(&self.store, &id)
+                        .unwrap()
+                        .frontmatter
+                        .comments
+                }
+                Target::Node(r) => {
+                    ops::read_node(&self.store, &r)
+                        .unwrap()
+                        .frontmatter
+                        .comments
+                }
+            }
+        }
+
+        /// The number of the epic's one comment written by the human, which is the
+        /// only comment the browser may rewrite or withdraw.
+        ///
+        /// Found by author rather than by position, so a fixture that grows another
+        /// comment cannot quietly hand a test somebody else's.
+        pub(crate) fn the_humans_comment(&self) -> u64 {
+            self.epic_comments()
+                .into_iter()
+                .find(|c| !c.deleted && c.author == Actor::Human)
+                .expect("the fixture writes one comment as the human")
+                .id
+        }
+
+        /// A comment on the epic written by an agent, created on demand, by the
+        /// number the store gave it.
+        ///
+        /// The one thing the shared fixture cannot hold and this slice cannot do
+        /// without: what the browser offers on a comment turns on who wrote it, and
+        /// with only the human's comment in the store a browser that offered
+        /// everything on everyone's would look right.
+        pub(crate) fn an_agents_comment(&self) -> u64 {
+            ops::add_comment(
+                &self.store,
+                &Target::Epic(self.epic.clone()),
+                Actor::Agent("builder".to_string()),
+                "somebody else wrote this\n".to_string(),
+            )
+            .unwrap()
+            .id
+        }
+
+        /// A withdrawn comment of the human's on the epic, created on demand, by the
+        /// number it keeps.
+        ///
+        /// Withdrawn through the operation layer as its author, because a tombstone
+        /// is a state a comment is left in rather than a shape to write by hand —
+        /// and the browser must offer nothing on it even though the human wrote it.
+        pub(crate) fn a_withdrawn_comment(&self) -> u64 {
+            let target = Target::Epic(self.epic.clone());
+            let added = ops::add_comment(
+                &self.store,
+                &target,
+                Actor::Human,
+                "withdrawn since\n".to_string(),
+            )
+            .unwrap();
+            ops::delete_comment(&self.store, &target, added.id, Actor::Human).unwrap();
+            added.id
         }
 
         /// The ticket's dependency list as a selection: the row an addition acts
@@ -2454,6 +2770,7 @@ mod tests {
                 RowKind::Work { claimed_by, .. } => Some(claimed_by.clone()),
                 RowKind::Collection(_)
                 | RowKind::Member
+                | RowKind::Comment { .. }
                 | RowKind::Withdrawn
                 | RowKind::Unreadable => None,
             })
@@ -2557,6 +2874,56 @@ mod tests {
             listed.len(),
             ops::list_comments(store, &target, true).unwrap().len()
         );
+    }
+
+    #[test]
+    fn a_comment_row_says_whether_the_human_wrote_it() {
+        let fx = Fixture::build();
+        let agents = fx.an_agents_comment();
+        let withdrawn = fx.a_withdrawn_comment();
+        let container = Container::Epic(fx.epic.clone());
+        let listed = rows(
+            &fx.store,
+            &Level::Collection(container.clone(), Collection::Comments),
+        )
+        .unwrap();
+        let kind = |id: u64| {
+            listed
+                .iter()
+                .find(|r| r.selection == Selection::Comment(container.clone(), id))
+                .unwrap_or_else(|| panic!("comment {id} is listed"))
+                .kind
+                .clone()
+        };
+
+        // The author is on the row because what may be done to a comment turns on
+        // it: the human's own is the only one the browser may rewrite or withdraw.
+        // Three rows, because a row kind that answered the same for everyone would
+        // look right against any one of them.
+        let humans = fx.the_humans_comment();
+        assert_ne!(humans, withdrawn, "the fixture's own comment was withdrawn");
+        assert_eq!(kind(humans), RowKind::Comment { by_the_human: true });
+        assert_eq!(
+            kind(agents),
+            RowKind::Comment {
+                by_the_human: false
+            }
+        );
+        // A tombstone is neither: there is no text to rewrite and withdrawing twice
+        // means nothing, so whose it was does not come into it.
+        assert_eq!(kind(withdrawn), RowKind::Withdrawn);
+        // And the reader is told the same thing in the row's own words, with colour
+        // off: the author leads the name column of every comment row.
+        for (id, author) in [
+            (humans, Actor::Human),
+            (agents, Actor::Agent("builder".into())),
+        ] {
+            let row = listed
+                .iter()
+                .find(|r| r.selection == Selection::Comment(container.clone(), id))
+                .unwrap();
+            assert!(row.name.contains(&author.to_string()), "{:?}", row.name);
+        }
     }
 
     #[test]
@@ -3146,6 +3513,284 @@ mod tests {
     }
 
     #[test]
+    fn a_comment_is_added_to_the_list_it_names_authored_by_the_human_and_numbered_by_the_store() {
+        let fx = Fixture::build();
+        let before = fx.epic_comments();
+        let on_the_node = fx.node_comments();
+
+        // Verbatim, trailing newline and all: whether a given string is a comment
+        // the store will take is the store's rule, and the browser normalises none
+        // of it.
+        let written = "a remark\n\nwith a blank line above it\n";
+        let effect = perform(
+            &fx.store,
+            &Write::AddComment(fx.comments_selection(), written.to_string()),
+        )
+        .unwrap();
+
+        let after = fx.epic_comments();
+        let added = after
+            .iter()
+            .find(|c| !before.iter().any(|had| had.id == c.id))
+            .expect("the comment is on the list its row named")
+            .clone();
+        assert_eq!(added.text, written);
+        // The browser writes as the human and only the human: there is no channel
+        // here for an agent's attribution, and the store records who wrote it.
+        assert_eq!(added.author, Actor::Human);
+        // The number is the store's, assigned under the lock from what the list
+        // already held, and it comes back so the reader can be told which comment
+        // theirs became.
+        assert_eq!(effect, Effect::Commented(added.id));
+        assert!(!before.iter().any(|had| had.id == added.id));
+        // A node's comments and an epic's are different lists, so a write aimed at
+        // the wrong container of the two would look right against the epic alone.
+        assert_eq!(fx.node_comments(), on_the_node);
+        perform(
+            &fx.store,
+            &Write::AddComment(fx.node_comments_selection(), "on the ticket\n".to_string()),
+        )
+        .unwrap();
+        assert_eq!(fx.node_comments().len(), on_the_node.len() + 1);
+        assert!(
+            fx.node_comments()
+                .iter()
+                .any(|c| c.text == "on the ticket\n"),
+            "the ticket's own list did not take it"
+        );
+        assert!(
+            !fx.epic_comments()
+                .iter()
+                .any(|c| c.text == "on the ticket\n"),
+            "the ticket's comment landed on the epic"
+        );
+
+        // And a row that is not a comment list is a caller that has lost track of
+        // what its row points at: refused by name, with nothing written.
+        for wrong in [
+            fx.epic_selection(),
+            fx.blocked_by_selection(),
+            fx.epic_comment_selection(added.id),
+        ] {
+            let err = refusal_words(
+                perform(
+                    &fx.store,
+                    &Write::AddComment(wrong.clone(), "nowhere\n".into()),
+                )
+                .expect_err("only a comment list takes a comment"),
+            );
+            assert!(err.contains(&wrong.reference()), "{wrong:?}: {err}");
+            assert_eq!(fx.epic_comments().len(), after.len(), "{wrong:?} wrote");
+        }
+    }
+
+    #[test]
+    fn a_comments_text_is_replaced_verbatim_under_the_stamp_it_was_read_at() {
+        let fx = Fixture::build();
+        let id = fx.epic_comments()[0].id;
+        let selection = fx.epic_comment_selection(id);
+        let read = comment_target(&fx.store, &selection).unwrap();
+        let neighbour = fx.an_agents_comment();
+        // Read out of the store rather than spelled here, so a richer fixture
+        // cannot turn either half of this into a false promise.
+        let held_before = fx.epic_comments();
+        let text_of = |id: u64, of: &[loti_core::model::Comment]| {
+            of.iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("comment {id} is held"))
+                .text
+                .clone()
+        };
+        let body = fx.epic_body();
+
+        // The stamp is re-read after the neighbour arrived: a comment's guard is its
+        // container's stamp, so the read a surface opens on is the read the write
+        // names.
+        let stamp = comment_target(&fx.store, &selection).unwrap().stamp;
+        let written = "rewritten\n\nwith a blank line above it\n";
+        perform(
+            &fx.store,
+            &Write::Replace {
+                target: selection.clone(),
+                field: Replaceable::CommentText,
+                value: written.to_string(),
+                expect: Some(stamp),
+            },
+        )
+        .unwrap();
+
+        let held = fx.epic_comments();
+        assert_eq!(text_of(id, &held), written);
+        assert_eq!(
+            read.text,
+            text_of(id, &held_before),
+            "the buffer opened on text the store was not holding"
+        );
+        // The comment it named and no other: two comments of the same container are
+        // one list, so a write that reached for the wrong entry would look right
+        // against a store holding one.
+        assert_eq!(
+            text_of(neighbour, &held),
+            text_of(neighbour, &held_before),
+            "the neighbour was rewritten"
+        );
+        // And nothing of the container's own: a comment is one entry of a list in
+        // the frontmatter, not a field of it.
+        assert_eq!(fx.epic_body(), body);
+    }
+
+    #[test]
+    fn a_comment_edit_naming_a_stamp_the_container_has_moved_past_is_refused_as_a_conflict() {
+        let fx = Fixture::build();
+        let selection = fx.epic_comment_selection(fx.epic_comments()[0].id);
+        let read = comment_target(&fx.store, &selection).unwrap();
+
+        // Somebody else writes to the container while the reader is composing
+        // theirs. The stamp is the container's, so a change anywhere on it refuses
+        // the edit — the same per-entity granularity every other replacement has.
+        fx.rewrite_the_epics_body("theirs\n");
+        let stale = Write::Replace {
+            target: selection.clone(),
+            field: Replaceable::CommentText,
+            value: "mine\n".to_string(),
+            expect: Some(read.stamp),
+        };
+        // Refused *as a conflict*, not merely refused: the browser asks about this
+        // one and reports every other, so a refusal for an unrelated reason arriving
+        // here would put the wrong question on screen.
+        assert_eq!(perform(&fx.store, &stale), Err(Refusal::Conflict));
+        assert_eq!(
+            comment_target(&fx.store, &selection).unwrap().text,
+            read.text,
+            "a refused write wrote"
+        );
+
+        // And the same write with the precondition dropped applies over it, which is
+        // what a reader asks for by answering the question with overwrite.
+        perform(&fx.store, &stale.overwriting()).unwrap();
+        assert_eq!(
+            comment_target(&fx.store, &selection).unwrap().text,
+            "mine\n"
+        );
+    }
+
+    #[test]
+    fn a_withdrawn_comment_keeps_its_number_and_gives_its_text_up() {
+        let fx = Fixture::build();
+        let held = fx.epic_comments();
+        let id = held[0].id;
+        let neighbour = fx.an_agents_comment();
+        let on_the_node = fx.node_comments();
+
+        perform(
+            &fx.store,
+            &Write::DeleteComment(fx.epic_comment_selection(id)),
+        )
+        .unwrap();
+
+        let after = fx.epic_comments();
+        let withdrawn = after.iter().find(|c| c.id == id).expect("the slot stays");
+        assert!(withdrawn.deleted);
+        // Hidden, never removed: the slot stays taken, so the number is never reused
+        // and the reader who was told "comment 1" still means this one.
+        assert_eq!(after.len(), held.len() + 1, "a slot went");
+        assert!(
+            !ops::list_comments(&fx.store, &Target::Epic(fx.epic.clone()), false)
+                .unwrap()
+                .iter()
+                .any(|view| matches!(view, CommentView::Live(c) if c.id == id)),
+            "a withdrawn comment is still listed as live"
+        );
+        // The one it named and no other, on the container it named: a list of one
+        // cannot tell a withdrawal of the wrong entry from the right one, and a node
+        // and an epic are addressed differently.
+        assert!(!after.iter().any(|c| c.id == neighbour && c.deleted));
+        assert_eq!(fx.node_comments(), on_the_node);
+        let on_the_ticket = on_the_node[0].id;
+        perform(
+            &fx.store,
+            &Write::DeleteComment(Selection::Comment(
+                Container::Node(fx.node.clone()),
+                on_the_ticket,
+            )),
+        )
+        .unwrap();
+        assert!(
+            fx.node_comments()
+                .iter()
+                .any(|c| c.id == on_the_ticket && c.deleted),
+            "the ticket's own comment was not withdrawn"
+        );
+
+        // A second withdrawal is the store's refusal, in the store's own words: the
+        // browser offers nothing on a tombstone, so reaching one at all is a caller
+        // that has lost track of its row.
+        let refused = refusal_words(
+            perform(
+                &fx.store,
+                &Write::DeleteComment(fx.epic_comment_selection(id)),
+            )
+            .expect_err("a comment is withdrawn once"),
+        );
+        let its_own =
+            ops::delete_comment(&fx.store, &Target::Epic(fx.epic.clone()), id, Actor::Human)
+                .expect_err("a comment is withdrawn once")
+                .to_string();
+        assert_eq!(refused, its_own);
+    }
+
+    #[test]
+    fn a_comment_opens_on_the_text_it_holds_and_the_stamp_a_precondition_accepts() {
+        let fx = Fixture::build();
+        // On an epic's comment and on a node's, because the two containers are
+        // addressed differently: a read aimed at the wrong one of them would look
+        // right against either alone.
+        for (selection, stored) in [
+            (
+                fx.epic_comment_selection(fx.epic_comments()[0].id),
+                fx.epic_comments()[0].text.clone(),
+            ),
+            (
+                Selection::Comment(Container::Node(fx.node.clone()), fx.node_comments()[0].id),
+                fx.node_comments()[0].text.clone(),
+            ),
+        ] {
+            let read = comment_target(&fx.store, &selection).unwrap();
+            assert_eq!(read.selection, selection);
+            assert_eq!(read.text, stored);
+            // The stamp is the one the store accepts as a precondition: a write
+            // naming it goes through, which no comparison of timestamps here could
+            // prove.
+            perform(
+                &fx.store,
+                &Write::Replace {
+                    target: selection.clone(),
+                    field: Replaceable::CommentText,
+                    value: stored.clone(),
+                    expect: Some(read.stamp),
+                },
+            )
+            .unwrap_or_else(|e| panic!("{selection:?}: {e:?}"));
+        }
+
+        // A comment that has been withdrawn since the letter was offered has no text
+        // to open a buffer on, and one that is not there at all is refused the same
+        // way — by name, so the reader is told which row went.
+        let withdrawn = fx.epic_comment_selection(fx.a_withdrawn_comment());
+        for gone in [withdrawn, fx.epic_comment_selection(9999)] {
+            let err = comment_target(&fx.store, &gone)
+                .expect_err("there is no text to edit")
+                .to_string();
+            assert!(err.contains(&gone.reference()), "{gone:?}: {err}");
+        }
+        // And a row that is not a comment at all says so rather than reading one.
+        let err = comment_target(&fx.store, &fx.epic_selection())
+            .expect_err("an epic is not a comment")
+            .to_string();
+        assert!(err.contains(&fx.epic), "{err}");
+    }
+
+    #[test]
     fn a_container_is_named_by_the_noun_the_command_line_addresses_it_by() {
         let fx = Fixture::build();
         // A message that tells a reader which command does a job the browser does
@@ -3330,7 +3975,7 @@ mod tests {
             &fx.store,
             &Write::Replace {
                 target: fx.epic_selection(),
-                field: FreeForm::Body,
+                field: Replaceable::Field(FreeForm::Body),
                 value: written.to_string(),
                 expect: Some(target.stamp),
             },
@@ -3355,7 +4000,7 @@ mod tests {
             &fx.store,
             &Write::Replace {
                 target: node,
-                field: FreeForm::Body,
+                field: Replaceable::Field(FreeForm::Body),
                 value: "the ticket's own\n".to_string(),
                 expect: Some(stamp),
             },
@@ -3383,7 +4028,7 @@ mod tests {
                     &fx.store,
                     &Write::Replace {
                         target: target.clone(),
-                        field,
+                        field: Replaceable::Field(field),
                         value: written.clone(),
                         expect: Some(read.stamp),
                     },
@@ -3417,10 +4062,13 @@ mod tests {
         // the value is what a surface opens on. Two fields sharing either would put
         // one field's text under another's name — and write it back there.
         let target = edit_target(&fx.store, &fx.epic_selection()).unwrap();
-        let mut nouns: Vec<&str> = FreeForm::ALL.iter().map(|f| f.noun()).collect();
+        // Every whole field the browser replaces, a comment's text among them: the
+        // letter that opens a body opens that instead on a comment row, so the two
+        // are read and written by one path and must not be called one thing.
+        let mut nouns: Vec<&str> = Replaceable::ALL.iter().map(|f| f.noun()).collect();
         nouns.sort_unstable();
         nouns.dedup();
-        assert_eq!(nouns.len(), FreeForm::ALL.len());
+        assert_eq!(nouns.len(), Replaceable::ALL.len());
         let mut values: Vec<&str> = FreeForm::ALL.iter().map(|f| f.of(&target)).collect();
         values.sort_unstable();
         values.dedup();
@@ -3448,7 +4096,7 @@ mod tests {
             &fx.store,
             &Write::Replace {
                 target: fx.epic_selection(),
-                field: FreeForm::Body,
+                field: Replaceable::Field(FreeForm::Body),
                 value: "mine\n".to_string(),
                 expect: Some(stamp),
             },
@@ -3466,7 +4114,7 @@ mod tests {
             &fx.store,
             &Write::Replace {
                 target: fx.epic_selection(),
-                field: FreeForm::Body,
+                field: Replaceable::Field(FreeForm::Body),
                 value: "mine\n".to_string(),
                 expect: Some(stamp),
             }
@@ -3498,7 +4146,7 @@ mod tests {
                 &fx.store,
                 &Write::Replace {
                     target: fx.epic_selection(),
-                    field: FreeForm::Body,
+                    field: Replaceable::Field(FreeForm::Body),
                     value: "mine\n".to_string(),
                     expect: Some(stamp),
                 },
@@ -3509,12 +4157,16 @@ mod tests {
     }
 
     #[test]
-    fn only_an_epic_or_a_node_has_a_field_to_replace() {
+    fn only_a_row_that_holds_a_whole_field_may_have_it_replaced() {
         let fx = Fixture::build();
         let before = fx.epic_body();
-        // A collection and its members are edited by their own operations, so any
-        // other selection is a caller that has lost track of what its row points
-        // at — refused by name, with nothing written on the way to refusing.
+        let comment = fx.epic_comment_selection(fx.epic_comments()[0].id);
+        // Which rows hold which whole field: an epic and a node have a name, a
+        // summary and a body, a comment has its text, and no row holds both. A
+        // collection and its other members are edited by their own operations. Every
+        // pairing the browser does not offer is a caller that has lost track of what
+        // its row points at — refused by name, with nothing written on the way to
+        // refusing.
         for wrong in [
             Selection::Collection(Container::Epic(fx.epic.clone()), Collection::Labels),
             Selection::Label(
@@ -3525,10 +4177,16 @@ mod tests {
                 Container::Epic(fx.epic.clone()),
                 fx.epic_assets()[0].clone(),
             ),
+            comment.clone(),
         ] {
             // Every replaceable field, because each is refused for the same reason
             // and each has to say which field the row does not have.
-            for field in FreeForm::ALL.iter().copied() {
+            for field in Replaceable::ALL.iter().copied() {
+                // The one pairing that is not misdirected at all: a comment's text
+                // on a comment is the write this whole path exists for.
+                if wrong == comment && field == Replaceable::CommentText {
+                    continue;
+                }
                 let err = refusal_words(
                     perform(
                         &fx.store,
@@ -3539,13 +4197,37 @@ mod tests {
                             expect: None,
                         },
                     )
-                    .expect_err("only an epic or a node has these fields"),
+                    .expect_err("the row has no such field"),
                 );
                 assert!(err.contains(&fx.epic), "{wrong:?}: {err}");
-                assert!(err.contains(field.noun()), "{wrong:?}: {err}");
+                // An entity's field says which field the row has not got; a
+                // comment's text says the row is not a comment, since there is no
+                // field of the row to name.
+                if let Replaceable::Field(named) = field {
+                    assert!(err.contains(named.noun()), "{wrong:?}: {err}");
+                }
                 assert_eq!(fx.epic_body(), before, "{wrong:?} wrote something");
             }
         }
+        // And the other way round: a comment's text is not a field an epic or a node
+        // has, so the write that reaches one is refused rather than landing in a
+        // body.
+        for entity in [fx.epic_selection(), fx.node_selection()] {
+            let err = refusal_words(
+                perform(
+                    &fx.store,
+                    &Write::Replace {
+                        target: entity.clone(),
+                        field: Replaceable::CommentText,
+                        value: "nowhere\n".to_string(),
+                        expect: None,
+                    },
+                )
+                .expect_err("an entity has no comment text of its own"),
+            );
+            assert!(err.contains(&entity.reference()), "{entity:?}: {err}");
+        }
+        assert_eq!(fx.epic_body(), before);
     }
 
     #[test]
@@ -4031,7 +4713,7 @@ mod tests {
         let stamp = edit_target(&fx.store, &fx.epic_selection()).unwrap().stamp;
         let body = Write::Replace {
             target: fx.epic_selection(),
-            field: FreeForm::Body,
+            field: Replaceable::Field(FreeForm::Body),
             value: "mine\n".to_string(),
             expect: Some(stamp),
         };
@@ -4043,6 +4725,8 @@ mod tests {
             Write::AddBlocker(fx.blocked_by_selection(), "1".into()),
             Write::RemoveBlocker(fx.epic_selection()),
             Write::DeleteAsset(fx.epic_selection()),
+            Write::AddComment(fx.epic_selection(), "a remark".into()),
+            Write::DeleteComment(fx.epic_selection()),
             Write::TakeClaim(fx.node_selection(), "a human".into()),
             Write::ReleaseClaim(fx.node_selection()),
             Write::SetState {
@@ -4062,7 +4746,7 @@ mod tests {
         // and the text the reader left — for every field it may name: dropping the
         // precondition is the reader saying "write it anyway", not "write something
         // else".
-        for field in FreeForm::ALL.iter().copied() {
+        for field in Replaceable::ALL.iter().copied() {
             let stamped = Write::Replace {
                 target: fx.epic_selection(),
                 field,
