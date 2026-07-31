@@ -1,4 +1,4 @@
-//! Keys to intents — the only place in the crate that names a key.
+//! Keys to intents — the only place in the crate that names bindings.
 //!
 //! The two panes never compete for a key, so there is no focus to switch: the
 //! navigation cursor owns the plain motion keys and the preview owns the paging
@@ -23,192 +23,27 @@ pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
     if let Mode::Dialog(answers) = mode {
         return dialog_action(key, answers);
     }
-    // An open surface takes the whole keyboard, so nothing below is consulted:
-    // a letter typed into a field is a character, never the action that letter
-    // carries one layer up.
-    if let Mode::Surface(shape) = mode {
-        return surface_action(key, shape);
-    }
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    Some(match (key.code, ctrl) {
-        // Quitting. `q` is the way out of the browser and no mode borrows it.
-        (KeyCode::Char('q'), false) => Action::Quit,
 
-        // Raw mode delivers Ctrl-C as a key press rather than a signal, so it
-        // has to be bound explicitly to be honoured at all. Inside editing mode
-        // it is the same key as `Esc` — the conventional way to abandon what you
-        // are in — so it ends the session while browsing only, which is the safe
-        // direction for a key a habit presses.
-        (KeyCode::Char('c'), true) => match mode {
-            Mode::Browse => Action::Quit,
-            // A dialog's answers and a surface's keys are settled before this
-            // table is reached, so only browsing and editing arrive here.
-            Mode::Editing | Mode::Surface(_) | Mode::Dialog(_) => Action::Unwind,
-        },
-
-        // Preview paging. Bound before the plain motions so Ctrl-D/Ctrl-U are
-        // not shadowed by any character binding.
-        (KeyCode::Char('d'), true) => Action::PreviewHalfDown,
-        (KeyCode::Char('u'), true) => Action::PreviewHalfUp,
-        (KeyCode::PageDown, _) | (KeyCode::Char(' '), false) => Action::PreviewPageDown,
-        (KeyCode::PageUp, _) => Action::PreviewPageUp,
-        (KeyCode::Home, _) => Action::PreviewTop,
-        (KeyCode::End, _) => Action::PreviewBottom,
-
-        // Navigation motions.
-        (KeyCode::Char('j'), false) | (KeyCode::Down, false) => Action::CursorDown,
-        (KeyCode::Char('k'), false) | (KeyCode::Up, false) => Action::CursorUp,
-        (KeyCode::Char('g'), false) => Action::CursorFirst,
-        (KeyCode::Char('G'), false) => Action::CursorLast,
-        (KeyCode::Enter, _) | (KeyCode::Char('l'), false) | (KeyCode::Right, false) => {
-            Action::Descend
-        }
-        // `Esc` unwinds one layer at a time, which is not what a level key does:
-        // while editing mode is on the level cannot change, so the level keys do
-        // nothing there and `Esc` alone is still the way out.
-        (KeyCode::Esc, _) => Action::Unwind,
-        (KeyCode::Backspace, _) | (KeyCode::Char('h'), false) | (KeyCode::Left, false) => {
-            Action::Ascend
-        }
-
-        // Layout.
-        (KeyCode::Char('<'), false) => Action::ShrinkNav,
-        (KeyCode::Char('>'), false) => Action::GrowNav,
-        (KeyCode::Char('='), false) => Action::ResetSplit,
-        (KeyCode::Char('z'), false) => Action::ToggleZoom,
-
-        // The letters of editing mode's action-selection layer, bound inside the
-        // mode only: browse mode is where a reader's fingers rest, and a letter
-        // that removed something from there would be one stray keystroke away
-        // from a write.
-        (KeyCode::Char('a'), false) if matches!(mode, Mode::Editing) => Action::Add,
-        (KeyCode::Char('d'), false) if matches!(mode, Mode::Editing) => Action::Delete,
-        // A letter names the kind of thing being edited: `b` the long-form text, `n`
-        // the name, `S` the summary. The summary takes the shifted key because the
-        // unshifted one belongs to the state a reader changes far more often, at the
-        // cost of two unrelated nouns sharing a letter.
-        //
-        // `b` is the long-form text *of the row it is pressed on* — a body on an
-        // epic or a node, a comment's text on a comment — so a comment needs no
-        // letter of its own and one key still carries one intent. Which field the
-        // intent reaches is the row's answer, decided where a row's offers are.
-        (KeyCode::Char('b'), false) if matches!(mode, Mode::Editing) => {
-            Action::Edit(FreeForm::Body)
-        }
-        (KeyCode::Char('n'), false) if matches!(mode, Mode::Editing) => {
-            Action::Edit(FreeForm::Name)
-        }
-        (KeyCode::Char('S'), false) if matches!(mode, Mode::Editing) => {
-            Action::Edit(FreeForm::Summary)
-        }
-        // The unshifted letter belongs to the state because the state is the action
-        // a reader takes far more often than any other; the summary takes the shift.
-        (KeyCode::Char('s'), false) if matches!(mode, Mode::Editing) => Action::SetState,
-        // The one shift-pair whose halves are the same noun: the letter takes the
-        // claim and the shifted letter gives it up. Giving up is the shifted half
-        // because it is offered only while a claim is held, so it is the rarer of
-        // the two.
-        (KeyCode::Char('c'), false) if matches!(mode, Mode::Editing) => Action::TakeClaim,
-        (KeyCode::Char('C'), false) if matches!(mode, Mode::Editing) => Action::ReleaseClaim,
-
-        // Session. `F1` is a help key beside `?` everywhere, because inside a
-        // field `?` is a literal character and a reader must not have to learn a
-        // second help key on arriving there.
-        (KeyCode::Char('e'), false) => Action::EnterEditing,
-        // The one write key that is not a letter a row offers: an epic has no
-        // container row to be added to, so creating one is the browser's own key
-        // rather than an action inside the mode. Shifted, because the unshifted
-        // letter is a motion a reader's fingers rest on and this one writes — the
-        // same reason no editing letter is bound while browsing.
-        (KeyCode::Char('N'), false) => Action::CreateEpic,
-        (KeyCode::Char('r'), false) => Action::Reload,
-        (KeyCode::Char('?'), false) | (KeyCode::F(1), _) => Action::ToggleHelp,
-
-        _ => return None,
-    })
+    // The key list is the binding map. Dispatching through its entries means an
+    // entry cannot disappear from help while its key remains live, nor can help
+    // advertise a key without also making it live here.
+    HELP.iter()
+        .find_map(|entry| action_for_binding(entry.binding, key, mode))
+        .or_else(|| surface_character(key, mode))
 }
 
-/// The intent a key carries inside an open surface, where every key belongs to
-/// the field.
-///
-/// Nothing browse mode binds survives: the paging keys that scroll a preview are
-/// the field's while it is open, and a letter is a character rather than the
-/// action that letter carries one layer up. A key this table does not bind is
-/// ignored rather than handed to the level underneath.
-///
-/// The surface's shape is an input rather than something read off a key, because
-/// several keys mean different things by it: how many fields there are decides
-/// whether the field-motion keys have anywhere to go, and what kind of field the
-/// keyboard is in decides whether a line break is content, what the vertical keys
-/// move, and whether there is any text for the external editor to take. None of
-/// them decides how a surface is accepted — that is one key everywhere.
-fn surface_action(key: KeyEvent, shape: Shape) -> Option<Action> {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    Some(match (key.code, ctrl) {
-        // The save key accepts every surface, whatever kind of field has focus and
-        // however many fields there are: the way to finish is one key, learned once.
-        // Raw mode is already on, which clears `IXON`, so Ctrl-S arrives as a key
-        // press instead of being eaten as flow control.
-        (KeyCode::Char('s'), true) => Action::Accept,
-        // The reflex key is a line break, which is content in a field that holds
-        // many lines and in no other, so anywhere else it is unbound: it neither
-        // accepts nor moves, and a reader learns one meaning for it instead of a
-        // rule with cases. Ignoring it says nothing, deliberately — the hint strip
-        // already carries the save key, and a notice covers the whole strip for as
-        // long as it is up, so teaching the save key would hide the hint that
-        // teaches it along with the field and editor hints beside it.
-        (KeyCode::Enter, _) if matches!(shape.kind, FieldKind::ManyLines) => Action::Insert('\n'),
-        // Field motion, and the only keys that move between fields. Bound where
-        // there is another field to reach and nowhere else: a key that did nothing
-        // on a one-field surface would be a key taught for nothing.
-        (KeyCode::Tab, _) if matches!(shape.fields, Fields::Several) => Action::NextField,
-        (KeyCode::BackTab, _) if matches!(shape.fields, Fields::Several) => Action::PreviousField,
-        // Handing the field over is for a field made of text: a picker holds none,
-        // so there is nothing to hand over and nothing an editor could hand back.
-        // Unbound there rather than ignored, so the strip and the key are settled by
-        // one answer.
-        (KeyCode::Char('g'), true)
-            if matches!(shape.kind, FieldKind::OneLine | FieldKind::ManyLines) =>
-        {
-            Action::ExternalEditor
-        }
-        (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => Action::Unwind,
-        // The one help key that can be pressed inside a field.
-        (KeyCode::F(1), _) => Action::ToggleHelp,
-
-        // The emacs motions, with the arrows and the line keys beside them. These
-        // are a line's start and end, which in a field holding one line is the whole
-        // of it, so the keys that page a preview while browsing move within the
-        // field here.
-        (KeyCode::Char('a'), true) | (KeyCode::Home, _) => Action::MoveToStart,
-        (KeyCode::Char('e'), true) | (KeyCode::End, _) => Action::MoveToEnd,
-        (KeyCode::Char('b'), true) | (KeyCode::Left, _) => Action::MoveLeft,
-        (KeyCode::Char('f'), true) | (KeyCode::Right, _) => Action::MoveRight,
-        // Vertical motion, bound where there is something above or below to reach:
-        // another line of text, or the picker's next value. One meaning — up and
-        // down — and the field the keyboard is in says what is up and down in it.
-        // In a field holding one line there is neither, so the keys are unbound
-        // rather than landing where they started.
-        (KeyCode::Up, _) | (KeyCode::Char('p'), true)
-            if matches!(shape.kind, FieldKind::ManyLines | FieldKind::Pick) =>
-        {
-            Action::MoveUp
-        }
-        (KeyCode::Down, _) | (KeyCode::Char('n'), true)
-            if matches!(shape.kind, FieldKind::ManyLines | FieldKind::Pick) =>
-        {
-            Action::MoveDown
-        }
-
-        // Ctrl-H is unavailable as a binding of its own: terminals send 0x08 for
-        // Backspace, so it cannot be told apart from the key that deletes a
-        // character.
-        (KeyCode::Backspace, _) => Action::DeleteBefore,
-        (KeyCode::Delete, _) => Action::DeleteAfter,
-        (KeyCode::Char(c), false) => Action::Insert(c),
-
-        _ => return None,
-    })
+/// Plain characters are field content, not browser bindings. Every named
+/// binding is dispatched through [`HELP`] above; this fallback exists solely so
+/// text fields can accept their unbounded input alphabet.
+fn surface_character(key: KeyEvent, mode: Mode) -> Option<Action> {
+    matches!(mode, Mode::Surface(_))
+        .then(
+            || match (key.code, key.modifiers.contains(KeyModifiers::CONTROL)) {
+                (KeyCode::Char(c), false) => Some(Action::Insert(c)),
+                _ => None,
+            },
+        )
+        .flatten()
 }
 
 /// The letter one set of dialog answers goes ahead by, and `None` for a set that
@@ -277,67 +112,338 @@ pub fn dialog_answers(answers: Answers, words: AnswerWords) -> Vec<String> {
     }
 }
 
-/// The bindings as the help overlay and the footer present them: one row per
-/// group, so both surfaces describe the same keymap without restating it.
-pub const HELP: &[(&str, &str)] = &[
-    (
-        "j / k / ↓ / ↑",
-        "move the cursor; ↑ / ↓ by line, or through a picker",
-    ),
-    ("g / G", "first / last row"),
-    // Enter's two meanings, and it has no third: it is a line break where breaks
-    // are content, and nothing at all in a field that holds one line.
-    ("Enter / l / →", "open the row; a line break in a text area"),
-    ("Backspace / h / ←", "leave the level"),
-    ("Esc", "leave the level, a field, or editing mode"),
-    // Both ways of scrolling the preview on one row, because the list is as tall
-    // as the shortest terminal the browser supports and a row past that is
-    // clipped without saying so: the keys that page it and the keys that page half
-    // of it are one group, read together.
-    (
-        "PgDn / PgUp / Space",
-        "scroll the preview a screen; Ctrl-D / Ctrl-U half",
-    ),
-    (
-        "Home / End",
-        "preview start / end; a field line's ends inside one",
-    ),
-    ("< / > / =", "narrow / widen / reset the panes"),
-    ("z", "preview fills the width; mouse released"),
-    // Two keys on one row, for the same reason the groups below share theirs: the
-    // list is as tall as the shortest terminal the browser supports and a row past
-    // that is clipped without saying so. These two are the ways into a write from
-    // browsing, and neither is answered on a store that may not be written.
-    ("e / N", "editing mode on the row / a new epic, from epics"),
-    ("a / d", "editing mode: add a member / remove it, confirmed"),
-    // Three keys on one row, because the list is as tall as the shortest terminal
-    // the browser supports and a row past that is clipped without saying so: the
-    // three replace a whole field between them and are read as one group. The last
-    // of them is named for what it edits on any row rather than for a body, because
-    // on a comment it is the comment's own text.
-    (
-        "n / S / b",
-        "editing mode: the name / the summary / the text",
-    ),
-    // Three keys on one row, for the same reason the fields above share one: the
-    // list is as tall as the shortest terminal the browser supports and a row past
-    // that is clipped without saying so. These three set what a row *is* rather than
-    // what it says, so they read as one group.
-    (
-        "s / c / C",
-        "editing mode: the state / take the claim / release it",
-    ),
-    ("Ctrl-S", "save, whichever field you are in"),
-    ("Tab / Shift-Tab", "next / previous field"),
-    ("Ctrl-G", "edit the open field in $EDITOR"),
-    (
-        "Ctrl-A / Ctrl-E",
-        "line start / end; Ctrl-B / Ctrl-F or ← / → by one",
-    ),
-    ("r", "re-read the store"),
-    ("? / F1", "these keys; F1 works inside a field"),
-    ("q", "quit"),
+/// A group of bindings described by one key-list row. The group lives on its
+/// entry so dispatch and presentation share one source of truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelpBinding {
+    Motion,
+    FirstLast,
+    Descend,
+    Ascend,
+    Unwind,
+    Interrupt,
+    PreviewPaging,
+    PreviewEnds,
+    Layout,
+    StartWriting,
+    AddDelete,
+    EditFields,
+    StateClaim,
+    Save,
+    FieldMotion,
+    ExternalEditor,
+    LineMotion,
+    Reload,
+    Help,
+    Quit,
+}
+
+/// The action one listed binding carries in the mode where it applies.
+fn action_for_binding(binding: HelpBinding, key: KeyEvent, mode: Mode) -> Option<Action> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let browsing = matches!(mode, Mode::Browse | Mode::Editing);
+    let surface = match mode {
+        Mode::Surface(shape) => Some(shape),
+        Mode::Browse | Mode::Editing | Mode::Dialog(_) => None,
+    };
+
+    match binding {
+        HelpBinding::Motion => match (key.code, ctrl, surface) {
+            (KeyCode::Char('j'), false, None) | (KeyCode::Down, false, None) if browsing => {
+                Some(Action::CursorDown)
+            }
+            (KeyCode::Char('k'), false, None) | (KeyCode::Up, false, None) if browsing => {
+                Some(Action::CursorUp)
+            }
+            (KeyCode::Up, _, Some(shape)) | (KeyCode::Char('p'), true, Some(shape))
+                if matches!(shape.kind, FieldKind::ManyLines | FieldKind::Pick) =>
+            {
+                Some(Action::MoveUp)
+            }
+            (KeyCode::Down, _, Some(shape)) | (KeyCode::Char('n'), true, Some(shape))
+                if matches!(shape.kind, FieldKind::ManyLines | FieldKind::Pick) =>
+            {
+                Some(Action::MoveDown)
+            }
+            _ => None,
+        },
+        HelpBinding::FirstLast if browsing => match (key.code, ctrl) {
+            (KeyCode::Char('g'), false) => Some(Action::CursorFirst),
+            (KeyCode::Char('G'), false) => Some(Action::CursorLast),
+            _ => None,
+        },
+        HelpBinding::Descend => match (key.code, ctrl, surface) {
+            (KeyCode::Enter, _, None)
+            | (KeyCode::Char('l'), false, None)
+            | (KeyCode::Right, false, None)
+                if browsing =>
+            {
+                Some(Action::Descend)
+            }
+            (KeyCode::Enter, _, Some(shape)) if matches!(shape.kind, FieldKind::ManyLines) => {
+                Some(Action::Insert('\n'))
+            }
+            (KeyCode::Right, _, Some(_)) => Some(Action::MoveRight),
+            _ => None,
+        },
+        HelpBinding::Ascend => match (key.code, ctrl, surface) {
+            (KeyCode::Backspace, _, None)
+            | (KeyCode::Char('h'), false, None)
+            | (KeyCode::Left, false, None)
+                if browsing =>
+            {
+                Some(Action::Ascend)
+            }
+            (KeyCode::Backspace, _, Some(_)) => Some(Action::DeleteBefore),
+            (KeyCode::Left, _, Some(_)) => Some(Action::MoveLeft),
+            _ => None,
+        },
+        HelpBinding::Unwind if matches!(key.code, KeyCode::Esc) => Some(Action::Unwind),
+        HelpBinding::Interrupt if matches!((key.code, ctrl), (KeyCode::Char('c'), true)) => {
+            Some(if matches!(mode, Mode::Browse) {
+                Action::Quit
+            } else {
+                Action::Unwind
+            })
+        }
+        HelpBinding::PreviewPaging if browsing => match (key.code, ctrl) {
+            (KeyCode::Char('d'), true) => Some(Action::PreviewHalfDown),
+            (KeyCode::Char('u'), true) => Some(Action::PreviewHalfUp),
+            (KeyCode::PageDown, _) | (KeyCode::Char(' '), false) => Some(Action::PreviewPageDown),
+            (KeyCode::PageUp, _) => Some(Action::PreviewPageUp),
+            _ => None,
+        },
+        HelpBinding::PreviewEnds => match (key.code, surface) {
+            (KeyCode::Home, None) if browsing => Some(Action::PreviewTop),
+            (KeyCode::End, None) if browsing => Some(Action::PreviewBottom),
+            (KeyCode::Home, Some(_)) => Some(Action::MoveToStart),
+            (KeyCode::End, Some(_)) => Some(Action::MoveToEnd),
+            _ => None,
+        },
+        HelpBinding::Layout if browsing => match (key.code, ctrl) {
+            (KeyCode::Char('<'), false) => Some(Action::ShrinkNav),
+            (KeyCode::Char('>'), false) => Some(Action::GrowNav),
+            (KeyCode::Char('='), false) => Some(Action::ResetSplit),
+            (KeyCode::Char('z'), false) => Some(Action::ToggleZoom),
+            _ => None,
+        },
+        HelpBinding::StartWriting if browsing => match (key.code, ctrl) {
+            (KeyCode::Char('e'), false) => Some(Action::EnterEditing),
+            (KeyCode::Char('N'), false) => Some(Action::CreateEpic),
+            _ => None,
+        },
+        HelpBinding::AddDelete if matches!(mode, Mode::Editing) => match (key.code, ctrl) {
+            (KeyCode::Char('a'), false) => Some(Action::Add),
+            (KeyCode::Char('d'), false) => Some(Action::Delete),
+            _ => None,
+        },
+        HelpBinding::EditFields if matches!(mode, Mode::Editing) => match (key.code, ctrl) {
+            (KeyCode::Char('n'), false) => Some(Action::Edit(FreeForm::Name)),
+            (KeyCode::Char('S'), false) => Some(Action::Edit(FreeForm::Summary)),
+            (KeyCode::Char('b'), false) => Some(Action::Edit(FreeForm::Body)),
+            _ => None,
+        },
+        HelpBinding::StateClaim if matches!(mode, Mode::Editing) => match (key.code, ctrl) {
+            (KeyCode::Char('s'), false) => Some(Action::SetState),
+            (KeyCode::Char('c'), false) => Some(Action::TakeClaim),
+            (KeyCode::Char('C'), false) => Some(Action::ReleaseClaim),
+            _ => None,
+        },
+        HelpBinding::Save
+            if surface.is_some() && matches!((key.code, ctrl), (KeyCode::Char('s'), true)) =>
+        {
+            Some(Action::Accept)
+        }
+        HelpBinding::FieldMotion if matches!(surface, Some(shape) if matches!(shape.fields, Fields::Several)) => {
+            match key.code {
+                KeyCode::Tab => Some(Action::NextField),
+                KeyCode::BackTab => Some(Action::PreviousField),
+                _ => None,
+            }
+        }
+        HelpBinding::ExternalEditor
+            if matches!(surface, Some(shape) if matches!(shape.kind, FieldKind::OneLine | FieldKind::ManyLines))
+                && matches!((key.code, ctrl), (KeyCode::Char('g'), true)) =>
+        {
+            Some(Action::ExternalEditor)
+        }
+        HelpBinding::LineMotion if surface.is_some() => match (key.code, ctrl) {
+            (KeyCode::Char('a'), true) => Some(Action::MoveToStart),
+            (KeyCode::Char('e'), true) => Some(Action::MoveToEnd),
+            (KeyCode::Char('b'), true) => Some(Action::MoveLeft),
+            (KeyCode::Char('f'), true) => Some(Action::MoveRight),
+            (KeyCode::Delete, _) => Some(Action::DeleteAfter),
+            _ => None,
+        },
+        HelpBinding::Reload
+            if browsing && matches!((key.code, ctrl), (KeyCode::Char('r'), false)) =>
+        {
+            Some(Action::Reload)
+        }
+        HelpBinding::Help => match (key.code, surface) {
+            (KeyCode::Char('?'), None) if browsing => Some(Action::ToggleHelp),
+            (KeyCode::F(1), _) => Some(Action::ToggleHelp),
+            _ => None,
+        },
+        HelpBinding::Quit
+            if browsing && matches!((key.code, ctrl), (KeyCode::Char('q'), false)) =>
+        {
+            Some(Action::Quit)
+        }
+        _ => None,
+    }
+}
+
+/// One row in the key list. `requires_write` keeps the list honest on a store
+/// this browser cannot write: a binding that could not reach a surface is not a
+/// capability the reader can use there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HelpEntry {
+    pub keys: &'static str,
+    pub description: &'static str,
+    requires_write: bool,
+    binding: HelpBinding,
+}
+
+/// The bindings as the help overlay presents them: one row per group. The list is
+/// also filtered from this one table when the store is read-only, so the overlay
+/// cannot offer a write that the browser knows it will refuse.
+pub const HELP: &[HelpEntry] = &[
+    HelpEntry {
+        keys: "j / k / ↓ / ↑ / Ctrl-P / Ctrl-N",
+        description: "move; ↑/↓ or Ctrl-P/N in a field",
+        requires_write: false,
+        binding: HelpBinding::Motion,
+    },
+    HelpEntry {
+        keys: "g / G",
+        description: "first / last row",
+        requires_write: false,
+        binding: HelpBinding::FirstLast,
+    },
+    // Enter is a line break where breaks are content and nothing at all in a
+    // one-line field or picker; it never accepts a surface.
+    HelpEntry {
+        keys: "Enter / l / →",
+        description: "open; newline in text area, else ignored",
+        requires_write: false,
+        binding: HelpBinding::Descend,
+    },
+    HelpEntry {
+        keys: "Backspace / h / ←",
+        description: "leave the level",
+        requires_write: false,
+        binding: HelpBinding::Ascend,
+    },
+    HelpEntry {
+        keys: "Esc",
+        description: "leave the level, a field, or editing mode",
+        requires_write: false,
+        binding: HelpBinding::Unwind,
+    },
+    HelpEntry {
+        keys: "Ctrl-C",
+        description: "quit while browsing; otherwise like Esc",
+        requires_write: false,
+        binding: HelpBinding::Interrupt,
+    },
+    HelpEntry {
+        keys: "PgDn / PgUp / Space",
+        description: "page preview; Ctrl-D / Ctrl-U half",
+        requires_write: false,
+        binding: HelpBinding::PreviewPaging,
+    },
+    HelpEntry {
+        keys: "Home / End",
+        description: "preview start / end; field line ends",
+        requires_write: false,
+        binding: HelpBinding::PreviewEnds,
+    },
+    // These layout keys share one row so the list remains wholly visible at the
+    // shortest supported terminal height; their descriptions stay on the row.
+    HelpEntry {
+        keys: "< / > / = / z",
+        description: "resize; z fills width, releases mouse",
+        requires_write: false,
+        binding: HelpBinding::Layout,
+    },
+    HelpEntry {
+        keys: "e / N",
+        description: "edit a row / new epic from epics",
+        requires_write: true,
+        binding: HelpBinding::StartWriting,
+    },
+    HelpEntry {
+        keys: "a / d",
+        description: "edit: add member / confirmed removal",
+        requires_write: true,
+        binding: HelpBinding::AddDelete,
+    },
+    // The name and summary are short floats; the long-form text is the preview
+    // pane. Keeping the three keys together preserves a whole row for each binding.
+    HelpEntry {
+        keys: "n / S / b",
+        description: "edit name/summary floats; text in preview",
+        requires_write: true,
+        binding: HelpBinding::EditFields,
+    },
+    HelpEntry {
+        keys: "s / c / C",
+        description: "edit: state / take / release claim",
+        requires_write: true,
+        binding: HelpBinding::StateClaim,
+    },
+    HelpEntry {
+        keys: "Ctrl-S",
+        description: "save, whichever field you are in",
+        requires_write: true,
+        binding: HelpBinding::Save,
+    },
+    HelpEntry {
+        keys: "Tab / Shift-Tab",
+        description: "next / previous field",
+        requires_write: true,
+        binding: HelpBinding::FieldMotion,
+    },
+    HelpEntry {
+        keys: "Ctrl-G",
+        description: "edit the open field in $EDITOR",
+        requires_write: true,
+        binding: HelpBinding::ExternalEditor,
+    },
+    HelpEntry {
+        keys: "Ctrl-A / Ctrl-E",
+        description: "line start/end; Ctrl-B/F or ←/→ moves one",
+        requires_write: true,
+        binding: HelpBinding::LineMotion,
+    },
+    HelpEntry {
+        keys: "r",
+        description: "re-read the store",
+        requires_write: false,
+        binding: HelpBinding::Reload,
+    },
+    HelpEntry {
+        keys: "? / F1",
+        description: "these keys; F1 works inside a field",
+        requires_write: false,
+        binding: HelpBinding::Help,
+    },
+    HelpEntry {
+        keys: "q",
+        description: "quit while browsing",
+        requires_write: false,
+        binding: HelpBinding::Quit,
+    },
 ];
+
+/// The list entries a browser in this store state may teach. The returned rows
+/// still originate in [`HELP`], so the writable and read-only overlays cannot
+/// acquire separate wording or a different binding order.
+pub fn help(can_write: bool) -> impl Iterator<Item = &'static HelpEntry> {
+    HELP.iter()
+        .filter(move |entry| can_write || !entry.requires_write)
+}
 
 /// The hints the strip under the panes is built from, in the order a reader
 /// wants them. A narrow terminal drops trailing hints rather than clipping one
@@ -351,6 +457,27 @@ pub const FOOTER_HINTS: &[&str] = &[
     "z zoom",
     "r reload",
 ];
+
+/// The two browse-mode entries into writing. They lead the droppable strip when
+/// they apply so an ordinary-width terminal teaches how to begin a write; the
+/// essential pair still wins at widths that cannot hold them.
+const FOOTER_HINT_ENTER_EDITING: &str = "e edit";
+const FOOTER_HINT_CREATE_EPIC: &str = "N new epic";
+
+/// Browse hints filtered to what the browser can perform at the level on screen.
+/// The state machine owns whether a row exists and whether the store can be
+/// written; this table owns the binding words and their order.
+pub fn footer_hints_browse(can_enter_editing: bool, can_create_epic: bool) -> Vec<&'static str> {
+    let mut hints = Vec::with_capacity(FOOTER_HINTS.len() + 2);
+    if can_enter_editing {
+        hints.push(FOOTER_HINT_ENTER_EDITING);
+    }
+    if can_create_epic {
+        hints.push(FOOTER_HINT_CREATE_EPIC);
+    }
+    hints.extend_from_slice(FOOTER_HINTS);
+    hints
+}
 
 /// The pair the strip always appends, in rank order: how to get out of where you
 /// are, then how to get help.
@@ -634,6 +761,64 @@ mod tests {
         assert_eq!(
             action_for(plain(KeyCode::Char('e')), Mode::Browse),
             Some(Action::EnterEditing)
+        );
+    }
+
+    #[test]
+    fn browse_write_hints_are_shown_only_where_the_browser_can_start_a_write() {
+        let cases = [
+            (true, true, vec!["e edit", "N new epic"]),
+            (true, false, vec!["e edit"]),
+            (false, true, vec!["N new epic"]),
+            (false, false, vec![]),
+        ];
+        for (can_enter, can_create, expected) in cases {
+            let hints = footer_hints_browse(can_enter, can_create);
+            for hint in ["e edit", "N new epic"] {
+                assert_eq!(
+                    hints.contains(&hint),
+                    expected.contains(&hint),
+                    "{can_enter}/{can_create}: {hints:?}"
+                );
+            }
+        }
+        // The two labels are derived from the bindings the reader presses, so a
+        // strip entry cannot teach a key that does nothing in browse mode.
+        assert_eq!(
+            action_for(key_named("e"), Mode::Browse),
+            Some(Action::EnterEditing)
+        );
+        assert_eq!(
+            action_for(key_named("N"), Mode::Browse),
+            Some(Action::CreateEpic)
+        );
+    }
+
+    #[test]
+    fn the_key_list_hides_every_write_binding_on_a_read_only_store() {
+        let writable: Vec<_> = help(true).collect();
+        let read_only: Vec<_> = help(false).collect();
+        assert!(
+            writable.iter().any(|entry| entry.keys == "e / N"),
+            "the writable list lost the way into writing"
+        );
+        for entry in &read_only {
+            assert!(
+                writable.contains(entry),
+                "the read-only list invented {:?}",
+                entry.keys
+            );
+            assert!(
+                !entry.requires_write,
+                "the read-only list teaches {:?}",
+                entry.keys
+            );
+        }
+        assert!(
+            writable
+                .iter()
+                .any(|entry| entry.requires_write && !read_only.contains(entry)),
+            "no write binding was removed from the read-only list"
         );
     }
 
@@ -1020,6 +1205,20 @@ mod tests {
     }
 
     #[test]
+    fn reload_is_live_where_the_key_list_says_it_is() {
+        // The list is the dispatch table, not a second catalogue. Removing this
+        // row therefore removes the binding too; this test pins the browser
+        // behaviour the row exists to expose.
+        for mode in [Mode::Browse, Mode::Editing] {
+            assert_eq!(
+                action_for(plain(KeyCode::Char('r')), mode),
+                Some(Action::Reload),
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
     fn preview_paging_is_not_shadowed_by_the_plain_motions() {
         assert_eq!(
             action_for(ctrl('d'), Mode::Browse),
@@ -1328,6 +1527,28 @@ mod tests {
             assert!(
                 listed.iter().any(|a| a.contains(words().dismissal)),
                 "{answers:?} does not list its way out: {listed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_acknowledgement_lists_each_named_dismissal_key() {
+        // `Esc / Enter` is one answer string, so checking only its leading token
+        // would leave the reflex key free to disappear while the dialog still
+        // looked answerable. Both names must reach the set that lists them.
+        let listed = dialog_answers(
+            Answers::Acknowledge,
+            AnswerWords {
+                affirmative: None,
+                dismissal: "dismiss",
+            },
+        );
+        assert_eq!(listed, vec!["Esc / Enter dismiss"]);
+        for key in [key_named("Esc"), key_named("Enter")] {
+            assert_eq!(
+                action_for(key, Mode::Dialog(Answers::Acknowledge)),
+                Some(Action::Unwind),
+                "{key:?} is listed but not admitted"
             );
         }
     }

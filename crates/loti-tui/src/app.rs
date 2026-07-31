@@ -107,7 +107,7 @@ const LABEL_FIELD: &str = "label";
 /// See [`LABEL_FIELD`]. A blocker is named by a reference rather than written
 /// out, so the field says so: what the reader types is a token the store
 /// resolves, not prose.
-const BLOCKER_FIELD: &str = "blocker reference";
+const BLOCKER_FIELD: &str = "blocker reference (number or epic/number)";
 /// See [`LABEL_FIELD`]. The store's own word for the field a state is held in, on
 /// an epic as on a unit of work.
 const STATE_FIELD: &str = "status";
@@ -154,6 +154,7 @@ fn cascade_label(open_descendants: usize) -> String {
 fn reported(done: String, effect: data::Effect) -> String {
     match effect {
         data::Effect::AsAsked => done,
+        data::Effect::AlreadyListed(reference) => format!("blocker {reference} is already listed"),
         data::Effect::AlsoClosed(1) => format!("{done}, and 1 descendant with it"),
         data::Effect::AlsoClosed(count) => format!("{done}, and {count} descendants with it"),
         // A comment is addressed by its number for the rest of its life, and the
@@ -2899,6 +2900,41 @@ mod tests {
         let fx = Fixture::build();
         let app = App::new(fx.store.clone(), Theme::with_color(false)).unwrap();
         (fx, app)
+    }
+
+    #[test]
+    fn a_single_descendant_is_named_in_the_singular_on_every_surface() {
+        assert_eq!(cascade_label(1), "also close 1 open descendant");
+        assert_eq!(
+            reported(
+                "browser/1 is now closed".to_string(),
+                data::Effect::AlsoClosed(1)
+            ),
+            "browser/1 is now closed, and 1 descendant with it"
+        );
+        assert_eq!(cascade_label(2), "also close 2 open descendants");
+        assert_eq!(
+            reported(
+                "browser/1 is now closed".to_string(),
+                data::Effect::AlsoClosed(2)
+            ),
+            "browser/1 is now closed, and 2 descendants with it"
+        );
+    }
+
+    #[test]
+    fn a_destructive_question_carries_its_own_title() {
+        // The question's message names what would go, but the fixed title names
+        // what kind of interruption this is. A confirmation must not borrow the
+        // refusal title just because both are centred dialogs.
+        let dialog = Dialog::confirm(
+            "Remove label ui?".to_string(),
+            "remove",
+            Performs::Discard,
+            "cancel",
+        );
+        assert_eq!(dialog.title(), CONFIRM_TITLE);
+        assert_ne!(dialog.title(), REFUSAL_TITLE);
     }
 
     /// Put the cursor on the first row of the given kind on the level on screen.
@@ -6154,6 +6190,16 @@ mod tests {
         // holds one more entry than it did.
         let row = app.nav().frame().current().expect("a highlighted row");
         assert_eq!(row.children, expected.len());
+
+        // Repeating the same request is a successful no-op in the store. The
+        // browser must not call it an addition when the list the reader sees did
+        // not change.
+        add_a_blocker(&mut app, &whole);
+        assert_eq!(fx.node_blockers(), expected);
+        assert_eq!(
+            app.flash_message(),
+            Some(format!("blocker {whole} is already listed").as_str())
+        );
 
         // And a whole reference is the other form a reader writes one in — the form
         // that reaches another epic, which is the only thing distinguishing it from

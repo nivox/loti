@@ -1254,8 +1254,8 @@ impl Write {
 /// stood when the surface opened, and the store recomputes it under the lock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
-    /// Exactly what was asked for and nothing besides, which is every write the
-    /// browser makes but one.
+    /// Exactly what was asked for and nothing besides. Writes whose outcome adds
+    /// information the browser could not know use a more specific variant.
     AsAsked,
     /// The reference the store recorded a newly created unit of work under.
     ///
@@ -1264,6 +1264,10 @@ pub enum Effect {
     /// the new ticket has. An epic's own id is not one of these — the reader typed
     /// it, so it was knowable before the write.
     Created(String),
+    /// A dependency list already held the blocker the reader asked to add. The
+    /// core operation is deliberately idempotent, so the browser reports the
+    /// non-event rather than claiming a duplicate was added.
+    AlreadyListed(String),
     /// A close that resolved this many of the row's open descendants with it.
     ///
     /// Never none: a cascade that finds nothing left to close — somebody else got
@@ -1324,14 +1328,12 @@ pub fn perform(store: &Store, write: &Write) -> Result<Effect, Refusal> {
             name,
             summary,
         } => create_node(store, parent, name, summary),
-        // Only a state pick can do more than it was asked for, so every other write
-        // reports what it was asked for: the one place a notice is finished by the
-        // store cannot then be forgotten for the one write that needs it.
+        // Most writes report exactly what was asked. The operations whose outcome
+        // adds information the browser could not know return a specific effect so
+        // the notice is finished from the store's result rather than guessed.
         Write::AddLabel(selection, label) => as_asked(add_label(store, selection, label)),
         Write::RemoveLabel(selection) => as_asked(remove_label(store, selection)),
-        Write::AddBlocker(selection, reference) => {
-            as_asked(add_blocker(store, selection, reference))
-        }
+        Write::AddBlocker(selection, reference) => add_blocker(store, selection, reference),
         Write::RemoveBlocker(selection) => as_asked(remove_blocker(store, selection)),
         Write::DeleteAsset(selection) => as_asked(delete_asset(store, selection)),
         // The second write whose notice only the store can finish: which number the
@@ -1684,10 +1686,20 @@ fn remove_label(store: &Store, selection: &Selection) -> Result<(), Refusal> {
 /// No stamp guards this write, for the same reason a label addition carries none:
 /// a stamp is the precondition of a free-form replacement, and adding one entry
 /// to a list cannot silently discard text someone else wrote.
-fn add_blocker(store: &Store, selection: &Selection, reference: &str) -> Result<(), Refusal> {
+fn add_blocker(store: &Store, selection: &Selection, reference: &str) -> Result<Effect, Refusal> {
     let (node, blocker) = blocked_and_blocking(selection, reference).map_err(misdirected)?;
+    let canonical = blocker.to_string();
+    // The core keeps a dependency list unique. Read the list through the same
+    // seam before asking it to add, so a successful idempotent operation is not
+    // reported as a change the reader cannot see.
+    let already_listed = ops::list_blocked_by(store, &node)
+        .map_err(refusal)?
+        .contains(&canonical);
     ops::add_blocked_by(store, &node, std::slice::from_ref(&blocker)).map_err(refusal)?;
-    Ok(())
+    Ok(match already_listed {
+        true => Effect::AlreadyListed(canonical),
+        false => Effect::AsAsked,
+    })
 }
 
 /// Take one entry off the dependency list it sits on.
@@ -3500,14 +3512,20 @@ mod tests {
         // A bare number names a node of the blocked node's own epic, which is the
         // one thing about the text the browser resolves — and the store records the
         // canonical form whichever way it was written.
-        perform(&fx.store, &Write::AddBlocker(list.clone(), bare)).unwrap();
+        assert_eq!(
+            perform(&fx.store, &Write::AddBlocker(list.clone(), bare)).unwrap(),
+            Effect::AsAsked
+        );
         let mut expected = before.clone();
         expected.push(whole.clone());
         assert_eq!(fx.node_blockers(), expected);
 
         // The same reference written whole is the same entry, so the store's own
         // no-op is what happens — not a refusal the browser invents on its behalf.
-        perform(&fx.store, &Write::AddBlocker(list.clone(), whole.clone())).unwrap();
+        assert_eq!(
+            perform(&fx.store, &Write::AddBlocker(list.clone(), whole.clone())).unwrap(),
+            Effect::AlreadyListed(whole.clone())
+        );
         assert_eq!(fx.node_blockers(), expected);
 
         // A whole reference reaches a node of ANOTHER epic — which is the only

@@ -194,7 +194,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 
     match app.modal() {
-        Some(Modal::Help) => draw_help(f, f.area(), theme),
+        Some(Modal::Help) => draw_help(f, f.area(), theme, app.read_only().is_none()),
         // One widget for every dialog: it draws what the dialog carries, so a
         // further kind of question needs nothing here.
         Some(Modal::Dialog(dialog)) => draw_dialog(
@@ -691,7 +691,15 @@ fn footer(app: &App, width: u16) -> Span<'static> {
                     keymap::FOOTER_ESSENTIAL_SURFACE,
                 ),
                 (None, true) => (app.editing_hints(), keymap::FOOTER_ESSENTIAL_EDITING),
-                (None, false) => (keymap::FOOTER_HINTS.to_vec(), keymap::FOOTER_ESSENTIAL),
+                (None, false) => (
+                    keymap::footer_hints_browse(
+                        app.read_only().is_none()
+                            && !app.zoomed()
+                            && app.nav().frame().current().is_some(),
+                        app.read_only().is_none() && app.nav().crumbs().len() == 1,
+                    ),
+                    keymap::FOOTER_ESSENTIAL,
+                ),
             };
             Span::styled(
                 format!(" {}", hint_strip(columns, &hints, essential)),
@@ -1161,11 +1169,11 @@ fn truncate(text: &str, budget: usize) -> String {
     format!("{kept}{CUT_MARKER}")
 }
 
-/// The key column's width: the widest binding, so descriptions line up.
-fn help_key_width() -> usize {
-    keymap::HELP
-        .iter()
-        .map(|(k, _)| k.chars().count())
+/// The key column's width: the widest binding in the overlay being drawn, so
+/// descriptions line up without reserving room for a read-only-hidden binding.
+fn help_key_width(can_write: bool) -> usize {
+    keymap::help(can_write)
+        .map(|entry| entry.keys.chars().count())
         .max()
         .unwrap_or(0)
 }
@@ -1174,31 +1182,42 @@ fn help_key_width() -> usize {
 /// `<keys>  <description>` row plus borders — so a binding's description is
 /// never clipped by a popup that guessed too narrow. A terminal too small for
 /// that still bounds it.
-fn help_width(available: u16) -> u16 {
-    let widest = keymap::HELP
-        .iter()
-        .map(|(_, what)| help_key_width() + 2 + what.chars().count())
+fn help_width(available: u16, can_write: bool) -> u16 {
+    let key_width = help_key_width(can_write);
+    let widest = keymap::help(can_write)
+        .map(|entry| key_width + 2 + entry.description.chars().count())
         .max()
         .unwrap_or(0);
     let wanted = widest as u16 + 2;
     wanted.min(available.saturating_sub(4)).max(20)
 }
 
-fn draw_help(f: &mut Frame, area: Rect, theme: Theme) {
-    let width = help_width(area.width);
-    let height = (keymap::HELP.len() as u16 + 2).min(area.height.saturating_sub(2));
+/// The smallest terminal the browser's key list promises to fit without dropping
+/// a binding. The breadcrumb and footer take the other two rows.
+#[cfg(test)]
+const HELP_FIT_HEIGHT: u16 = 24;
+
+/// The rows an overlay needs: one for every binding and its two borders.
+fn help_height(can_write: bool) -> u16 {
+    keymap::help(can_write).count() as u16 + 2
+}
+
+fn draw_help(f: &mut Frame, area: Rect, theme: Theme, can_write: bool) {
+    let entries: Vec<_> = keymap::help(can_write).collect();
+    let width = help_width(area.width, can_write);
+    let height = help_height(can_write).min(area.height.saturating_sub(2));
     let popup = centred(area, width, height);
-    let key_width = help_key_width();
-    let lines: Vec<Line> = keymap::HELP
-        .iter()
-        .map(|(keys, what)| {
+    let key_width = help_key_width(can_write);
+    let lines: Vec<Line> = entries
+        .into_iter()
+        .map(|entry| {
             Line::from(vec![
                 Span::styled(
-                    format!("{keys:<key_width$}"),
+                    format!("{:<key_width$}", entry.keys),
                     Style::default().fg(theme.accent()),
                 ),
                 Span::raw("  "),
-                Span::raw(*what),
+                Span::raw(entry.description),
             ])
         })
         .collect();
@@ -1459,35 +1478,56 @@ mod tests {
     }
 
     #[test]
+    fn the_overlay_fits_every_binding_at_the_supported_height() {
+        // The draw path clips an overlay on a smaller terminal as a last resort,
+        // but the ordinary minimum must never silently lose a binding because a
+        // row was added without making room for it.
+        for can_write in [false, true] {
+            assert!(
+                help_height(can_write) <= HELP_FIT_HEIGHT.saturating_sub(2),
+                "{} rows need {} cells at a {}-line terminal",
+                keymap::help(can_write).count(),
+                help_height(can_write),
+                HELP_FIT_HEIGHT
+            );
+        }
+    }
+
+    #[test]
     fn the_overlay_is_wide_enough_for_every_binding_it_lists() {
         // On a terminal with room to spare, and on the ordinary eighty- and
         // hundred-column ones too: the overlay is bounded by the screen, so a
         // description longer than that is clipped, and half a binding teaches a key
         // that does something else.
-        for available in [80, 100, 200] {
-            let width = help_width(available) as usize;
-            for (keys, what) in keymap::HELP {
-                let row = help_key_width() + 2 + what.chars().count();
-                assert!(
-                    row + 2 <= width,
-                    "{keys:?} / {what:?} needs {row} columns inside a {width}-wide overlay"
-                );
+        for can_write in [false, true] {
+            for available in [80, 100, 200] {
+                let width = help_width(available, can_write) as usize;
+                for entry in keymap::help(can_write) {
+                    let row = help_key_width(can_write) + 2 + entry.description.chars().count();
+                    assert!(
+                        row + 2 <= width,
+                        "{:?} / {:?} needs {row} columns inside a {width}-wide overlay",
+                        entry.keys,
+                        entry.description
+                    );
+                }
             }
         }
     }
 
     #[test]
     fn the_hint_strip_never_clips_a_hint_in_half() {
-        for width in 10..120usize {
-            let strip = hint_strip(width, keymap::FOOTER_HINTS, keymap::FOOTER_ESSENTIAL);
-            assert!(strip.chars().count() <= width, "width {width}: {strip:?}");
-            if width >= 40 {
-                for hint in strip.split(keymap::HINT_SEPARATOR) {
-                    assert!(
-                        keymap::FOOTER_HINTS.contains(&hint)
-                            || keymap::FOOTER_ESSENTIAL.contains(&hint),
-                        "width {width} produced a partial hint {hint:?}"
-                    );
+        for (hints, essential) in strips() {
+            for width in 10..120usize {
+                let strip = hint_strip(width, &hints, essential);
+                assert!(strip.chars().count() <= width, "width {width}: {strip:?}");
+                if width >= 40 {
+                    for hint in strip.split(keymap::HINT_SEPARATOR) {
+                        assert!(
+                            hints.contains(&hint) || essential.contains(&hint),
+                            "width {width} produced a partial hint {hint:?}"
+                        );
+                    }
                 }
             }
         }
@@ -1500,7 +1540,14 @@ mod tests {
     /// its keys apply.
     fn strips() -> Vec<(Vec<&'static str>, &'static [&'static str])> {
         let mut strips = vec![
-            (keymap::FOOTER_HINTS.to_vec(), keymap::FOOTER_ESSENTIAL),
+            (
+                keymap::footer_hints_browse(true, true),
+                keymap::FOOTER_ESSENTIAL,
+            ),
+            (
+                keymap::footer_hints_browse(false, false),
+                keymap::FOOTER_ESSENTIAL,
+            ),
             (
                 keymap::FOOTER_HINTS_EDITING
                     .iter()

@@ -156,6 +156,32 @@ fn the_first_frame_carries_the_breadcrumb_the_panes_and_the_hints() {
 }
 
 #[test]
+fn browse_hints_offer_only_the_writes_the_screen_can_start() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store, Theme::with_color(false)).unwrap();
+    let (_t, roster) = draw(&mut app);
+    // The roster can create an epic and has a selected row to edit, so both entry
+    // points lead the droppable strip where an ordinary terminal can show them.
+    assert!(roster[23].contains("e edit"), "{:?}", roster[23]);
+    assert!(roster[23].contains("N new epic"), "{:?}", roster[23]);
+
+    app.apply(Action::Descend).unwrap();
+    let (_t, nested) = draw(&mut app);
+    // An epic can still be edited, but only the roster is a container for a new
+    // epic; a hint must not teach a key whose use here is a refusal.
+    assert!(nested[23].contains("e edit"), "{:?}", nested[23]);
+    assert!(!nested[23].contains("N new epic"), "{:?}", nested[23]);
+
+    app.apply(Action::Ascend).unwrap();
+    app.apply(Action::ToggleZoom).unwrap();
+    let (_t, zoomed) = draw(&mut app);
+    // Editing freezes and marks a navigation row, neither of which exists while
+    // zoomed. Epic creation remains a roster action and does not need that pane.
+    assert!(!zoomed[23].contains("e edit"), "{:?}", zoomed[23]);
+    assert!(zoomed[23].contains("N new epic"), "{:?}", zoomed[23]);
+}
+
+#[test]
 fn descending_updates_the_breadcrumb_and_lists_the_level_below() {
     let (_dir, store) = fixture();
     let mut app = App::new(store, Theme::with_color(false)).unwrap();
@@ -298,23 +324,41 @@ fn entering_a_collection_names_it_in_the_breadcrumb_and_dims_the_crumb() {
 fn the_help_overlay_lists_the_bindings() {
     let (_dir, store) = fixture();
     let mut app = App::new(store, Theme::with_color(false)).unwrap();
+    let (before, _) = draw(&mut app);
     app.apply(Action::ToggleHelp).unwrap();
-    let (_t, lines) = draw(&mut app);
+    let (after, _) = draw(&mut app);
+    let help = box_lines(&cells(&after), changed_box(&cells(&before), &cells(&after)));
 
-    assert!(lines.iter().any(|l| l.contains("keys")));
-    assert!(lines.iter().any(|l| l.contains("move the cursor")));
-    // Every binding the list carries reaches the screen: a list one row too tall
-    // for the terminal teaches nothing about the binding it drops.
-    for (keys, what) in loti_tui::keymap::HELP {
+    assert!(help[0].contains("keys"), "{help:#?}");
+    // Each entry must occupy a row of the overlay itself. Searching the whole
+    // frame would let a footer hint or the preview prove a row that was clipped.
+    for entry in loti_tui::keymap::help(true) {
         assert!(
-            lines.iter().any(|l| l.contains(what)),
-            "{keys:?} / {what:?} is listed but not on the frame"
+            help.iter()
+                .any(|line| line.contains(entry.keys) && line.contains(entry.description)),
+            "{:?} / {:?} is not on its overlay row: {help:#?}",
+            entry.keys,
+            entry.description
         );
     }
-    // The keys that move between a surface's fields among them.
+    // The emacs vertical motions are taught alongside the arrows that share their
+    // field-line meaning, and the reflex key's inert cases are not hidden.
     assert!(
-        lines.iter().any(|l| l.contains("Tab / Shift-Tab")),
-        "the field keys are not listed: {lines:#?}"
+        help.iter().any(|line| line.contains("Ctrl-P / Ctrl-N")),
+        "the vertical field motions are not listed: {help:#?}"
+    );
+    assert!(
+        help.iter().any(|line| line.contains("else ignored")),
+        "the key list implies Enter always does something: {help:#?}"
+    );
+    // The keys that move between a surface's fields are among them.
+    assert!(
+        help.iter().any(|line| line.contains("Tab / Shift-Tab")),
+        "the field keys are not listed: {help:#?}"
+    );
+    assert!(
+        help.iter().any(|line| line.contains("quit while browsing")),
+        "the key list calls quit available outside browse mode: {help:#?}"
     );
 }
 
@@ -654,6 +698,48 @@ fn the_editing_key_on_a_read_only_store_says_the_stores_own_words_on_the_strip()
 }
 
 #[test]
+fn a_read_only_store_teaches_no_write_binding_in_its_footer_or_key_list() {
+    let (_dir, store) = fixture();
+    assert!(turn_read_only(&store, ReadOnly::MigrationInProgress));
+    let mut app = App::new(store, Theme::with_color(false)).unwrap();
+    let (_t, browsing) = draw(&mut app);
+    for hint in ["e edit", "N new epic"] {
+        assert!(
+            !browsing[23].contains(hint),
+            "the read-only footer teaches {hint:?}: {:?}",
+            browsing[23]
+        );
+    }
+
+    let (before, _) = draw(&mut app);
+    app.apply(Action::ToggleHelp).unwrap();
+    let (after, _) = draw(&mut app);
+    let help = box_lines(&cells(&after), changed_box(&cells(&before), &cells(&after)));
+    for entry in loti_tui::keymap::help(true).filter(|entry| {
+        matches!(
+            entry.keys,
+            "e / N"
+                | "a / d"
+                | "n / S / b"
+                | "s / c / C"
+                | "Ctrl-S"
+                | "Tab / Shift-Tab"
+                | "Ctrl-G"
+                | "Ctrl-A / Ctrl-E"
+        )
+    }) {
+        assert!(
+            !help.iter().any(|line| line.contains(entry.keys)),
+            "the read-only key list teaches {:?}: {help:#?}",
+            entry.keys
+        );
+    }
+    // Browse bindings remain discoverable; filtering writing must not turn the
+    // overlay into an empty warning instead of a key list.
+    assert!(help.iter().any(|line| line.contains("j / k")), "{help:#?}");
+}
+
+#[test]
 fn a_narrow_line_elides_the_breadcrumb_rather_than_the_mode_it_is_in() {
     let (_dir, store) = fixture();
     let mut app = App::new(store, Theme::with_color(false)).unwrap();
@@ -736,6 +822,25 @@ fn the_strip_offers_the_modes_own_keys_and_not_the_levels() {
     assert!(lines[23].contains("? keys"), "{:?}", lines[23]);
     assert!(!lines[23].contains("q quit"), "{:?}", lines[23]);
     assert!(!lines[23].contains("j/k move"), "{:?}", lines[23]);
+}
+
+#[test]
+fn a_refused_quit_leaves_its_notice_visible_below_the_key_list() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store, Theme::with_color(false)).unwrap();
+    app.apply(Action::EnterEditing).unwrap();
+    app.apply(Action::ToggleHelp).unwrap();
+    assert!(
+        !app.apply(Action::Quit).unwrap(),
+        "editing mode let quit through"
+    );
+    let (_t, lines) = draw(&mut app);
+
+    // The overlay is deliberately two rows shorter than the terminal so the
+    // refusal's only channel stays visible below every key-list row.
+    assert!(lines[23].contains("not an editing action"), "{lines:#?}");
+    assert!(lines[23].contains("Esc to leave"), "{lines:#?}");
+    assert!(lines[0].contains("EDITING"), "{lines:#?}");
 }
 
 #[test]
@@ -1895,6 +2000,12 @@ fn a_blocker_surface_takes_a_reference_and_the_notice_names_what_the_store_recor
     // the reference typed into it.
     assert!(float[0].contains("new blocker on browser/1"), "{float:#?}");
     assert!(float[1].contains("blocker reference"), "{float:#?}");
+    // The short form is accepted but not self-evident from a reference label, so
+    // the surface names both forms before a reader has to recover from a refusal.
+    assert!(
+        float[1].contains("number or epic/number"),
+        "the reference shorthand is not taught: {float:#?}"
+    );
     assert!(float[1].contains('3'), "{float:#?}");
 
     app.apply(Action::Accept).unwrap();
