@@ -957,7 +957,16 @@ fn list_epics<O: Write>(
     if !selected.is_empty() {
         render::validate_list_fields(&selected, render::LISTABLE_EPIC_FIELDS)?;
     }
-    let epics = read::list_epics(store)?;
+    // The command-line roster has no row for a recoverable read failure, unlike
+    // the browser. Preserve its all-or-nothing output contract by surfacing the
+    // first unreadable epic after the core has completed the roster read.
+    let epics: Vec<_> = read::list_epics(store)?
+        .into_iter()
+        .map(|entry| match entry {
+            read::RosterEntry::Readable(epic) => Ok(epic),
+            read::RosterEntry::Unreadable { failure, .. } => Err(failure),
+        })
+        .collect::<std::result::Result<_, _>>()?;
     let text = if format.json {
         render::list_epics_json(&epics)
     } else if format.ndjson {

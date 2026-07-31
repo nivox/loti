@@ -412,22 +412,33 @@ pub fn rows(store: &Store, level: &Level) -> Result<Vec<Row>> {
     match level {
         Level::Epics => {
             let mut out = Vec::new();
-            for epic in read::list_epics(store)? {
-                // An epic's children are its top-level tickets, not every node
-                // in the epic: the count must describe what descending reveals.
-                let children = read::epic_children(store, &epic.id)?.len();
-                out.push(Row {
-                    selection: Selection::Epic(epic.id.clone()),
-                    kind: RowKind::Work {
-                        status: epic.status,
-                        // An epic carries no claim at all — a claim is taken on a
-                        // unit of work — so the roster never marks a row.
-                        claimed_by: None,
-                    },
-                    label: epic.id,
-                    name: epic.name,
-                    children,
-                });
+            for entry in read::list_epics(store)? {
+                match entry {
+                    read::RosterEntry::Readable(epic) => {
+                        // An epic's children are its top-level tickets, not every node
+                        // in the epic: the count must describe what descending reveals.
+                        let children = read::epic_children(store, &epic.id)?.len();
+                        out.push(Row {
+                            selection: Selection::Epic(epic.id.clone()),
+                            kind: RowKind::Work {
+                                status: epic.status,
+                                // An epic carries no claim at all — a claim is taken on a
+                                // unit of work — so the roster never marks a row.
+                                claimed_by: None,
+                            },
+                            label: epic.id,
+                            name: epic.name,
+                            children,
+                        });
+                    }
+                    // The core roster has already distinguished this one epic's
+                    // failure from failure to list the roster itself. Keep its id
+                    // as the selection so the reader can see where corruption is.
+                    read::RosterEntry::Unreadable { id, failure } => {
+                        let selection = Selection::Epic(id.clone());
+                        out.push(unreadable(selection, id, &failure));
+                    }
+                }
             }
             Ok(out)
         }

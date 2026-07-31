@@ -2802,6 +2802,57 @@ fn a_level_opens_on_an_asset_whose_bytes_are_gone_and_the_row_says_so() {
 }
 
 #[test]
+fn the_roster_opens_with_a_bad_epic_and_marks_its_row_unreadable() {
+    let (_dir, store) = fixture();
+    ops::create_epic(
+        &store,
+        NewEpic {
+            epic_id: "damaged".into(),
+            name: "Damaged effort".into(),
+            summary: "Its file cannot be read".into(),
+            labels: vec![],
+            body: String::new(),
+        },
+    )
+    .unwrap();
+    // Reached behind the operation layer on purpose: normal writes never leave
+    // an epic directory with an unreadable document, but that directory is still
+    // part of the roster and must not stop the browser reaching its neighbour.
+    std::fs::write(store.epic_path("damaged"), "not a store file").unwrap();
+
+    let mut app = App::new(store, Theme::with_color(false))
+        .expect("one damaged epic must not stop the roster opening");
+    let width = nav_pane_width(&app);
+    let (terminal, lines) = draw(&mut app);
+    assert_eq!(lines[0].trim(), "epics");
+    let rows = nav_lines(&terminal, width);
+    let row = |needle: &str| {
+        rows.iter()
+            .find(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} is not on the roster: {rows:#?}"))
+    };
+
+    // The fixture epic is readable beside the broken one, so a roster that
+    // returned early or converted every row to a failure cannot satisfy this.
+    assert!(
+        row("browser").contains("The browser"),
+        "{:?}",
+        row("browser")
+    );
+    assert!(
+        !row("browser").contains("unreadable"),
+        "{:?}",
+        row("browser")
+    );
+    // Colour is off, so the row itself must say that its epic could not be read.
+    assert!(
+        row("damaged").contains("unreadable"),
+        "{:?}",
+        row("damaged")
+    );
+}
+
+#[test]
 fn a_level_opens_on_an_unparseable_blocker_and_says_it_cannot_be_removed() {
     let (_dir, store) = fixture();
     let blocked = NodeRef::new("browser", 1);

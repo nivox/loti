@@ -17,7 +17,7 @@ use crate::filter::{RegexMatcher, StructuredFilters};
 use crate::matcher::{self, MatchWarning, MatcherError, MatcherRegistry, ResolvedMatcher};
 use crate::ops::{descendants_of, list_comments, load_epic_nodes, CommentView, OpError, Target};
 use crate::render::{ChildRow, CommentLine, ListEpic, ListNode};
-use crate::store::{Store, EPIC_FILE};
+use crate::store::{Store, StoreError, EPIC_FILE};
 use crate::{model::NodeFile, render};
 
 /// The canonical JSON value of a node, ready for `show --json`/`--raw`/field
@@ -72,23 +72,50 @@ pub fn comment_lines(
     Ok(views.into_iter().map(comment_line).collect())
 }
 
+/// One epic in the flat roster. Reading one listed epic can fail without making
+/// the other epics disappear, while a failure to enumerate the roster remains a
+/// failure of the whole read.
+#[derive(Debug)]
+pub enum RosterEntry {
+    /// An epic whose summary and node state could be read.
+    Readable(ListEpic),
+    /// An epic directory the roster found but whose own contents could not be
+    /// read. The id remains usable by a caller that can report the corruption.
+    Unreadable {
+        /// The directory id the roster found.
+        id: String,
+        /// The failure from reading this epic alone.
+        failure: OpError,
+    },
+}
+
 /// The flat roster of every epic under the data root, in id order, for
 /// `epic list`.
-pub fn list_epics(store: &Store) -> Result<Vec<ListEpic>, OpError> {
+///
+/// A failure to enumerate the root is returned as an error because there is no
+/// roster to show. Once an id has been enumerated, its own failure stays beside
+/// that id so a caller can show the readable epics and name the damaged one.
+pub fn list_epics(store: &Store) -> Result<Vec<RosterEntry>, OpError> {
     let mut ids = epic_ids(store)?;
     ids.sort();
     let mut out = Vec::new();
     for id in ids {
-        let epic = read_epic(store, &id)?;
-        let statuses = node_statuses(store, &id)?;
-        out.push(ListEpic {
-            id: epic.frontmatter.id.clone(),
-            name: epic.frontmatter.name.clone(),
-            status: epic_status(epic.frontmatter.closed, &statuses)
-                .wire_name()
-                .to_string(),
-            labels: epic.frontmatter.labels.clone(),
-            nodes: statuses.len(),
+        let entry = (|| {
+            let epic = read_epic(store, &id)?;
+            let statuses = node_statuses(store, &id)?;
+            Ok(ListEpic {
+                id: epic.frontmatter.id.clone(),
+                name: epic.frontmatter.name.clone(),
+                status: epic_status(epic.frontmatter.closed, &statuses)
+                    .wire_name()
+                    .to_string(),
+                labels: epic.frontmatter.labels.clone(),
+                nodes: statuses.len(),
+            })
+        })();
+        out.push(match entry {
+            Ok(epic) => RosterEntry::Readable(epic),
+            Err(failure) => RosterEntry::Unreadable { id, failure },
         });
     }
     Ok(out)
@@ -376,14 +403,21 @@ fn node_statuses(store: &Store, epic_id: &str) -> Result<Vec<NodeStatus>, OpErro
 
 /// The ids of every epic directory under the data root: a directory that holds
 /// an `epic.md`. The epic's own asset directory and any stray files are skipped.
+///
+/// Enumerating this directory is the one roster-wide read. It must not turn an
+/// unreadable root or entry into an empty roster: no per-epic row exists until
+/// an id has been found.
 fn epic_ids(store: &Store) -> Result<Vec<String>, OpError> {
     let mut ids = Vec::new();
-    let entries = match std::fs::read_dir(store.root()) {
-        Ok(e) => e,
-        // No root directory yet: no epics.
-        Err(_) => return Ok(ids),
-    };
-    for entry in entries.flatten() {
+    let entries = std::fs::read_dir(store.root()).map_err(|source| StoreError::Io {
+        path: store.root().to_path_buf(),
+        source,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| StoreError::Io {
+            path: store.root().to_path_buf(),
+            source,
+        })?;
         let path = entry.path();
         if !path.is_dir() {
             continue;
@@ -566,10 +600,58 @@ mod tests {
         let roster = list_epics(&s).unwrap();
         assert_eq!(roster.len(), 2);
         // Sorted by id.
-        assert_eq!(roster[0].id, "a-epic");
-        assert_eq!(roster[0].nodes, 1);
-        assert_eq!(roster[1].id, "z-epic");
-        assert_eq!(roster[1].nodes, 0);
+        let RosterEntry::Readable(a_epic) = &roster[0] else {
+            panic!("a readable epic became an unreadable roster entry")
+        };
+        assert_eq!(a_epic.id, "a-epic");
+        assert_eq!(a_epic.nodes, 1);
+        let RosterEntry::Readable(z_epic) = &roster[1] else {
+            panic!("a readable epic became an unreadable roster entry")
+        };
+        assert_eq!(z_epic.id, "z-epic");
+        assert_eq!(z_epic.nodes, 0);
+    }
+
+    #[test]
+    fn roster_keeps_a_bad_epic_beside_the_epics_it_can_read() {
+        let (_d, s) = seeded();
+        create_epic(&s, new_epic("a-good")).unwrap();
+        create_epic(&s, new_epic("bad")).unwrap();
+        create_epic(&s, new_epic("z-good")).unwrap();
+        // Reached behind the store on purpose: a normal write never leaves an
+        // indexed epic whose document cannot be parsed, but the roster still has
+        // to identify that directory and list its intact neighbours.
+        std::fs::write(s.epic_path("bad"), "not a store file").unwrap();
+
+        let roster = list_epics(&s).expect("the epic root can still be listed");
+        assert_eq!(roster.len(), 3);
+        let ids: Vec<&str> = roster
+            .iter()
+            .map(|entry| match entry {
+                RosterEntry::Readable(epic) => epic.id.as_str(),
+                RosterEntry::Unreadable { id, .. } => id,
+            })
+            .collect();
+        assert_eq!(ids, ["a-good", "bad", "z-good"]);
+        let RosterEntry::Unreadable { id, failure } = &roster[1] else {
+            panic!("the corrupt epic was not preserved as its own roster entry")
+        };
+        assert_eq!(id, "bad");
+        assert!(
+            failure.to_string().contains("frontmatter delimiter"),
+            "the bad epic lost its own read failure: {failure}"
+        );
+    }
+
+    #[test]
+    fn roster_failure_is_not_hidden_as_an_empty_roster() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("not-a-store-directory");
+        std::fs::write(&root, "not a directory").unwrap();
+
+        let failure = list_epics(&fast_store(&root))
+            .expect_err("a root that cannot be listed must not look empty");
+        assert!(matches!(failure, OpError::Store(StoreError::Io { path, .. }) if path == root));
     }
 
     #[test]

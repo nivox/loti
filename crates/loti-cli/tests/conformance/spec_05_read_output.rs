@@ -17,6 +17,32 @@
 use super::harness::{contains_ansi, Store};
 
 #[test]
+fn epic_list_refuses_a_corrupt_roster_without_rendering_a_partial_roster() {
+    let s = Store::new();
+    s.epic("a-readable");
+    let corrupt_id = "z-corrupt";
+    let corrupt_epic = s.store_path(&format!("{corrupt_id}/epic.md"));
+    std::fs::create_dir_all(corrupt_epic.parent().unwrap()).expect("create corrupt epic directory");
+    std::fs::write(&corrupt_epic, "not a store file").expect("write malformed epic");
+
+    let out = s.cmd(&["epic", "list"]).output().expect("spawn loti");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "epic list must fail for a corrupt epic\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "a failed roster must not render the readable epic: {stdout}"
+    );
+    assert_eq!(
+        stderr, "loti: file does not start with a '---' frontmatter delimiter\n",
+        "the malformed epic's parse failure is surfaced"
+    );
+}
+
+#[test]
 fn show_json_is_canonical_with_all_fields() {
     let s = Store::new();
     s.epic("e");
