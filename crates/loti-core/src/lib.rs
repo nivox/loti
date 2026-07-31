@@ -16,6 +16,7 @@ pub mod discovery;
 pub mod domain;
 pub mod filter;
 pub mod frontmatter;
+pub mod launch;
 pub mod lock;
 pub mod matcher;
 pub mod meta;
