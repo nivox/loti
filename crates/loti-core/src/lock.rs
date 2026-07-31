@@ -210,6 +210,23 @@ impl TempLock {
             source,
         })
     }
+
+    /// Finish the lock by deleting the target instead of publishing bytes onto
+    /// it — the delete twin of [`TempLock::commit`], for a mutation that
+    /// removes rather than replaces. The target is unlinked while the lock is
+    /// still held, so no removal can land while another operation holds this
+    /// same lock mid-publish; the lock's own temp file is then cleaned up
+    /// regardless of whether the target removal succeeded, so a target that
+    /// was already gone reports its error without leaving the lock behind.
+    pub fn remove_target(mut self) -> Result<(), LockError> {
+        self.active = false;
+        let result = fs::remove_file(&self.target).map_err(|source| LockError::Io {
+            path: self.target.clone(),
+            source,
+        });
+        let _ = fs::remove_file(&self.temp);
+        result
+    }
 }
 
 impl Drop for TempLock {
@@ -745,6 +762,29 @@ mod tests {
         let lock = acquire(&target, &fast_config(), Force::Deny).unwrap();
         lock.commit(b"published").unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"published");
+        assert!(!temp_path(&target).unwrap().exists());
+    }
+
+    #[test]
+    fn remove_target_deletes_the_target_and_releases_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.bin");
+        fs::write(&target, b"payload").unwrap();
+        let lock = acquire(&target, &fast_config(), Force::Deny).unwrap();
+        lock.remove_target().unwrap();
+        assert!(!target.exists());
+        assert!(!temp_path(&target).unwrap().exists());
+    }
+
+    #[test]
+    fn remove_target_still_releases_the_lock_when_the_target_is_already_gone() {
+        // The target vanishing between acquire and remove (another actor
+        // cleaned it up already, or it never existed) reports the removal
+        // error but must not leave the lock behind for a retry to trip over.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.bin");
+        let lock = acquire(&target, &fast_config(), Force::Deny).unwrap();
+        assert!(matches!(lock.remove_target(), Err(LockError::Io { .. })));
         assert!(!temp_path(&target).unwrap().exists());
     }
 

@@ -452,6 +452,20 @@ impl Store {
         Ok(())
     }
 
+    /// The delete twin of [`Store::atomic_write`]: acquire the lock on `path`,
+    /// verify the store's version gate while it is held, then remove the file
+    /// instead of publishing onto it. A stale lock is never forced past here —
+    /// asset removal carries no `--force` surface, and a stale temp file on an
+    /// asset path most often means another operation is mid-publish on the very
+    /// bytes being removed, which is exactly the race this bracketing closes.
+    fn atomic_remove(&self, path: &Path) -> Result<(), StoreError> {
+        let gate = self.version_gate();
+        let lock = lock::acquire(path, &self.lock_config, Force::Deny)?;
+        gate.verify()?;
+        lock.remove_target()?;
+        Ok(())
+    }
+
     /// Create a new node in an epic, allocating its number from the epic's flat
     /// monotonic pool, and return the written [`NodeFile`] (its `number` field
     /// filled in with the allocated value).
@@ -624,20 +638,24 @@ impl Store {
         Ok(path)
     }
 
-    /// Hard-remove an epic asset's bytes. Missing is reported so a caller can
-    /// keep the index consistent. Index upkeep is the caller's.
+    /// Hard-remove an epic asset's bytes, under the same advisory lock and
+    /// version gate as every other mutation here: a store this binary must not
+    /// write refuses before any byte is removed, and the removal cannot land
+    /// while another operation holds the lock on the same path mid-publish.
+    /// Missing is reported so a caller can keep the index consistent. Index
+    /// upkeep is the caller's.
     pub fn remove_epic_asset(&self, epic_id: &str, name: &str) -> Result<(), StoreError> {
-        remove_file(&self.epic_asset_dir(epic_id).join(name))
+        self.atomic_remove(&self.epic_asset_dir(epic_id).join(name))
     }
 
-    /// Hard-remove a node asset's bytes.
+    /// Hard-remove a node asset's bytes, with the same bracketing.
     pub fn remove_node_asset(
         &self,
         epic_id: &str,
         number: u64,
         name: &str,
     ) -> Result<(), StoreError> {
-        remove_file(&self.node_asset_dir(epic_id, number).join(name))
+        self.atomic_remove(&self.node_asset_dir(epic_id, number).join(name))
     }
 
     /// Read an epic asset's bytes verbatim. The index is the source of truth for
@@ -830,13 +848,6 @@ fn create_dir_all(path: &Path) -> Result<(), StoreError> {
     })
 }
 
-fn remove_file(path: &Path) -> Result<(), StoreError> {
-    std::fs::remove_file(path).map_err(|source| StoreError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
 fn read_bytes(path: &Path) -> Result<Vec<u8>, StoreError> {
     std::fs::read(path).map_err(|source| StoreError::Io {
         path: path.to_path_buf(),
@@ -937,6 +948,88 @@ mod tests {
         assert_eq!(std::fs::read(&written).unwrap(), vec![0u8, 1, 2, 3]);
         store.remove_node_asset("my-epic", 7, "proof.bin").unwrap();
         assert!(!written.exists());
+    }
+
+    #[test]
+    fn remove_epic_asset_refuses_on_a_read_only_store_without_removing_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fast_store(dir.path());
+        let (major, minor) = FORMAT_VERSION;
+        if major == 0 {
+            // No lower major exists to record; unreachable with a major-0
+            // binary, as with the other version-matrix tests in this module.
+            return;
+        }
+        let path = store
+            .copy_epic_asset("my-epic", "a.bin", b"payload")
+            .unwrap();
+        meta::write(
+            dir.path(),
+            &Meta {
+                format_version: format!("{}.{minor}", major - 1),
+            },
+        )
+        .unwrap();
+
+        // An older major is read-only until migrated: removal refuses exactly
+        // as any other mutation would, and no byte moves before it does.
+        assert!(matches!(
+            store.remove_epic_asset("my-epic", "a.bin"),
+            Err(StoreError::Version(VersionRefusal::NeedsMigration))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn remove_node_asset_refuses_mid_migration_without_removing_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fast_store(dir.path());
+        let (major, minor) = FORMAT_VERSION;
+        let path = store
+            .copy_node_asset("my-epic", 7, "a.bin", b"payload")
+            .unwrap();
+        meta::write(
+            dir.path(),
+            &Meta {
+                format_version: format!("{major}.{minor}-migrate"),
+            },
+        )
+        .unwrap();
+
+        // The mid-migration sentinel refuses every mutation but the migrator's,
+        // removal included, before any byte is touched.
+        assert!(matches!(
+            store.remove_node_asset("my-epic", 7, "a.bin"),
+            Err(StoreError::Version(VersionRefusal::MigrationInProgress))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn remove_epic_asset_cannot_land_while_another_operation_holds_the_lock() {
+        // The live race the bracketing closes: an unlink must not land while
+        // another operation holds the lock on the very asset path being
+        // removed, as it would mid-publish.
+        let dir = tempfile::tempdir().unwrap();
+        let store = fast_store(dir.path());
+        let path = store
+            .copy_epic_asset("my-epic", "a.bin", b"payload")
+            .unwrap();
+
+        let held = lock::acquire(&path, &LockConfig::default(), Force::Deny).unwrap();
+
+        assert!(matches!(
+            store.remove_epic_asset("my-epic", "a.bin"),
+            Err(StoreError::Lock(_))
+        ));
+        assert!(
+            path.is_file(),
+            "the bytes are untouched while the lock is held"
+        );
+
+        drop(held);
+        store.remove_epic_asset("my-epic", "a.bin").unwrap();
+        assert!(!path.is_file());
     }
 
     // -- the bracketed read-modify-write ------------------------------------
