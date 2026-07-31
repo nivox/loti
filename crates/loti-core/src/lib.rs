@@ -24,6 +24,7 @@ pub mod model;
 pub mod ops;
 pub mod read;
 pub mod render;
+pub mod resource;
 pub mod store;
 
 /// Store `format-version` as `(major, minor)`. Written by `loti init` into

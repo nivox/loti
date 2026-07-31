@@ -32,6 +32,9 @@ use serde::Deserialize;
 
 use crate::filter::BUILTIN_MATCHER_NAME;
 
+#[cfg(test)]
+pub(crate) static XDG_CONFIG_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The `<QUERY>` placeholder, replaced by exactly one argument.
 const QUERY_PLACEHOLDER: &str = "<QUERY>";
 
@@ -341,21 +344,23 @@ fn read_match_impls(path: &Path) -> BTreeMap<String, MatcherConfig> {
 /// The conventional user-global config path under the XDG config home, if it can
 /// be determined. Honours `XDG_CONFIG_HOME`, falling back to `~/.config`.
 pub fn user_global_config_path() -> Option<PathBuf> {
+    Some(xdg_config_home()?.join("loti").join("config.toml"))
+}
+
+/// The XDG config home directory, if it can be determined: `$XDG_CONFIG_HOME`
+/// when set and non-empty, else `~/.config` from `$HOME`. Shared by every
+/// user-global path loti derives from it, so they cannot disagree on the base.
+pub(crate) fn xdg_config_home() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
         if !xdg.is_empty() {
-            return Some(PathBuf::from(xdg).join("loti").join("config.toml"));
+            return Some(PathBuf::from(xdg));
         }
     }
     let home = std::env::var_os("HOME")?;
     if home.is_empty() {
         return None;
     }
-    Some(
-        PathBuf::from(home)
-            .join(".config")
-            .join("loti")
-            .join("config.toml"),
-    )
+    Some(PathBuf::from(home).join(".config"))
 }
 
 #[cfg(test)]
@@ -499,13 +504,16 @@ mod tests {
 
     #[test]
     fn xdg_config_path_honours_env() {
-        // This test mutates process env; it is fine in the single-threaded test
-        // harness context and restores nothing because each read is independent.
+        let _env = XDG_CONFIG_HOME_LOCK.lock().unwrap();
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("XDG_CONFIG_HOME", dir.path());
         let path = user_global_config_path().unwrap();
+        match previous {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
         assert_eq!(path, dir.path().join("loti").join("config.toml"));
-        std::env::remove_var("XDG_CONFIG_HOME");
     }
 
     // -- external matcher process protocol (hermetic, via a fake matcher) ---

@@ -170,17 +170,24 @@ fn read_config_root(config_path: &Path) -> Result<PathBuf, DiscoveryError> {
             path: config_path.to_path_buf(),
         })?;
 
-    let root = PathBuf::from(&raw);
-    let resolved = if root.is_absolute() {
-        root
+    Ok(resolve_relative_to_config(config_path, &raw))
+}
+
+/// Resolve a config-file string value against the config file's own directory:
+/// an absolute value is taken as-is, a relative one is anchored at the config
+/// file's parent directory. No shell expansion is performed. Shared by every
+/// config key that names a path this way (`loti-root`, and the agent/workflow
+/// resource roots), so they cannot disagree on what "relative" means.
+pub(crate) fn resolve_relative_to_config(config_path: &Path, raw: &str) -> PathBuf {
+    let value = PathBuf::from(raw);
+    if value.is_absolute() {
+        value
     } else {
-        // A relative root is anchored at the config file's own directory.
         config_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
-            .join(root)
-    };
-    Ok(resolved)
+            .join(value)
+    }
 }
 
 #[cfg(test)]
