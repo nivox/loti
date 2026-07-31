@@ -32,6 +32,18 @@ pub enum ModelError {
     /// The frontmatter YAML did not match the expected shape.
     #[error("frontmatter is not valid YAML: {0}")]
     Yaml(#[from] serde_yaml::Error),
+    /// A node's frontmatter parsed structurally but its claim holder is empty,
+    /// which no wire shape rules out on its own — `take_claim` refuses one
+    /// before it ever reaches a file, but a hand-edited store bypasses that
+    /// gate entirely. Checked after the frontmatter parses so the message can
+    /// name the node the empty holder was found on.
+    #[error("node {number} ({name}) is malformed: claim holder must not be empty")]
+    EmptyClaimHolder {
+        /// The node's number, for a message that names what failed to parse.
+        number: u64,
+        /// The node's name, for a message that names what failed to parse.
+        name: String,
+    },
 }
 
 /// One entry in a file's assets index. The bytes live in the companion
@@ -214,6 +226,18 @@ impl NodeFile {
     pub fn parse(text: &str) -> Result<Self, ModelError> {
         let split = frontmatter::split(text)?;
         let frontmatter: NodeFrontmatter = serde_yaml::from_str(&split.frontmatter)?;
+        // A hand-edited store can hold a claim with an empty holder even though
+        // nothing on the write surface can produce one; refuse it here, where a
+        // claim enters the process by any route, not only where writing leaves
+        // it.
+        if let Some(claim) = &frontmatter.claim {
+            if claim.by.is_empty() {
+                return Err(ModelError::EmptyClaimHolder {
+                    number: frontmatter.number,
+                    name: frontmatter.name,
+                });
+            }
+        }
         Ok(Self {
             frontmatter,
             body: split.body,
@@ -453,6 +477,33 @@ mod tests {
         .to_text()
         .unwrap();
         assert!(!out.contains("claim:"));
+    }
+
+    #[test]
+    fn parsing_a_node_with_an_empty_claim_holder_is_refused() {
+        // The never-empty rule is documented on `Claim::by` and enforced by
+        // `take_claim`, but nothing stops a hand-edited store from holding an
+        // empty one; parsing must refuse it rather than silently accepting a
+        // claim with nobody to name.
+        let text = "---\n\
+             number: 3\n\
+             name: three\n\
+             summary: s\n\
+             status: to-do\n\
+             claim:\n  by: \"\"\n  at: 2024-01-02T03:04:05Z\n\
+             created: 2024-01-01T00:00:00Z\n\
+             updated: 2024-01-01T00:00:00Z\n\
+             ---\n";
+        let err = NodeFile::parse(text).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("claim holder"),
+            "expected the error to name the claim holder, got: {message}"
+        );
+        assert!(
+            message.contains('3') && message.contains("three"),
+            "expected the error to name the malformed entity, got: {message}"
+        );
     }
 
     #[test]

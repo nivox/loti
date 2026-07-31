@@ -1777,8 +1777,9 @@ fn delete_comment(store: &Store, selection: &Selection) -> Result<(), Refusal> {
 ///
 /// The holder is freeform text and has nothing to do with attribution: it says
 /// who is on the work, not who wrote the change, so nothing about the writer's
-/// identity reaches this and the text is written exactly as it was typed —
-/// whether a given string is a holder the store will take is the store's rule.
+/// identity reaches this. The store trims the holder and refuses one that trims
+/// to nothing; beyond that, whether a given string is a holder the store will
+/// take is the store's rule.
 ///
 /// When the claim was taken is the store's to maintain and is never passed, so
 /// no clock outside the store can disagree with the instant it recorded.
