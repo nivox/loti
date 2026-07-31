@@ -2802,6 +2802,47 @@ fn a_level_opens_on_an_asset_whose_bytes_are_gone_and_the_row_says_so() {
 }
 
 #[test]
+fn a_level_opens_on_an_unparseable_blocker_and_says_it_cannot_be_removed() {
+    let (_dir, store) = fixture();
+    let blocked = NodeRef::new("browser", 1);
+    let entry = "bad".to_string();
+    // Reached behind the operation layer on purpose: a normal blocker write
+    // validates its reference, but a browser still has to show damaged text
+    // without turning it into a raw removal target.
+    let mut node = ops::read_node(&store, &blocked).unwrap();
+    node.frontmatter.blocked_by = vec![entry.clone()];
+    store
+        .write_node(&blocked.epic_id, blocked.number, &node)
+        .unwrap();
+
+    let mut app = App::new(store, Theme::with_color(false)).unwrap();
+    to_the_blocked_by_row(&mut app);
+    app.apply(Action::Descend).unwrap();
+    app.apply(Action::EnterEditing).unwrap();
+    let width = nav_pane_width(&app);
+    let (terminal, lines) = draw(&mut app);
+
+    assert!(
+        lines[0]
+            .trim()
+            .starts_with("epics › browser › 1 Navigation pane › blocked-by"),
+        "{:?}",
+        lines[0]
+    );
+    // Bound this to the navigation pane: the preview repeats the node's stored
+    // metadata, but the member row is what tells the reader the raw text is bad.
+    let rows = nav_lines(&terminal, width);
+    let row = rows
+        .iter()
+        .find(|line| line.contains(&entry))
+        .unwrap_or_else(|| panic!("{entry:?} is not on the level: {rows:#?}"));
+    assert!(row.contains("cannot be removed"), "{row:?}");
+    // The browser plainly says why it cannot offer removal, and never teaches the
+    // destructive key on a row that has no parsed reference to remove by.
+    assert!(!lines[23].contains("d remove"), "{:?}", lines[23]);
+}
+
+#[test]
 fn the_assets_row_teaches_no_letter_and_names_the_command_that_attaches_one() {
     let (_dir, store) = fixture();
     let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();

@@ -1089,7 +1089,8 @@ fn node_noun(parent: &Selection) -> &'static str {
         | Selection::Label(..)
         | Selection::Comment(..)
         | Selection::Asset(..)
-        | Selection::Blocker(..) => "ticket",
+        | Selection::Blocker(..)
+        | Selection::UnremovableBlocker(..) => "ticket",
     }
 }
 

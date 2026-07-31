@@ -124,6 +124,10 @@ pub enum Selection {
     /// node blocking it. Both travel, because the entry belongs to the first and
     /// the document belongs to the second.
     Blocker(Container, NodeRef),
+    /// A dependency entry the store holds as text but which cannot address a
+    /// node. It remains visible, but cannot become a removal target because
+    /// removal requires a parsed reference.
+    UnremovableBlocker(Container, String),
 }
 
 impl Selection {
@@ -131,9 +135,9 @@ impl Selection {
     /// epic or a node, and otherwise the container plus the member's own id or
     /// name, which is how the CLI addresses a member too.
     ///
-    /// A collection and a label name their container, because the container's
-    /// document is what the preview shows for them; a blocker names the node it
-    /// points at, for the same reason.
+    /// A collection, label and unremovable blocker name their container, because
+    /// the container's document is what the preview shows for them; a blocker
+    /// names the node it points at, for the same reason.
     pub fn reference(&self) -> String {
         match self {
             Selection::Epic(id) => id.clone(),
@@ -141,6 +145,9 @@ impl Selection {
             Selection::Collection(c, _) | Selection::Label(c, _) => c.selection().reference(),
             Selection::Comment(c, id) => format!("{} comment {id}", c.selection().reference()),
             Selection::Asset(c, name) => format!("{} asset {name}", c.selection().reference()),
+            Selection::UnremovableBlocker(c, entry) => {
+                format!("{} blocker {entry}", c.selection().reference())
+            }
         }
     }
 
@@ -155,22 +162,25 @@ impl Selection {
             Selection::Label(..)
             | Selection::Comment(..)
             | Selection::Asset(..)
-            | Selection::Blocker(..) => None,
+            | Selection::Blocker(..)
+            | Selection::UnremovableBlocker(..) => None,
         }
     }
 
     /// The document identity this selection previews: the one value that decides
     /// whether two rows show the same content.
     ///
-    /// A collection row and a label row carry no document of their own — the
-    /// preview shows their container's — so both normalise to the container's own
-    /// selection here; every other selection already names the document it shows,
-    /// so it is returned unchanged. [`preview`] and the reader's scroll position
-    /// both decide "same document" through this one function, so they cannot come
-    /// to disagree about it.
+    /// A collection, label or unremovable blocker row carries no document of its
+    /// own — the preview shows its container's — so each normalises to the
+    /// container's own selection here; every other selection already names the
+    /// document it shows, so it is returned unchanged. [`preview`] and the
+    /// reader's scroll position both decide "same document" through this one
+    /// function, so they cannot come to disagree about it.
     pub fn document(&self) -> Selection {
         match self {
-            Selection::Collection(c, _) | Selection::Label(c, _) => c.selection(),
+            Selection::Collection(c, _)
+            | Selection::Label(c, _)
+            | Selection::UnremovableBlocker(c, _) => c.selection(),
             other => other.clone(),
         }
     }
@@ -216,8 +226,9 @@ pub enum RowKind {
     /// crate. It offers nothing whoever wrote it: there is no text to rewrite,
     /// and withdrawing twice means nothing.
     Withdrawn,
-    /// A member the store lists but whose own data could not be read: an asset
-    /// whose bytes are gone, a blocker naming a ticket that is not there.
+    /// A member the store cannot fully use: an asset whose bytes are gone, a
+    /// blocker naming a ticket that is not there, or blocker text that is not a
+    /// reference.
     ///
     /// The row stands where the member does, because a store the reader cannot
     /// fully read is exactly when a browser is most useful: the corruption is
@@ -264,7 +275,8 @@ impl Row {
             Selection::Label(..)
             | Selection::Comment(..)
             | Selection::Asset(..)
-            | Selection::Blocker(..) => false,
+            | Selection::Blocker(..)
+            | Selection::UnremovableBlocker(..) => false,
         }
     }
 }
@@ -556,7 +568,18 @@ fn member_rows(store: &Store, container: &Container, kind: Collection) -> Result
                 return Ok(out);
             };
             for reference in ops::list_blocked_by(store, node)? {
-                let blocker = NodeRef::parse(&reference)?;
+                let blocker = match NodeRef::parse(&reference) {
+                    Ok(blocker) => blocker,
+                    // No parsed reference means there is no safe operation target.
+                    // Keep the text visible rather than losing the whole level, but
+                    // make the row incapable of reaching a raw removal.
+                    Err(_) => {
+                        let selection =
+                            Selection::UnremovableBlocker(container.clone(), reference.clone());
+                        out.push(unremovable_blocker(selection, reference));
+                        continue;
+                    }
+                };
                 // A blocker may live in another epic, so the row carries the whole
                 // reference rather than the bare number a sibling would.
                 let selection = Selection::Blocker(container.clone(), blocker.clone());
@@ -623,15 +646,17 @@ fn asset_size(store: &Store, container: &Container, name: &str) -> Result<u64> {
         .len())
 }
 
-/// The word a row unreadable for any reason leads with, so one word covers every
-/// corruption a member can carry rather than a reader learning one per kind.
+/// The word an unreadable row with a usable member target leads with, so one
+/// word covers every recoverable read failure rather than a reader learning one
+/// per kind.
 const UNREADABLE: &str = "unreadable";
 
 /// A member the store lists but whose own data could not be read.
 ///
 /// The level still opens and the row still points at the member, so the reader
-/// sees what the store claims to hold and can still act on the entry — a dangling
-/// index entry is a thing to delete, which takes a row to stand on.
+/// sees what the store claims to hold and can still act on an entry its selection
+/// can address — a dangling index entry is a thing to delete, which takes a row
+/// to stand on.
 ///
 /// The reason is the failure's own outermost words, not a browser paraphrase, and
 /// the fixed word leads because a row is read with colour off as often as with it
@@ -643,6 +668,20 @@ fn unreadable(selection: Selection, label: String, failure: &impl std::fmt::Disp
         kind: RowKind::Unreadable,
         label,
         name: format!("{UNREADABLE} · {failure}"),
+        children: 0,
+    }
+}
+
+/// A malformed blocker entry cannot be safely removed: the core operation names
+/// an entry with a parsed reference, and raw text is not one. The short reason
+/// leads because the raw entry is already in the identifier column and a narrow
+/// row must still say what the browser cannot do.
+fn unremovable_blocker(selection: Selection, label: String) -> Row {
+    Row {
+        selection,
+        kind: RowKind::Unreadable,
+        label,
+        name: "cannot be removed".to_string(),
         children: 0,
     }
 }
@@ -856,7 +895,8 @@ impl State {
             | Selection::Label(..)
             | Selection::Comment(..)
             | Selection::Asset(..)
-            | Selection::Blocker(..) => None,
+            | Selection::Blocker(..)
+            | Selection::UnremovableBlocker(..) => None,
         }
     }
 
@@ -949,7 +989,8 @@ pub fn state_target(store: &Store, selection: &Selection) -> Result<StateTarget>
         | Selection::Label(..)
         | Selection::Comment(..)
         | Selection::Asset(..)
-        | Selection::Blocker(..) => {
+        | Selection::Blocker(..)
+        | Selection::UnremovableBlocker(..) => {
             anyhow::bail!("{} has no state of its own", selection.reference())
         }
     };
@@ -996,7 +1037,8 @@ pub fn edit_target(store: &Store, selection: &Selection) -> Result<EditTarget> {
         | Selection::Label(..)
         | Selection::Comment(..)
         | Selection::Asset(..)
-        | Selection::Blocker(..) => {
+        | Selection::Blocker(..)
+        | Selection::UnremovableBlocker(..) => {
             anyhow::bail!(
                 "{} has no name, summary or body of its own",
                 selection.reference()
@@ -1492,7 +1534,8 @@ fn replace(
         | Selection::Label(..)
         | Selection::Comment(..)
         | Selection::Asset(..)
-        | Selection::Blocker(..) => Err(misdirected(format!(
+        | Selection::Blocker(..)
+        | Selection::UnremovableBlocker(..) => Err(misdirected(format!(
             "{} has no {} of its own",
             selection.reference(),
             field.noun()
@@ -1562,7 +1605,8 @@ fn set_state(
         | Selection::Label(..)
         | Selection::Comment(..)
         | Selection::Asset(..)
-        | Selection::Blocker(..) => Err(wrong_state(selection, state)),
+        | Selection::Blocker(..)
+        | Selection::UnremovableBlocker(..) => Err(wrong_state(selection, state)),
     }
 }
 
@@ -1941,10 +1985,10 @@ pub fn preview(store: &Store, selection: &Selection) -> Result<String> {
             read::node_children(store, &r)?,
             read::comment_lines(store, &Target::Node(r), false)?,
         ),
-        // `document()` never produces these two: both normalise away to their
-        // container's selection above, so this arm exists only for exhaustiveness.
-        Selection::Collection(..) | Selection::Label(..) => {
-            unreachable!("document() normalises collections and labels to their container")
+        // `document()` never produces these selections: all normalise away to
+        // their container's selection above, so this arm exists only for exhaustiveness.
+        Selection::Collection(..) | Selection::Label(..) | Selection::UnremovableBlocker(..) => {
+            unreachable!("document() normalises container-owned rows to their container")
         }
         Selection::Comment(container, id) => return comment_document(store, &container, id),
         Selection::Asset(container, name) => return asset_document(store, &container, &name),
@@ -2427,6 +2471,21 @@ pub(crate) mod fixture {
         /// richer fixture cannot turn a removal test into a false promise.
         pub(crate) fn node_blockers(&self) -> Vec<String> {
             ops::list_blocked_by(&self.store, &self.node).unwrap()
+        }
+
+        /// Replace the dependency list with text no node reference can parse.
+        ///
+        /// This bypasses the operation layer deliberately: it creates a damaged
+        /// store the normal writer rejects, which is the only store that can prove
+        /// the browser shows the entry without inventing a raw removal operation.
+        pub(crate) fn replace_blockers_with_unparseable_entry(&self) -> String {
+            let entry = "not-a-reference".to_string();
+            let mut node = ops::read_node(&self.store, &self.node).unwrap();
+            node.frontmatter.blocked_by = vec![entry.clone()];
+            self.store
+                .write_node(&self.node.epic_id, self.node.number, &node)
+                .unwrap();
+            entry
         }
 
         /// The ticket under test in the two forms a reader may type its reference
@@ -3266,6 +3325,52 @@ mod tests {
         assert_eq!(
             row.selection,
             Selection::Blocker(container, fx.blocker.clone())
+        );
+    }
+
+    #[test]
+    fn an_unparseable_blocker_is_listed_but_is_not_a_removal_target() {
+        let fx = Fixture::build();
+        let container = Container::Node(fx.node.clone());
+        let entry = fx.replace_blockers_with_unparseable_entry();
+
+        let listed = rows(
+            &fx.store,
+            &Level::Collection(container.clone(), Collection::BlockedBy),
+        )
+        .expect("a malformed dependency must not fail its level");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|row| row.label.clone())
+                .collect::<Vec<_>>(),
+            fx.node_blockers(),
+            "every stored entry stays visible by its exact text"
+        );
+
+        let row = listed
+            .iter()
+            .find(|row| row.label == entry)
+            .expect("the malformed entry has a row");
+        assert_eq!(row.kind, RowKind::Unreadable);
+        assert_eq!(row.name, "cannot be removed");
+        // The raw text is deliberately not a Blocker selection: only that parsed
+        // selection reaches the removal write, so this row cannot mutate by text.
+        assert_eq!(
+            row.selection,
+            Selection::UnremovableBlocker(container, entry.clone())
+        );
+        assert!(!row.enterable(), "a malformed entry is still a leaf");
+
+        let before = fx.node_blockers();
+        assert!(
+            perform(&fx.store, &Write::RemoveBlocker(row.selection.clone())).is_err(),
+            "a malformed entry must not reach a raw removal"
+        );
+        assert_eq!(
+            fx.node_blockers(),
+            before,
+            "a refused removal changed the list"
         );
     }
 

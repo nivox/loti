@@ -246,7 +246,8 @@ fn crumb_for(row: &Row) -> String {
         Selection::Label(..)
         | Selection::Comment(..)
         | Selection::Asset(..)
-        | Selection::Blocker(..) => row.label.clone(),
+        | Selection::Blocker(..)
+        | Selection::UnremovableBlocker(..) => row.label.clone(),
     }
 }
 
