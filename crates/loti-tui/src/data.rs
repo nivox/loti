@@ -158,6 +158,22 @@ impl Selection {
             | Selection::Blocker(..) => None,
         }
     }
+
+    /// The document identity this selection previews: the one value that decides
+    /// whether two rows show the same content.
+    ///
+    /// A collection row and a label row carry no document of their own — the
+    /// preview shows their container's — so both normalise to the container's own
+    /// selection here; every other selection already names the document it shows,
+    /// so it is returned unchanged. [`preview`] and the reader's scroll position
+    /// both decide "same document" through this one function, so they cannot come
+    /// to disagree about it.
+    pub fn document(&self) -> Selection {
+        match self {
+            Selection::Collection(c, _) | Selection::Label(c, _) => c.selection(),
+            other => other.clone(),
+        }
+    }
 }
 
 /// What a row stands for, which is what decides how it reads.
@@ -1873,31 +1889,35 @@ pub fn blocker_name(selection: &Selection, reference: &str) -> String {
 /// `loti ticket show` print, so there is no second document shape to keep in
 /// sync with theirs. A collection and a label have no document of their own, so
 /// the pane keeps the container's and stays useful — the label itself is visible
-/// in that document's own metadata table. A comment and an asset get a document
-/// composed here, because no other surface needs one.
+/// in that document's own metadata table; [`Selection::document`] is what makes
+/// that normalisation, so this reads it back rather than repeating it. A comment
+/// and an asset get a document composed here, because no other surface needs
+/// one.
 pub fn preview(store: &Store, selection: &Selection) -> Result<String> {
-    let (value, children, comments) = match selection {
+    let (value, children, comments) = match selection.document() {
         Selection::Epic(id) => (
-            read::epic_json(store, id)?,
-            read::epic_children(store, id)?,
-            read::comment_lines(store, &Target::Epic(id.clone()), false)?,
+            read::epic_json(store, &id)?,
+            read::epic_children(store, &id)?,
+            read::comment_lines(store, &Target::Epic(id), false)?,
         ),
         Selection::Node(r) => (
-            read::node_json(store, r)?,
-            read::node_children(store, r)?,
-            read::comment_lines(store, &Target::Node(r.clone()), false)?,
+            read::node_json(store, &r)?,
+            read::node_children(store, &r)?,
+            read::comment_lines(store, &Target::Node(r), false)?,
         ),
-        Selection::Collection(container, _) | Selection::Label(container, _) => {
-            return preview(store, &container.selection())
+        // `document()` never produces these two: both normalise away to their
+        // container's selection above, so this arm exists only for exhaustiveness.
+        Selection::Collection(..) | Selection::Label(..) => {
+            unreachable!("document() normalises collections and labels to their container")
         }
-        Selection::Comment(container, id) => return comment_document(store, container, *id),
-        Selection::Asset(container, name) => return asset_document(store, container, name),
+        Selection::Comment(container, id) => return comment_document(store, &container, id),
+        Selection::Asset(container, name) => return asset_document(store, &container, &name),
         // A blocker's own document, so what blocks you is readable without
         // leaving the level.
         Selection::Blocker(_, r) => (
-            read::node_json(store, r)?,
-            read::node_children(store, r)?,
-            read::comment_lines(store, &Target::Node(r.clone()), false)?,
+            read::node_json(store, &r)?,
+            read::node_children(store, &r)?,
+            read::comment_lines(store, &Target::Node(r), false)?,
         ),
     };
     Ok(render::show_markdown(&value, &children, &comments))
@@ -2663,6 +2683,66 @@ mod tests {
             .filter(|r| matches!(r.kind, RowKind::Collection(_)))
             .map(|r| (r.name.clone(), r.children))
             .collect()
+    }
+
+    /// [`Selection::document`] is the seam's one source of truth for "same
+    /// document": a collection row and every label row of one container
+    /// normalise to the container's own selection, two different containers
+    /// never collapse into one, and every other selection stays itself. Pure
+    /// data, so no store is needed to prove it.
+    #[test]
+    fn document_normalises_collections_and_labels_to_their_container() {
+        let node = NodeRef::parse("feature/1").unwrap();
+        let other = NodeRef::parse("feature/2").unwrap();
+        let container = Container::Node(node);
+        let other_container = Container::Node(other.clone());
+
+        // Every collection of one container normalises to that container's own
+        // document.
+        for kind in container.collections() {
+            assert_eq!(
+                Selection::Collection(container.clone(), *kind).document(),
+                container.selection()
+            );
+        }
+        // So does every label, whatever text it carries: a cursor crossing label
+        // rows must never see the document change.
+        for label in ["a", "b"] {
+            assert_eq!(
+                Selection::Label(container.clone(), label.to_string()).document(),
+                container.selection()
+            );
+        }
+        // A collection row and a label row of the same container agree with each
+        // other, and with the container's own selection.
+        assert_eq!(
+            Selection::Collection(container.clone(), Collection::Labels).document(),
+            Selection::Label(container.clone(), "a".to_string()).document()
+        );
+        assert_eq!(container.selection().document(), container.selection());
+
+        // A different container is a different document — collection and label
+        // rows included — so normalisation must never collapse distinct entities
+        // together.
+        assert_ne!(
+            Selection::Collection(container.clone(), Collection::Labels).document(),
+            Selection::Collection(other_container.clone(), Collection::Labels).document()
+        );
+        assert_ne!(
+            Selection::Label(container.clone(), "a".to_string()).document(),
+            Selection::Label(other_container, "a".to_string()).document()
+        );
+
+        // Every other selection already names the document it shows, so it comes
+        // back unchanged rather than normalised into something else.
+        let epic = Selection::Epic("feature".to_string());
+        assert_eq!(epic.document(), epic);
+        let comment = Selection::Comment(container.clone(), 1);
+        assert_eq!(comment.document(), comment);
+        let asset = Selection::Asset(container.clone(), "a.png".to_string());
+        assert_eq!(asset.document(), asset);
+        let blocker = Selection::Blocker(container, other);
+        assert_eq!(blocker.document(), blocker);
     }
 
     /// The fixture is a contract: every test module in the crate reads the shape

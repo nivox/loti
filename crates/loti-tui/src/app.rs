@@ -1657,6 +1657,10 @@ impl Surface {
 struct Preview {
     viewer: MarkdownViewer,
     width: u16,
+    /// The document identity currently rendered — [`Selection::document`], not
+    /// the raw row selection — so a cursor move across rows that share a
+    /// document (a container's collection rows, and the label rows inside a
+    /// collection) is never mistaken for a change of what is shown.
     shown: Option<Selection>,
 }
 
@@ -2805,10 +2809,17 @@ impl App {
     /// Bring the preview in line with the highlighted row, rebuilding it when
     /// the target or the pane width changed. Called once per frame, before the
     /// panes are drawn.
+    ///
+    /// Whether to keep the scroll position is decided on document identity —
+    /// [`Selection::document`] — not on the row's own selection: a cursor move
+    /// between rows that share a document (a container's collection rows, and
+    /// the label rows inside a collection) cannot change what is shown, so it
+    /// must not move the reader either.
     pub fn sync_preview(&mut self, width: u16) {
         let target = self.nav.preview_target();
+        let document = target.as_ref().map(Selection::document);
         let width_changed = width != self.preview.width;
-        if !width_changed && target == self.preview.shown {
+        if !width_changed && document == self.preview.shown {
             return;
         }
         if width_changed {
@@ -2827,9 +2838,9 @@ impl App {
             None => "# no epics\n\n> This store has no epics yet.\n".to_string(),
         };
         self.preview.viewer.set_content(&content, &self.theme);
-        if target != self.preview.shown {
+        if document != self.preview.shown {
             self.preview.viewer.scroll_to_top();
-            self.preview.shown = target;
+            self.preview.shown = document;
         }
     }
 
@@ -3145,6 +3156,55 @@ mod tests {
         (0..buffer.area.height)
             .map(|y| {
                 (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The preview pane's own lines — nothing else the frame draws — through the
+    /// same headless backend as [`frame_lines`].
+    ///
+    /// The breadcrumb, the navigation pane and the footer all read off the row
+    /// the cursor stands on, not the document the preview shows, so a test about
+    /// what the reader of the document sees — whether a scroll carried over —
+    /// must not let any of them stand in for it: a collection row and a label
+    /// row of the same container draw different breadcrumbs and different
+    /// navigation rows while showing the very same document, and comparing whole
+    /// frames would blame the pane for a difference that is entirely theirs. The
+    /// split mirrors [`crate::ui::draw`]'s own, so the slice taken here is the
+    /// pane exactly as it draws.
+    fn preview_lines(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        use ratatui::layout::{Constraint, Direction, Layout, Rect};
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let area = Rect::new(0, 0, width, height);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(app.nav_percent()),
+                Constraint::Percentage(100 - app.nav_percent()),
+            ])
+            .split(chunks[1]);
+        let preview = panes[1];
+
+        (preview.y..preview.y + preview.height)
+            .map(|y| {
+                (preview.x..preview.x + preview.width)
                     .map(|x| buffer[(x, y)].symbol())
                     .collect::<String>()
                     .trim_end()
@@ -6910,5 +6970,64 @@ mod tests {
             assert_eq!(app.preview_title(), fx.epic);
             app.apply(Action::CursorDown).unwrap();
         }
+    }
+
+    #[test]
+    fn a_cursor_move_that_cannot_change_the_document_leaves_the_scroll_alone() {
+        let (fx, mut app) = app();
+        to_the_labels_row(&mut app);
+
+        // A narrow, short frame, so the epic's own document — metadata table,
+        // body and children — does not fit in one screen and a scroll actually
+        // moves what is visible.
+        let (width, height) = (40, 10);
+        let top = preview_lines(&mut app, width, height);
+        app.preview_viewer().scroll_down(3);
+        let scrolled = preview_lines(&mut app, width, height);
+        assert_ne!(
+            scrolled, top,
+            "the fixture's epic document is not tall enough at this frame size for a scroll to move it, so this test cannot prove anything"
+        );
+
+        // Moving across the epic's own collection rows cannot change what the pane
+        // shows — every one of them keeps the epic's own document — so the pane
+        // must stay exactly where it was scrolled to. The breadcrumb and the
+        // navigation pane are free to change underneath it — a collection row and
+        // a label row read as different rows there — which is exactly why only
+        // the preview pane is compared.
+        app.apply(Action::CursorDown).unwrap(); // labels -> comments
+        assert_eq!(
+            preview_lines(&mut app, width, height),
+            scrolled,
+            "moving to the next collection row of the same container reset the scroll"
+        );
+
+        // Standing on a label row keeps the same document too, so entering the
+        // labels collection must not move the pane either.
+        to_a_label_row(&mut app);
+        assert_eq!(
+            preview_lines(&mut app, width, height),
+            scrolled,
+            "entering a label row reset the scroll, though it shows the container's own document"
+        );
+
+        // Leaving to a document that actually differs — a ticket, not the epic —
+        // must start that document at the top rather than carry the scroll over.
+        to_the_roster(&mut app);
+        app.apply(Action::Descend).unwrap(); // into the epic
+        to_work_row(&mut app);
+        let on_the_ticket = preview_lines(&mut app, width, height);
+
+        // What the ticket's own document looks like at the top, from a second
+        // browser on the same store that never touched a scrollbar — the only
+        // honest baseline for "started at the top".
+        let mut fresh = App::new(fx.store.clone(), Theme::with_color(false)).unwrap();
+        fresh.apply(Action::Descend).unwrap();
+        to_work_row(&mut fresh);
+        let ticket_top = preview_lines(&mut fresh, width, height);
+        assert_eq!(
+            on_the_ticket, ticket_top,
+            "moving to a different document did not start it at the top"
+        );
     }
 }
