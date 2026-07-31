@@ -1068,11 +1068,12 @@ fn nav_pane(terminal: &Terminal<TestBackend>, nav_width: u16) -> Vec<String> {
         .collect()
 }
 
-/// The preview pane's side of every line, so a claim asserted "in the preview" is
-/// read where the preview is and not off a navigation row that shares the line.
+/// The preview pane's cells, excluding the breadcrumb and footer which span both
+/// panes. A claim assertion about the pane must not be satisfied by a notice on
+/// the footer's shared line.
 fn preview_side(terminal: &Terminal<TestBackend>, nav_width: u16) -> Vec<String> {
     let buffer = terminal.backend().buffer();
-    (0..buffer.area.height)
+    (1..buffer.area.height.saturating_sub(1))
         .map(|y| {
             (nav_width..buffer.area.width)
                 .map(|x| buffer[(x, y)].symbol())
@@ -1225,21 +1226,6 @@ fn freeze_a_ticket(app: &mut App) {
     app.apply(Action::EnterEditing).unwrap();
 }
 
-/// What a browser opened again on the store shows in the preview for the ticket a
-/// claim was taken on: the pane as the next session reads it.
-///
-/// A second browser rather than the one that wrote, because the pane a committed
-/// write leaves behind is not re-rendered while the cursor has not moved off the
-/// row — so reading it there would assert the browser's own staleness rather than
-/// what the store now holds.
-fn preview_of_the_ticket_after_reopening(store: &Store, nav_width: u16) -> Vec<String> {
-    let mut reopened = App::new(store.clone(), Theme::with_color(false)).unwrap();
-    reopened.apply(Action::Descend).unwrap();
-    to_work_row(&mut reopened);
-    let (terminal, _) = draw(&mut reopened);
-    preview_side(&terminal, nav_width)
-}
-
 #[test]
 fn a_claim_taken_from_the_browser_marks_the_row_and_names_the_ticket_in_the_notice() {
     let (_dir, store) = fixture();
@@ -1248,6 +1234,15 @@ fn a_claim_taken_from_the_browser_marks_the_row_and_names_the_ticket_in_the_noti
     let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
     let width = nav_pane_width(&app);
     freeze_a_ticket(&mut app);
+    // The usual frame before a reader acts: the cached document has to exist for
+    // the following assertion to distinguish a refresh from a first render.
+    let (before, _) = draw(&mut app);
+    assert!(
+        !preview_side(&before, width)
+            .iter()
+            .any(|line| line.contains("a human")),
+        "the unclaimed ticket already names its future holder"
+    );
 
     // The whole interaction: the letter, the holder, the save key.
     app.apply(Action::TakeClaim).unwrap();
@@ -1269,12 +1264,12 @@ fn a_claim_taken_from_the_browser_marks_the_row_and_names_the_ticket_in_the_noti
     assert!(lines[23].contains("browser/1"), "{:?}", lines[23]);
     assert!(lines[23].contains("a human"), "{:?}", lines[23]);
 
-    // And the holder reaches the preview, which is where a claim's identity lives:
-    // the mark answers "is anyone on this", the pane answers who.
-    let preview = preview_of_the_ticket_after_reopening(&store, width);
+    // The holder reaches the preview in this same, post-write frame: the mark
+    // answers "is anyone on this", while the pane answers who.
+    let preview = preview_side(&terminal, width);
     assert!(
-        preview.iter().any(|l| l.contains("a human")),
-        "the preview does not name the holder: {preview:#?}"
+        preview.iter().any(|line| line.contains("a human")),
+        "the preview did not refresh after the write: {preview:#?}"
     );
 }
 
@@ -1307,11 +1302,85 @@ fn a_claim_released_from_the_browser_unmarks_the_row_and_names_the_ticket() {
     );
     assert!(lines[23].contains("browser/1"), "{:?}", lines[23]);
 
-    // And the holder is gone from the preview too, which is where it was named.
-    let preview = preview_of_the_ticket_after_reopening(&store, width);
+    // And the holder is gone from this frame's preview too, which is where it
+    // was named before the release.
+    let preview = preview_side(&terminal, width);
     assert!(
-        !preview.iter().any(|l| l.contains(&holder)),
+        !preview.iter().any(|line| line.contains(&holder)),
         "the preview still names {holder:?}: {preview:#?}"
+    );
+}
+
+#[test]
+fn reload_refreshes_a_scrolled_preview_without_returning_it_to_the_top() {
+    let (_dir, store) = fixture();
+    let node = NodeRef::new("browser", 1);
+    let top_marker = "reload scroll starts here";
+    let stale_marker = "stale content at the old viewport";
+    let fresh_marker = "fresh content at the preserved viewport";
+    let before_body = format!(
+        "## {top_marker}\n\n{}\n{stale_marker}\n",
+        (0..40)
+            .map(|line| format!("scroll filler line {line}\n\n"))
+            .collect::<String>(),
+    );
+    ops::edit_node(
+        &store,
+        &node,
+        ops::NodeEdits {
+            body: Some(before_body.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let after_body = before_body.replacen(stale_marker, fresh_marker, 1);
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    app.apply(Action::Descend).unwrap();
+    to_work_row(&mut app);
+    let width = nav_pane_width(&app);
+
+    // The initial frame gives the viewer a page size before the reader moves to
+    // its bottom. Both markers make that viewport observably unlike the top.
+    let (_initial, _) = draw(&mut app);
+    app.apply(Action::PreviewBottom).unwrap();
+    let (scrolled, _) = draw(&mut app);
+    let before = preview_side(&scrolled, width);
+    assert!(
+        before.iter().any(|line| line.contains(stale_marker)),
+        "the old tail is not visible after scrolling: {before:#?}"
+    );
+    assert!(
+        !before.iter().any(|line| line.contains(top_marker)),
+        "scrolling did not leave the top viewport: {before:#?}"
+    );
+
+    // Another writer changes the already-rendered document in place. Reloading
+    // keeps this selection, so the following frame has to both re-read it and
+    // retain the reader's location within it.
+    ops::edit_node(
+        &store,
+        &node,
+        ops::NodeEdits {
+            body: Some(after_body),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    app.apply(Action::Reload).unwrap();
+    let (reloaded, _) = draw(&mut app);
+    let after = preview_side(&reloaded, width);
+
+    assert!(
+        after.iter().any(|line| line.contains(fresh_marker)),
+        "reload did not show the externally updated tail: {after:#?}"
+    );
+    assert!(
+        !after.iter().any(|line| line.contains(stale_marker)),
+        "reload retained stale content at the viewport: {after:#?}"
+    );
+    assert!(
+        !after.iter().any(|line| line.contains(top_marker)),
+        "reload returned the preview to the top: {after:#?}"
     );
 }
 

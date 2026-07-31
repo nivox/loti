@@ -1663,6 +1663,13 @@ struct Preview {
     /// document (a container's collection rows, and the label rows inside a
     /// collection) is never mistaken for a change of what is shown.
     shown: Option<Selection>,
+    /// Whether the store was re-read after this document was rendered.
+    ///
+    /// Invariant: a preview is rebuilt when its document, wrap width, or store
+    /// snapshot changes. [`App::reload`] invalidates it before rows are replaced,
+    /// so the same rule refreshes the pane after both a successful write and a
+    /// reader-requested reload without turning either into a special case.
+    invalidated: bool,
 }
 
 /// The browser.
@@ -1729,6 +1736,7 @@ impl App {
                 viewer: MarkdownViewer::new(),
                 width: 0,
                 shown: None,
+                invalidated: false,
             },
             nav_percent: DEFAULT_NAV_PERCENT,
             zoomed: false,
@@ -2691,6 +2699,10 @@ impl App {
     /// committed — no outcome of it can stand between the write and the notice
     /// that tells the reader what was written.
     fn reload(&mut self) {
+        // Rows and the pane describe one store snapshot. Invalidate before
+        // replacing rows so the next frame cannot retain the document from before
+        // this read, even when its selected entity did not move.
+        self.preview.invalidated = true;
         let store = &self.store;
         self.nav.reload(|level| data::rows(store, level));
         self.read_only = data::read_only(&self.store);
@@ -2838,20 +2850,22 @@ impl App {
         }
     }
 
-    /// Bring the preview in line with the highlighted row, rebuilding it when
-    /// the target or the pane width changed. Called once per frame, before the
-    /// panes are drawn.
+    /// Bring the preview in line with the highlighted row. Called once per
+    /// frame, before the panes are drawn.
     ///
-    /// Whether to keep the scroll position is decided on document identity —
-    /// [`Selection::document`] — not on the row's own selection: a cursor move
-    /// between rows that share a document (a container's collection rows, and
-    /// the label rows inside a collection) cannot change what is shown, so it
-    /// must not move the reader either.
+    /// A rendering is rebuilt when its document, wrap width, or store snapshot
+    /// changed; [`Self::reload`] owns the last invalidation for every caller,
+    /// including successful writes. Whether to keep the scroll position is still
+    /// decided only on document identity — [`Selection::document`] — not on the
+    /// row's own selection: a cursor move between rows that share a document (a
+    /// container's collection rows, and the label rows inside a collection) cannot
+    /// change what is shown, so it must not move the reader either.
     pub fn sync_preview(&mut self, width: u16) {
         let target = self.nav.preview_target();
         let document = target.as_ref().map(Selection::document);
+        let document_changed = document != self.preview.shown;
         let width_changed = width != self.preview.width;
-        if !width_changed && document == self.preview.shown {
+        if !self.preview.invalidated && !width_changed && !document_changed {
             return;
         }
         if width_changed {
@@ -2870,7 +2884,8 @@ impl App {
             None => "# no epics\n\n> This store has no epics yet.\n".to_string(),
         };
         self.preview.viewer.set_content(&content, &self.theme);
-        if document != self.preview.shown {
+        self.preview.invalidated = false;
+        if document_changed {
             self.preview.viewer.scroll_to_top();
             self.preview.shown = document;
         }
