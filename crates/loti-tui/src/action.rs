@@ -321,7 +321,12 @@ impl EditingAction {
     }
 }
 
-/// A resolved user intent.
+/// A resolved user intent, or the fact that a key carried none.
+///
+/// [`Action::Unbound`] is the second of those: it is what lets an ignored key
+/// reach the state machine at all, rather than being dropped by the loop
+/// before anything downstream is asked about it. See its own documentation
+/// for the rule every layer answers it with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     /// Move the navigation cursor down one row.
@@ -448,6 +453,33 @@ pub enum Action {
     ToggleHelp,
     /// Leave the browser.
     Quit,
+    /// The key map found no intent for this key, in the mode it was pressed in.
+    ///
+    /// Reaching the state machine as an action of its own — rather than being
+    /// dropped by the loop before [`crate::app::App::apply`] is ever called —
+    /// is what makes an ignored key the state machine's decision instead of
+    /// the key map's: only the state machine knows where the reader is
+    /// standing, and the map does not.
+    ///
+    /// The rule every layer answers this with, and answers a recognised
+    /// action it declines to act on with too: **silence, unless an action
+    /// that would usually work cannot work in the context the reader is in.**
+    /// That mismatch is the surprise a notice exists to explain, and a key
+    /// with no meaning anywhere never rises to it — so no sweep is owed, and
+    /// a later context that does need a word is one arm edited, not the loop
+    /// replumbed.
+    ///
+    /// Two places look like that surprise and are not, so they stay silent on
+    /// purpose: the level and unwind keys while the preview is zoomed, because
+    /// there is no navigation pane on screen for a reader to expect them to
+    /// move something on; and the reflex key inside a field that does not hold
+    /// many lines, because the notice would sit over the hint strip for as
+    /// long as it is up, hiding the save key the strip already teaches. A
+    /// third place looks silent and is not: the epic-creation key answers
+    /// with its own notice wherever it is pressed off the epics list, because
+    /// making an epic is exactly what that key is expected to do everywhere
+    /// else in the roster.
+    Unbound,
 }
 
 #[cfg(test)]

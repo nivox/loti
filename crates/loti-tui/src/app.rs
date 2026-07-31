@@ -2122,12 +2122,27 @@ impl App {
         match action {
             Action::ToggleHelp => self.modal = Some(Modal::Help),
 
+            // The key map found nothing to bind this key to, in any mode: it
+            // reaches this layer rather than being dropped by the loop, and
+            // browsing answers it exactly as it answers a recognised action it
+            // has nothing to do with — silence. See [`Action::Unbound`] for the
+            // rule this is one instance of, and for where the instances that
+            // answer differently live.
+            Action::Unbound => {}
+
             // Zoom hides the navigation pane, so the motion keys fall through to
             // the preview: they must never move a cursor the reader cannot see.
             Action::CursorDown if self.zoomed => self.preview.viewer.scroll_down(1),
             Action::CursorUp if self.zoomed => self.preview.viewer.scroll_up(1),
             Action::CursorFirst if self.zoomed => self.preview.viewer.scroll_to_top(),
             Action::CursorLast if self.zoomed => self.preview.viewer.scroll_to_bottom(),
+            // Silent, deliberately, and named in [`Action::Unbound`] as one of
+            // the two places that look like the surprise a notice exists for
+            // and are not: entering, leaving and unwinding a level normally
+            // change what is on screen, but with the navigation pane hidden
+            // there is no visible cursor for a reader to expect them to move —
+            // unlike `EnterEditing` below, which opens a mode a reader has
+            // every reason to expect works wherever they are.
             Action::Descend | Action::Ascend | Action::Unwind if self.zoomed => {}
             // The same rule, said out loud because nothing on screen would say
             // it: an action that needs a visible cursor does nothing while there
@@ -2191,6 +2206,12 @@ impl App {
             // every other write's availability is decided — so it asks the store's
             // own state for itself. A store the format gate will not let this binary
             // write offers no write anywhere, this one included.
+            //
+            // Pressed anywhere but the roster it flashes rather than staying quiet:
+            // the third case [`Action::Unbound`] names, where a bound key answers
+            // for itself instead of following the default, because making an epic
+            // is exactly what this key is expected to do everywhere else on that
+            // list.
             Action::CreateEpic => match self.read_only {
                 Some(reason) => self.flash(reason.refusal()),
                 None => match self.nav.at_roster() {
@@ -2402,7 +2423,11 @@ impl App {
     /// Every key belongs to the field except the surface's own few: accept, the
     /// external editor, help, and the way out. There is no unknown-key notice here
     /// — in a field an unbound key is simply not a character, and the mode's notice
-    /// belongs to the layer where letters are actions.
+    /// belongs to the layer where letters are actions. The reflex key is the named
+    /// exception in [`Action::Unbound`]: outside a field that holds many lines it
+    /// carries no action and lands in the field's own catch-all with everything
+    /// else this layer ignores, silent so the notice it would otherwise deserve
+    /// cannot cover the hint strip's save key.
     fn apply_to_surface(&mut self, action: Action) {
         match action {
             // The text is the only copy of what the reader wrote, so the way out of
@@ -2512,11 +2537,15 @@ impl App {
     /// Carry out an intent while editing mode is on.
     ///
     /// The mode admits the actions the frozen row offers, the way out, help and a
-    /// reload, and ignores everything else with a notice naming the way out. With
-    /// the selection frozen there is nothing left for a motion, level or layout
-    /// key to do, and an unknown key is deliberately not an implicit exit: a typo
-    /// must not silently drop the reader out of a mode whose indicator is at the
-    /// top of the screen while their eyes are on the row.
+    /// reload. A key bound to some other action — a motion, a letter this row
+    /// does not offer — is answered with a notice naming the way out, because with
+    /// the selection frozen there is nothing left for it to do and an unknown key
+    /// is deliberately not an implicit exit: a typo must not silently drop the
+    /// reader out of a mode whose indicator is at the top of the screen while
+    /// their eyes are on the row. A key bound to nothing at all, in any mode,
+    /// stays silent instead — see [`Action::Unbound`] — rather than raising the
+    /// same notice for a stray keystroke that could never have started anything
+    /// here.
     ///
     /// Quitting never reaches this layer: it is answered for every layer at once,
     /// and the mode holds text the store has not been given, so it is refused
@@ -2525,6 +2554,7 @@ impl App {
         match action {
             Action::Unwind => self.editing = None,
             Action::ToggleHelp => self.modal = Some(Modal::Help),
+            Action::Unbound => {}
             // Nothing is pending at this layer, so a reload is safe — and it is
             // the natural move when the preview looks stale before committing to
             // an edit.
@@ -2549,8 +2579,10 @@ impl App {
             }
             // Everything else is an editing action or nothing. A letter is listed
             // only where the row offers it, so a letter this row does not offer is
-            // as unknown here as any key the mode never binds — and the offer that
-            // decides it is the one the hint strip asked.
+            // unknown here — and the offer that decides it is the one the hint strip
+            // asked — but it is a key the mode does bind, just not to something this
+            // row can do, which is what tells it apart from [`Action::Unbound`]
+            // above and earns it the notice that names the way out.
             _ => match EditingAction::for_intent(action).and_then(|a| self.offer(a)) {
                 Some(Offer::Ask(dialog)) => self.modal = Some(Modal::Dialog(Box::new(dialog))),
                 Some(Offer::Fill(surface)) => self.surface = Some(surface),
@@ -3298,7 +3330,36 @@ mod tests {
                 vec!["epics", "feature"],
                 "{action:?} changed the level"
             );
+            // The rule is that a reader does not expect these to move anything
+            // while the navigation pane is hidden, so the
+            // silence is deliberate rather than a stray key going unanswered —
+            // and deliberate silence still says nothing.
+            assert_eq!(app.flash_message(), None, "{action:?} said something");
         }
+    }
+
+    #[test]
+    fn an_unbound_key_in_browse_mode_changes_nothing_and_says_nothing() {
+        let (_fx, mut app) = app();
+        app.apply(Action::Descend).unwrap(); // somewhere other than the roster
+                                             // A stale notice from an earlier action, so silence is proven by the
+                                             // message surviving unchanged rather than by there never having been one
+                                             // — `is_some()` would pass on a message this action itself raised.
+        app.flash("an earlier notice");
+        let cursor = app.nav().cursor();
+        let crumbs: Vec<String> = app.nav().crumbs().iter().map(ToString::to_string).collect();
+        let zoomed = app.zoomed();
+        let percent = app.nav_percent();
+
+        assert!(!app.apply(Action::Unbound).unwrap(), "quit the browser");
+
+        assert_eq!(app.nav().cursor(), cursor);
+        assert_eq!(app.nav().crumbs(), crumbs);
+        assert_eq!(app.zoomed(), zoomed);
+        assert_eq!(app.nav_percent(), percent);
+        assert!(app.surface().is_none());
+        assert_eq!(app.editing_target(), None);
+        assert_eq!(app.flash_message(), Some("an earlier notice"));
     }
 
     #[test]
@@ -3549,6 +3610,21 @@ mod tests {
             notice.contains("Esc"),
             "{notice:?} does not name the way out"
         );
+    }
+
+    #[test]
+    fn an_unbound_key_in_editing_mode_changes_nothing_and_says_nothing() {
+        let (_fx, mut app) = app();
+        app.apply(Action::EnterEditing).unwrap();
+        app.flash("an earlier notice");
+        let target = app.editing_target().cloned();
+
+        assert!(!app.apply(Action::Unbound).unwrap(), "quit the browser");
+
+        assert_eq!(app.editing_target(), target.as_ref());
+        assert!(app.surface().is_none());
+        assert_eq!(app.modal(), None);
+        assert_eq!(app.flash_message(), Some("an earlier notice"));
     }
 
     #[test]
@@ -4168,6 +4244,29 @@ mod tests {
         let surface = app.surface().expect("the surface is open");
         assert_eq!(surface.fields()[0].label(), COMMENT_FIELD);
         assert!(!surface.title().contains("label"), "{:?}", surface.title());
+    }
+
+    #[test]
+    fn an_unbound_key_inside_a_one_line_field_touches_nothing_and_leaves_the_surface_open() {
+        let (fx, mut app) = app();
+        let before = fx.epic_labels();
+        open_the_label_surface(&mut app);
+        type_into(&mut app, "partial");
+        let cursor = cursor_at(&app);
+
+        app.apply(Action::Unbound).unwrap();
+
+        // Nothing about the field the reader was mid-way through typing moved: an
+        // unbound key is not a character, so it is not the reflex key's silent
+        // catch-all either — it never reaches `apply_to_surface`'s match at all
+        // without first being an action the field recognises as its own.
+        let surface = app.surface().expect("the surface closed");
+        let field = &surface.fields()[0];
+        assert_eq!(text_of(field), "partial");
+        assert!(field.is_dirty(), "typing before the key pressed was undone");
+        assert_eq!(cursor_at(&app), cursor, "the cursor moved");
+        assert_eq!(app.flash_message(), None);
+        assert_eq!(fx.epic_labels(), before, "the store was written");
     }
 
     #[test]

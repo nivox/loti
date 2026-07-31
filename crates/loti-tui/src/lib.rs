@@ -49,7 +49,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseButton, MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEvent, KeyEventKind, MouseButton,
+    MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -58,6 +59,7 @@ use crossterm::terminal::{
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::Terminal;
 
+use crate::action::Mode;
 use crate::app::App;
 use crate::theme::Theme;
 
@@ -347,6 +349,20 @@ fn editor_outcome(app: &mut App, outcome: Result<Option<String>>) {
 /// deadline by more than a quarter second.
 const TICK: Duration = Duration::from_millis(250);
 
+/// The action a key press carries to [`App::apply`]: the key map's own intent for
+/// this key and mode where it names one, and [`action::Action::Unbound`] where it
+/// does not.
+///
+/// This is the whole of the conversion the event-loop boundary owns, and it is
+/// what lets an ignored key reach application handling as a decision of its own,
+/// rather than being dropped here — before the state machine that owns the
+/// context a silence answers for is ever consulted. [`keymap::action_for`] keeps
+/// its `Option` return, so a key-table test still asks it directly whether a key
+/// is bound at all; this is the one place that turns "not bound" into an action.
+fn dispatch(key: KeyEvent, mode: Mode) -> action::Action {
+    keymap::action_for(key, mode).unwrap_or(action::Action::Unbound)
+}
+
 fn event_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
     // Mouse capture is what makes the divider draggable, but it also takes
     // click-drag text selection away from the terminal. Zoom is the way out:
@@ -393,12 +409,12 @@ fn event_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
                 // dispatch, so a key that raises one of its own keeps it.
                 app.clear_flash();
                 // The mode is an input to the mapping, so one key can be the way
-                // out of a mode here and the way out of the browser there.
-                if let Some(action) = keymap::action_for(key, app.mode()) {
-                    let outcome = app.apply(action);
-                    if intent_outcome(&mut app, outcome) {
-                        return Ok(());
-                    }
+                // out of a mode here and the way out of the browser there. Every
+                // key reaches `apply`, bound or not — see `dispatch`.
+                let action = dispatch(key, app.mode());
+                let outcome = app.apply(action);
+                if intent_outcome(&mut app, outcome) {
+                    return Ok(());
                 }
             }
             Event::Mouse(mouse) => match mouse.kind {
@@ -439,6 +455,7 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::backend::TestBackend;
     use ratatui::widgets::Paragraph;
 
@@ -877,5 +894,25 @@ mod tests {
             .expect_err("a blank setting names no program")
             .to_string();
         assert!(refusal.contains("blank"), "{refusal}");
+    }
+
+    #[test]
+    fn a_key_the_table_does_not_bind_dispatches_as_the_unbound_action() {
+        // No terminal is needed: `dispatch` is the whole of the boundary's own
+        // decision, so it is asked directly rather than through a loop iteration.
+        // `keymap::action_for` keeps saying `None` for a key it does not bind —
+        // that table is exhaustively swept in `keymap`'s own tests — and this is
+        // the one place that turns `None` into an action the state machine sees.
+        let unbound = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        for mode in [Mode::Browse, Mode::Editing] {
+            assert_eq!(keymap::action_for(unbound, mode), None, "{mode:?}");
+            assert_eq!(dispatch(unbound, mode), Action::Unbound, "{mode:?}");
+        }
+
+        // A key the table does bind still carries its own intent through —
+        // dispatch adds a case, it does not replace the map's answer.
+        let bound = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert_eq!(keymap::action_for(bound, Mode::Browse), Some(Action::Quit));
+        assert_eq!(dispatch(bound, Mode::Browse), Action::Quit);
     }
 }
