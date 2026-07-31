@@ -24,6 +24,11 @@ use crate::theme::{glyph, Theme};
 /// The separator between breadcrumb entries.
 const CRUMB_SEPARATOR: &str = " › ";
 
+/// The blank columns the state slot's marker keeps between itself and the
+/// breadcrumb path, so the two can never run together whatever either is drawn
+/// with.
+const CRUMB_MARKER_GAP: usize = 1;
+
 /// The rule drawn between a level's collection rows and its work rows.
 const STRUCTURE_RULE: &str = "─";
 
@@ -727,18 +732,27 @@ fn hint_strip(width: usize, hints: &[&str], essential_hints: &[&str]) -> String 
     strip.chars().take(width).collect()
 }
 
+/// The width left for the breadcrumb path once the state slot, if any, has
+/// taken its column and the gap that must separate it from the path.
+///
+/// Pulled out of [`draw_breadcrumb`] so the reservation itself — not just its
+/// effect on a rendered frame — can be pinned by a test.
+fn breadcrumb_budget(total_width: usize, slot: Option<(&'static str, usize)>) -> usize {
+    let reserved = slot.map_or(0, |(_, width)| width + CRUMB_MARKER_GAP);
+    total_width.saturating_sub(reserved)
+}
+
 fn draw_breadcrumb(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let crumbs = app.nav().crumbs();
     // The state of the session — the mode it is in, or the store refusing to be
     // written — holds the right-hand end of the line and the breadcrumb elides
     // into what is left: a session-level fact must not be the thing a narrow
-    // terminal scrolls away. One column of gap, so a crumb can never run into the
-    // marker.
+    // terminal scrolls away. CRUMB_MARKER_GAP reserves the blank column between
+    // them, so a crumb can never run into the marker.
     let slot = state_slot(app);
-    let reserved = slot.map_or(0, |(_, width)| width + 1);
     let text = elide_left(
         &crumbs,
-        area_text_width(area.width).saturating_sub(reserved),
+        breadcrumb_budget(area_text_width(area.width), slot),
     );
     let path = Style::default()
         .fg(theme.accent())
@@ -797,9 +811,11 @@ fn elide_left(crumbs: &[&str], width: usize) -> String {
             return candidate;
         }
     }
-    // Even the deepest entry alone does not fit: truncate it.
+    // Even the deepest entry alone does not fit: truncate it the way every
+    // other clipped text in the surface is truncated, so a shortened name
+    // still says it was cut rather than reading as a short one in full.
     let last = crumbs.last().copied().unwrap_or_default();
-    last.chars().take(width).collect()
+    truncate(last, width)
 }
 
 fn draw_nav(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
@@ -1229,6 +1245,39 @@ mod tests {
         assert!(elided.starts_with('…'), "{elided}");
         assert!(elided.ends_with("8 deeper still"), "{elided}");
         assert!(elided.chars().count() <= 30, "{elided}");
+    }
+
+    #[test]
+    fn a_breadcrumb_too_narrow_for_even_its_deepest_entry_is_cut_with_a_marker() {
+        // A single crumb, alone, is already what elide_left falls back to once
+        // dropping every ancestor still does not fit — so a width smaller than
+        // that one entry must exercise the same truncate() fallback the deepest
+        // entry of a longer path would hit.
+        let crumbs = ["a long ticket title that will not fit"];
+        let elided = elide_left(&crumbs, 5);
+        assert!(elided.ends_with(CUT_MARKER), "{elided}");
+        assert!(elided.chars().count() <= 5, "{elided}");
+    }
+
+    #[test]
+    fn the_breadcrumb_budget_reserves_the_slot_and_one_column_gap() {
+        let marker = "RO";
+        let with_slot = breadcrumb_budget(18, Some((marker, marker.chars().count())));
+        let without_slot = breadcrumb_budget(18, None);
+        assert_eq!(
+            without_slot - with_slot,
+            marker.chars().count() + CRUMB_MARKER_GAP,
+            "the slot's own width plus the gap must be exactly what the budget gives up"
+        );
+        assert_eq!(CRUMB_MARKER_GAP, 1);
+
+        // Sized so the path exactly fits the reserved budget: if the gap were
+        // dropped from the arithmetic, this same path would still fit and the
+        // test would not notice the missing column.
+        let crumbs = ["epics", "feature"];
+        let elided = elide_left(&crumbs, with_slot);
+        assert_eq!(elided, "epics › feature");
+        assert_eq!(elided.chars().count(), with_slot);
     }
 
     #[test]
