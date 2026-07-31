@@ -363,6 +363,23 @@ fn dispatch(key: KeyEvent, mode: Mode) -> action::Action {
     keymap::action_for(key, mode).unwrap_or(action::Action::Unbound)
 }
 
+/// The action a wheel event carries to [`App::apply`], or `None` for a mouse
+/// event this loop does not turn into one.
+///
+/// A wheel is not a key, so it carries its own intent rather than the one a key
+/// press would: see [`action::Action::WheelDown`] for why editing mode has to
+/// tell the two apart. This is the whole of that boundary's own decision, kept
+/// as one place a mutated pairing — `ScrollDown` mapped to the wrong action —
+/// would be caught directly, rather than only through a loop iteration a unit
+/// test cannot drive without a terminal.
+fn wheel_action(kind: MouseEventKind) -> Option<action::Action> {
+    match kind {
+        MouseEventKind::ScrollDown => Some(action::Action::WheelDown),
+        MouseEventKind::ScrollUp => Some(action::Action::WheelUp),
+        _ => None,
+    }
+}
+
 fn event_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
     // Mouse capture is what makes the divider draggable, but it also takes
     // click-drag text selection away from the terminal. Zoom is the way out:
@@ -426,15 +443,12 @@ fn event_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
                     app.drag(mouse.column, width);
                 }
                 MouseEventKind::Up(MouseButton::Left) => app.release(),
-                MouseEventKind::ScrollDown => {
-                    let outcome = app.apply(action::Action::CursorDown);
-                    intent_outcome(&mut app, outcome);
+                kind => {
+                    if let Some(action) = wheel_action(kind) {
+                        let outcome = app.apply(action);
+                        intent_outcome(&mut app, outcome);
+                    }
                 }
-                MouseEventKind::ScrollUp => {
-                    let outcome = app.apply(action::Action::CursorUp);
-                    intent_outcome(&mut app, outcome);
-                }
-                _ => {}
             },
             _ => {}
         }
@@ -455,7 +469,7 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyModifiers, MouseEvent};
     use ratatui::backend::TestBackend;
     use ratatui::widgets::Paragraph;
 
@@ -914,5 +928,43 @@ mod tests {
         let bound = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
         assert_eq!(keymap::action_for(bound, Mode::Browse), Some(Action::Quit));
         assert_eq!(dispatch(bound, Mode::Browse), Action::Quit);
+    }
+
+    #[test]
+    fn a_wheel_event_carries_its_own_direction_not_a_cursor_move() {
+        // No terminal is needed: `wheel_action` is the whole of this boundary's
+        // own decision, so it is asked directly rather than through a loop
+        // iteration. Built from real crossterm events — not the `MouseEventKind`
+        // variants alone — so the test exercises the same value the event loop
+        // reads off the wire.
+        let scroll_down = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        let scroll_up = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(wheel_action(scroll_down.kind), Some(Action::WheelDown));
+        assert_eq!(wheel_action(scroll_up.kind), Some(Action::WheelUp));
+
+        // Down must land on down and up on up: swapping the pairing is the exact
+        // mutation this test exists to catch, so both directions are checked
+        // against each other, not only against a variant each on its own.
+        assert_ne!(wheel_action(scroll_down.kind), wheel_action(scroll_up.kind));
+
+        // A press or drag is not a wheel event, so it carries no wheel action at
+        // all — this boundary only ever adds a case, it never invents one.
+        let press = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(wheel_action(press.kind), None);
     }
 }

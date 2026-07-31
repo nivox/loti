@@ -337,6 +337,17 @@ pub enum Action {
     CursorFirst,
     /// Move the navigation cursor to the last row.
     CursorLast,
+    /// Move the navigation cursor down one row, from the mouse wheel.
+    ///
+    /// Distinct from [`Action::CursorDown`] because a wheel is not a key: browsing
+    /// and zoom answer both alike — one pattern arm names them together — but
+    /// editing mode tells them apart. A key with no meaning there earns the notice
+    /// that names a way out; a wheel event earns silence, because nothing about it
+    /// was ever a key the reader could look up.
+    WheelDown,
+    /// Move the navigation cursor up one row, from the mouse wheel. See
+    /// [`Action::WheelDown`] for why it is not [`Action::CursorUp`].
+    WheelUp,
     /// Enter the highlighted row's children.
     Descend,
     /// Leave the current level for its parent.

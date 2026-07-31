@@ -2135,9 +2135,13 @@ impl App {
             Action::Unbound => {}
 
             // Zoom hides the navigation pane, so the motion keys fall through to
-            // the preview: they must never move a cursor the reader cannot see.
-            Action::CursorDown if self.zoomed => self.preview.viewer.scroll_down(1),
-            Action::CursorUp if self.zoomed => self.preview.viewer.scroll_up(1),
+            // the preview: they must never move a cursor the reader cannot see. The
+            // wheel shares every arm with the key it stands in for here: browsing
+            // and zoom never tell the two apart, only editing mode does.
+            Action::CursorDown | Action::WheelDown if self.zoomed => {
+                self.preview.viewer.scroll_down(1)
+            }
+            Action::CursorUp | Action::WheelUp if self.zoomed => self.preview.viewer.scroll_up(1),
             Action::CursorFirst if self.zoomed => self.preview.viewer.scroll_to_top(),
             Action::CursorLast if self.zoomed => self.preview.viewer.scroll_to_bottom(),
             // Silent, deliberately, and named in [`Action::Unbound`] as one of
@@ -2156,8 +2160,8 @@ impl App {
             // choice, so the refusal leaves it as it is rather than un-zooming.
             Action::EnterEditing if self.zoomed => self.flash(EDITING_NEEDS_THE_NAV_PANE),
 
-            Action::CursorDown => self.nav.cursor_down(),
-            Action::CursorUp => self.nav.cursor_up(),
+            Action::CursorDown | Action::WheelDown => self.nav.cursor_down(),
+            Action::CursorUp | Action::WheelUp => self.nav.cursor_up(),
             Action::CursorFirst => self.nav.cursor_first(),
             Action::CursorLast => self.nav.cursor_last(),
             Action::Descend => {
@@ -2591,6 +2595,12 @@ impl App {
                     }
                 }
             }
+            // A wheel event is not a key: the notice below is worded for one
+            // ("not an editing action") and would be wrong for a scroll, so the
+            // mode answers it exactly as it answers being zoomed with no cursor to
+            // move — silence, because the mode having frozen the selection is not
+            // something the reader did anything wrong to run into.
+            Action::WheelDown | Action::WheelUp => {}
             // Everything else is an editing action or nothing. A letter is listed
             // only where the row offers it, so a letter this row does not offer is
             // unknown here — and the offer that decides it is the one the hint strip
@@ -2711,7 +2721,18 @@ impl App {
 
     /// Begin a drag if the press landed on the divider. Returns whether the
     /// divider was grabbed.
+    ///
+    /// Refused only while a dialog is open: a question is the one case where
+    /// "nothing beneath it moves" is a real guarantee, because a dialog is a
+    /// question the reader must answer before anything else proceeds. The split
+    /// itself is neither what the mode has frozen nor what a question is waiting
+    /// on — it is the reader's own furniture — so the drag stays live through
+    /// editing mode and through an open surface alike, including a surface that
+    /// draws its buffer over the very pane the drag resizes.
     pub fn press(&mut self, column: u16) -> bool {
+        if matches!(self.mode(), Mode::Dialog(_)) {
+            return false;
+        }
         // A one-column border is hard to hit exactly, so the column either side
         // counts as the divider too.
         self.dragging_divider = self
@@ -3502,6 +3523,85 @@ mod tests {
         app.release();
         app.drag(20, 100);
         assert_eq!(app.nav_percent(), 60);
+    }
+
+    #[test]
+    fn pressing_the_divider_is_refused_while_a_dialog_is_open() {
+        let (_fx, mut app) = app();
+        app.set_divider_column(Some(30));
+        to_a_label_row(&mut app);
+        app.apply(Action::EnterEditing).unwrap();
+        app.apply(Action::Delete).unwrap();
+        assert!(app.modal().is_some(), "a dialog is open");
+
+        // The one case where "nothing beneath it moves" is a real guarantee: the
+        // press itself is refused, not merely left without effect once dragged,
+        // so a reader mid-question cannot resize what the question sits over.
+        assert!(
+            !app.press(31),
+            "the divider was grabbed while a dialog was open"
+        );
+        app.drag(60, 100);
+        assert_eq!(
+            app.nav_percent(),
+            DEFAULT_NAV_PERCENT,
+            "the drag moved the divider under an open dialog"
+        );
+    }
+
+    #[test]
+    fn the_divider_stays_live_through_editing_mode_and_an_open_surface() {
+        let (_fx, mut app) = app();
+        app.set_divider_column(Some(30));
+        freeze_the_epics_row(&mut app);
+        assert!(app.press(31), "editing mode blocked the divider");
+        app.drag(60, 100);
+        assert_eq!(
+            app.nav_percent(),
+            60,
+            "the split did not move while editing mode was on"
+        );
+        app.release();
+        app.apply(Action::Unwind).unwrap(); // leave editing mode before opening a surface
+
+        // The split is the reader's own furniture, not what the mode freezes or
+        // what a question is waiting on, so a surface drawn over the very pane
+        // the drag resizes must not gate it either.
+        open_the_label_surface(&mut app);
+        assert!(app.press(31), "the open surface blocked the divider");
+        app.drag(20, 100);
+        assert_eq!(
+            app.nav_percent(),
+            20,
+            "the split did not move while a surface was open"
+        );
+    }
+
+    #[test]
+    fn a_wheel_is_silent_in_editing_mode_where_a_key_would_notice() {
+        let (_fx, mut app) = app();
+        freeze_the_epics_row(&mut app);
+        let cursor = app.nav().cursor();
+
+        // Not a key: the notice below is worded for one and would be wrong for a
+        // scroll, so a wheel event is answered with the same silence as being
+        // zoomed with no cursor to move.
+        for action in [Action::WheelDown, Action::WheelUp] {
+            app.clear_flash();
+            assert!(!app.apply(action).unwrap(), "{action:?} quit");
+            assert_eq!(app.nav().cursor(), cursor, "{action:?} moved the cursor");
+            assert_eq!(app.flash_message(), None, "{action:?} said something");
+        }
+
+        // The key it stands in for is a different story: bound to nothing this
+        // row offers, it earns the notice that names the way out.
+        app.apply(Action::CursorDown).unwrap();
+        assert_eq!(
+            app.nav().cursor(),
+            cursor,
+            "CursorDown moved the frozen cursor"
+        );
+        assert_eq!(app.flash_message(), Some(NOT_AN_EDITING_ACTION));
     }
 
     #[test]
