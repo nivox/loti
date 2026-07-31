@@ -15,6 +15,7 @@ jiff.workspace = true
 ratatui.workspace = true
 ratatui-markdown.workspace = true
 crossterm.workspace = true
+unicode-width.workspace = true
 # The external editor is handed a real file, because that is the only interface
 # every editor has; the file is removed when the round-trip ends, whatever the
 # editor did.

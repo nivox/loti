@@ -37,6 +37,9 @@ anstyle = "1"
 ratatui = "0.29"
 ratatui-markdown = "0.3"
 crossterm = "0.28"
+# Pinned to what ratatui itself depends on, so a cell's width here always
+# agrees with the width ratatui laid the buffer out with.
+unicode-width = "=0.2.0"
 assert_cmd = "2"
 
 # A release is one self-contained executable, small enough to drop into a

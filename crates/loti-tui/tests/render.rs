@@ -1028,13 +1028,13 @@ fn the_claim_column_costs_a_level_nothing_while_nothing_on_it_is_claimed() {
     let width = nav_pane_width(&app);
     let (terminal, _) = draw(&mut app);
     let unclaimed = nav_pane(&terminal, width);
-    // Every name on the level, taken from the rows the browser built rather than
-    // spelled here, so the assertion covers whatever the level holds: its
-    // collections as well as its work.
+    // A claim column belongs to work rows only. Collection rows never carried a
+    // claim and must not give up their identifying text for a work-only column.
     let names: Vec<String> = app
         .nav()
         .rows()
         .iter()
+        .filter(|r| matches!(r.kind, RowKind::Work { .. }))
         .map(|r| r.name.clone())
         .filter(|n| !n.is_empty())
         .collect();
@@ -3664,4 +3664,44 @@ fn a_ticket_made_on_a_row_is_named_in_the_notice_by_the_reference_the_store_gave
         rows.iter().any(|l| l.contains("Wire the footer")),
         "the new ticket is not on the epic's level: {rows:#?}"
     );
+}
+
+#[test]
+fn collection_rows_keep_distinguishable_names_when_work_columns_grow() {
+    let (_dir, store) = fixture();
+    let work = NodeRef::new("browser", 2);
+    claim(&store, &work);
+    // A wide count and a claim make work rows expensive. Collection rows have
+    // neither, so charging them those columns would collapse all four names at
+    // the narrow pane width this test holds.
+    for i in 0..15 {
+        ops::create_node(
+            &store,
+            NewNode {
+                epic_id: "browser".into(),
+                parent: Some(work.clone()),
+                name: format!("grandchild {i}"),
+                summary: "s".into(),
+                labels: vec![],
+                body: String::new(),
+            },
+        )
+        .unwrap();
+    }
+
+    let mut app = App::new(store, Theme::with_color(false)).unwrap();
+    app.apply(Action::Descend).unwrap();
+    to_work_row(&mut app);
+    app.apply(Action::Descend).unwrap();
+    app.set_nav_percent(15);
+    let width = nav_pane_width(&app);
+    let (terminal, _) = draw(&mut app);
+    let rows = nav_pane(&terminal, width);
+
+    for name in ["labels", "comments", "blocked…", "assets"] {
+        assert!(
+            rows.iter().any(|row| row.contains(name)),
+            "collection name {name:?} was lost to work-only columns: {rows:#?}"
+        );
+    }
 }

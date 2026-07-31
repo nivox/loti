@@ -6,11 +6,14 @@
 //! where the previewed ticket sits. A transient notice draws over the strip
 //! rather than beside or above it, so nothing under it ever moves.
 
+use std::borrow::Cow;
+
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::action::FieldKind;
 use crate::app::{App, Field, Modal, Placement, Shown, Surface};
@@ -830,6 +833,19 @@ fn draw_nav(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
             .map(|r| count_cell(r).chars().count())
             .max()
             .unwrap_or(0);
+        // A collection row carries no identifier of its own and is never
+        // claimed, so the level's identifier and claim columns are entirely a
+        // cost the work rows impose — charging a collection row for them buys it
+        // nothing and steals from its name, which is the whole of what identifies
+        // it at a glance. Its own count column is sized from collection rows
+        // alone for the same reason: a child count like "(37)" is a work row's
+        // width, not a collection's.
+        let collection_count_width = rows
+            .iter()
+            .filter(|r| matches!(r.kind, RowKind::Collection(_)))
+            .map(|r| count_cell(r).chars().count())
+            .max()
+            .unwrap_or(0);
         // Zero when nothing on the level is claimed, so an unclaimed level spends
         // no width on the column at all. It is one decision for the level and not
         // one per row: a marked row and its unmarked neighbours line their names
@@ -848,12 +864,16 @@ fn draw_nav(f: &mut Frame, area: Rect, app: &App, theme: Theme) {
                     Style::default().fg(theme.muted()),
                 ))));
             }
+            let (row_label_width, row_count_width, row_claim_width) = match row.kind {
+                RowKind::Collection(_) => (0, collection_count_width, 0),
+                _ => (label_width, count_width, claim_width),
+            };
             items.push(ListItem::new(row_line(
                 row,
                 theme,
-                label_width,
-                count_width,
-                claim_width,
+                row_label_width,
+                row_count_width,
+                row_claim_width,
                 inner.width as usize,
                 emphasis(editing, index == app.nav().cursor()),
             )));
@@ -1074,17 +1094,55 @@ fn row_line<'a>(
     Line::from(spans)
 }
 
-/// Truncate to a column budget, marking the cut so a clipped name cannot be
-/// mistaken for a short one.
+/// The mark a cut carries, so a clipped value cannot be mistaken for a short
+/// one that happened to end there.
+const CUT_MARKER: char = '…';
+
+/// Drop every control character from `text` before it reaches a one-line slot.
+///
+/// A control character — a newline foremost, but any of them — moves the
+/// terminal's own cursor or paints outside the cell ratatui laid out for it, so
+/// a slot specified as one line cannot pass one through untouched: it is the
+/// frame itself that a store-derived value could corrupt, not merely the
+/// column budget. Removed rather than substituted, so a scrubbed value still
+/// reads as prose rather than gaining a placeholder glyph for a character
+/// nobody typed.
+fn scrub_control(text: &str) -> Cow<'_, str> {
+    if text.chars().any(|c| c.is_control()) {
+        Cow::Owned(text.chars().filter(|c| !c.is_control()).collect())
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+/// Fit `text` to a one-line slot `budget` columns wide.
+///
+/// Scrubbed of control characters first, since none may reach the frame, then
+/// cut by the display width the terminal actually draws rather than by
+/// character count — a budget counted in columns has to be enforced in
+/// columns, or a value made of wide glyphs overruns the line the count
+/// believed it fit inside. A cut is marked with [`CUT_MARKER`], so a clipped
+/// value cannot be mistaken for a short one.
 fn truncate(text: &str, budget: usize) -> String {
     if budget == 0 {
         return String::new();
     }
-    if text.chars().count() <= budget {
-        return text.to_string();
+    let text = scrub_control(text);
+    if text.width() <= budget {
+        return text.into_owned();
     }
-    let kept: String = text.chars().take(budget.saturating_sub(1)).collect();
-    format!("{kept}…")
+    let kept_budget = budget.saturating_sub(CUT_MARKER.width().unwrap_or(1));
+    let mut kept = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let width = ch.width().unwrap_or(0);
+        if used + width > kept_budget {
+            break;
+        }
+        used += width;
+        kept.push(ch);
+    }
+    format!("{kept}{CUT_MARKER}")
 }
 
 /// The key column's width: the widest binding, so descriptions line up.
@@ -1447,6 +1505,23 @@ mod tests {
         assert_eq!(truncate("short", 10), "short");
         assert_eq!(truncate("a longer name", 6), "a lon…");
         assert_eq!(truncate("anything", 0), "");
+    }
+
+    #[test]
+    fn one_line_text_is_scrubbed_and_fitted_by_display_width() {
+        for budget in 1..8 {
+            let fitted = truncate("名\n字", budget);
+            assert!(
+                !fitted.chars().any(char::is_control),
+                "control character survived: {fitted:?}"
+            );
+            assert!(
+                fitted.width() <= budget,
+                "display width exceeded {budget}: {fitted:?}"
+            );
+        }
+        assert_eq!(truncate("名\n字", 4), "名字");
+        assert_eq!(truncate("名\n字", 3), "名…");
     }
 
     #[test]

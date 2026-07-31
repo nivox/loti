@@ -582,6 +582,7 @@ dependencies = [
  "ratatui",
  "ratatui-markdown",
  "tempfile",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]
