@@ -160,9 +160,6 @@ pub struct NewEpic {
 /// Create an epic. Refuses if the id is already taken. The new epic starts its
 /// number pool at 1 and is open (not closed).
 pub fn create_epic(store: &Store, new: NewEpic) -> Result<EpicFile, OpError> {
-    if store.epic_path(&new.epic_id).is_file() {
-        return Err(OpError::EpicExists(new.epic_id));
-    }
     let ts = now();
     let epic = EpicFile {
         frontmatter: EpicFrontmatter {
@@ -181,7 +178,9 @@ pub fn create_epic(store: &Store, new: NewEpic) -> Result<EpicFile, OpError> {
         },
         body: new.body,
     };
-    store.write_epic(&new.epic_id, &epic)?;
+    if !store.create_epic(&new.epic_id, &epic)? {
+        return Err(OpError::EpicExists(new.epic_id));
+    }
     Ok(epic)
 }
 
@@ -1328,6 +1327,7 @@ pub const DEFAULT_FORCE: Force = Force::Deny;
 mod tests {
     use super::*;
     use crate::lock::LockConfig;
+    use std::sync::Barrier;
     use std::time::Duration;
 
     fn fast_store(root: &std::path::Path) -> Store {
@@ -1398,6 +1398,50 @@ mod tests {
             create_epic(&s, new_epic("e")),
             Err(OpError::EpicExists(_))
         ));
+    }
+
+    #[test]
+    fn two_concurrent_epic_creates_acknowledge_only_the_persisted_one() {
+        let (_d, s) = patient_store();
+        std::fs::create_dir(s.epic_dir("e")).unwrap();
+        // Keep both operations behind the target lock until their simultaneous
+        // starts contend for the same absent file. Releasing it provokes the
+        // create race without adding a test-only hook to the operation.
+        let held = lock::acquire(&s.epic_path("e"), &patient_config(), Force::Deny).unwrap();
+        let ready = Barrier::new(3);
+
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                ready.wait();
+                let mut epic = new_epic("e");
+                epic.name = "first".into();
+                create_epic(&s, epic)
+            });
+            let second = scope.spawn(|| {
+                ready.wait();
+                let mut epic = new_epic("e");
+                epic.name = "second".into();
+                create_epic(&s, epic)
+            });
+            ready.wait();
+            std::thread::sleep(HOLD);
+            held.abort().unwrap();
+            (first.join().unwrap(), second.join().unwrap())
+        });
+
+        let created = match (first, second) {
+            (Ok(created), Err(OpError::EpicExists(id)))
+            | (Err(OpError::EpicExists(id)), Ok(created)) => {
+                assert_eq!(id, "e");
+                created
+            }
+            outcomes => panic!("one creator must succeed and the other refuse: {outcomes:?}"),
+        };
+        assert_eq!(
+            s.read_epic("e").unwrap().frontmatter.name,
+            created.frontmatter.name,
+            "the stored epic is the one whose creator reported success"
+        );
     }
 
     #[test]

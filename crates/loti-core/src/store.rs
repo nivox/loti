@@ -253,6 +253,24 @@ impl Store {
         self.write_epic_forced(epic_id, epic, Force::Deny)
     }
 
+    /// Create an epic file only if its path is absent, returning whether this
+    /// caller created it. The target's lock is taken before absence is checked,
+    /// so two creators of one id cannot both observe a free path and publish.
+    ///
+    /// The boolean deliberately reports only the storage fact; the operation
+    /// layer owns the user-facing duplicate-id refusal.
+    pub fn create_epic(&self, epic_id: &str, epic: &EpicFile) -> Result<bool, StoreError> {
+        let dir = self.epic_dir(epic_id);
+        create_dir_all(&dir)?;
+        let path = self.epic_path(epic_id);
+        let Some(lock) = self.take_absent_path(&path, Force::Deny)? else {
+            return Ok(false);
+        };
+        self.version_gate().verify()?;
+        lock.commit(epic.to_text()?.as_bytes())?;
+        Ok(true)
+    }
+
     /// As [`Store::write_epic`], but a stale lock from an interrupted operation
     /// is cleared and the write proceeds (the `--force` path). The one
     /// epic-write body every public epic write funnels into, so the force
@@ -555,20 +573,29 @@ impl Store {
                 number += 1;
                 continue;
             }
-            let lock = lock::acquire(&path, &self.lock_config, force)?;
-            // Re-check under the lock: another operation may have published this
-            // number between the existence check and taking the lock. If so,
-            // release (drop) and probe forward.
-            if path.exists() {
-                drop(lock);
-                number += 1;
-                continue;
+            if let Some(lock) = self.take_absent_path(&path, force)? {
+                return Ok((number, lock));
             }
-            return Ok((number, lock));
+            number += 1;
         }
         Err(StoreError::Exhausted {
             epic_id: epic_id.to_string(),
         })
+    }
+
+    /// Take a path's lock, then decide whether the path remains free while that
+    /// lock is held. This is the exclusive-create seam shared by node slots and
+    /// epic files: no caller may check first and publish later.
+    fn take_absent_path(
+        &self,
+        path: &Path,
+        force: Force,
+    ) -> Result<Option<lock::TempLock>, StoreError> {
+        let lock = lock::acquire(path, &self.lock_config, force)?;
+        if path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(lock))
     }
 
     /// Best-effort bump of the epic's `next-number` hint to `at_least`.
