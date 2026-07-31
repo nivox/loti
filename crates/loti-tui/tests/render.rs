@@ -3484,3 +3484,146 @@ fn a_comment_withdrawal_asks_by_number_and_the_row_keeps_the_number_it_had() {
         "a withdrawal took a slot, so the number could be reused: {held:?}"
     );
 }
+
+/// The tickets an epic lists, by the reference each is addressed by — read
+/// through the same seam the browser draws its rows from, so a test about
+/// something created asserts against what the store now holds rather than against
+/// a number spelled out here.
+fn top_level_tickets(store: &Store) -> Vec<String> {
+    loti_tui::data::rows(store, &loti_tui::data::Level::Epic("browser".into()))
+        .expect("the epic's level can be listed")
+        .into_iter()
+        .filter(|row| matches!(row.kind, RowKind::Work { .. }))
+        .map(|row| row.selection.reference())
+        .collect()
+}
+
+/// Fill the open form in, field by field from the first, the way a reader does.
+fn fill(app: &mut App, values: &[&str]) {
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            app.apply(Action::NextField).unwrap();
+        }
+        type_into(app, value);
+    }
+}
+
+#[test]
+fn the_epic_form_is_a_float_of_its_own_fields_and_the_notice_names_what_it_made() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    let (before, browsing) = draw(&mut app);
+    // Nothing about the roster says a mode is on, because none is: the form is a
+    // key of the browser's own and freezes no row.
+    assert!(!browsing[0].contains("EDITING"), "{:?}", browsing[0]);
+
+    app.apply(Action::CreateEpic).unwrap();
+    let (after, drawn) = draw(&mut app);
+    assert!(!drawn[0].contains("EDITING"), "{:?}", drawn[0]);
+    let (before, after) = (cells(&before), cells(&after));
+    // Bounded to everything above the hint strip, which legitimately changes: the
+    // keys that apply are the form's own now.
+    let body = ..after.len() - 1;
+    let region @ (x, y, width, height) = changed_box(&before[body], &after[body]);
+    let float = box_lines(&after, region);
+    assert_eq!(after[y][x], "\u{250c}", "{float:#?}");
+    assert!(float[0].contains("new epic"), "{float:#?}");
+    // Nothing underneath moved: the panes are where they were, merely covered.
+    let (columns, rows) = (after[0].len(), after.len());
+    assert!(x > 0 && y > 0, "{region:?}");
+    assert!(x + width < columns && y + height < rows - 1, "{region:?}");
+
+    // Every field it asks for is on screen and named, in the order they are filled
+    // in: the id it will be addressed by, then what it is called and what it is
+    // for. A form whose later fields were off the float would be a form a reader
+    // could not finish.
+    for (line, label) in float[1..].iter().zip(["epic id", "name", "summary"]) {
+        assert!(line.contains(label), "{label:?}: {float:#?}");
+    }
+    // And the strip carries the keys that move between them, which a form with one
+    // field never shows.
+    assert!(drawn[23].contains("Tab fields"), "{:?}", drawn[23]);
+
+    fill(&mut app, &["a-second-effort", "A second effort", "later"]);
+    app.apply(Action::Accept).unwrap();
+    let (terminal, saved) = draw(&mut app);
+    // The reader typed the id, so the notice names it without asking the write for
+    // anything, and the form is gone with the write that finished it.
+    assert!(
+        saved[23].contains("epic a-second-effort created"),
+        "{:?}",
+        saved[23]
+    );
+    assert!(
+        !saved.iter().any(|l| l.contains("new epic")),
+        "the float outlived the write: {saved:#?}"
+    );
+    // The store was re-read, so the epic the reader made is a row they can stand
+    // on. Read off the navigation pane's own cells, because the preview beside it
+    // names the same epic on the same line.
+    let rows = nav_pane(&terminal, nav_pane_width(&app));
+    assert!(
+        rows.iter().any(|l| l.contains("a-second-effort")),
+        "the new epic is not on the roster: {rows:#?}"
+    );
+    assert_eq!(
+        stored_field(
+            &store,
+            &Selection::Epic("a-second-effort".into()),
+            FreeForm::Summary
+        ),
+        "later",
+        "the last field of the form did not reach the store"
+    );
+}
+
+#[test]
+fn a_ticket_made_on_a_row_is_named_in_the_notice_by_the_reference_the_store_gave_it() {
+    let (_dir, store) = fixture();
+    let mut app = App::new(store.clone(), Theme::with_color(false)).unwrap();
+    freeze_the_epics_row(&mut app);
+    let before = top_level_tickets(&store);
+    // The row teaches the letter that makes a member of it.
+    let (_t, frozen) = draw(&mut app);
+    assert!(frozen[23].contains("a add"), "{:?}", frozen[23]);
+
+    app.apply(Action::Add).unwrap();
+    let (terminal, drawn) = draw(&mut app);
+    let float = float_lines(&terminal, "new ticket on browser");
+    for (line, label) in float[1..].iter().zip(["name", "summary"]) {
+        assert!(line.contains(label), "{label:?}: {float:#?}");
+    }
+    assert!(drawn[0].contains("EDITING"), "{:?}", drawn[0]);
+
+    fill(&mut app, &["Wire the footer", "so it says what applies"]);
+    app.apply(Action::Accept).unwrap();
+    let (_t, saved) = draw(&mut app);
+
+    // The number came out of the epic's pool under the lock, so the notice is
+    // finished from what the write answered rather than from what the form knew:
+    // the reference is the only name the new ticket has, and the reader is told
+    // which ticket theirs became.
+    let after = top_level_tickets(&store);
+    let made: Vec<&String> = after.iter().filter(|r| !before.contains(r)).collect();
+    assert_eq!(made.len(), 1, "{after:?}");
+    assert!(
+        saved[23].contains(made[0].as_str()),
+        "the notice does not name what the store made: {:?} for {made:?}",
+        saved[23]
+    );
+    // A successful write is one edit long: the mode goes with the form.
+    assert!(!saved[0].contains("EDITING"), "{:?}", saved[0]);
+    assert!(
+        !saved.iter().any(|l| l.contains("new ticket on")),
+        "the float outlived the write: {saved:#?}"
+    );
+    // And the reader is standing on a level that shows it, because the write
+    // re-read the store.
+    app.apply(Action::Descend).unwrap();
+    let (terminal, _) = draw(&mut app);
+    let rows = nav_pane(&terminal, nav_pane_width(&app));
+    assert!(
+        rows.iter().any(|l| l.contains("Wire the footer")),
+        "the new ticket is not on the epic's level: {rows:#?}"
+    );
+}

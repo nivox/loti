@@ -1072,6 +1072,40 @@ pub fn comment_target(store: &Store, selection: &Selection) -> Result<CommentTar
 /// name when it is not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Write {
+    /// Create an epic, with the id the reader typed and the name and summary they
+    /// filled in.
+    ///
+    /// The id travels as the selection that will address the epic, because an id is
+    /// exactly how an epic is addressed: what this write is aimed at is the thing it
+    /// creates. Whether that id is already taken is the store's to say, so nothing
+    /// here asks first.
+    ///
+    /// No stamp: a stamp is the precondition of a free-form replacement, and an
+    /// entity that does not exist yet holds nobody's text to discard.
+    CreateEpic {
+        /// The epic to bring into being, addressed by the id it will have.
+        epic: Selection,
+        /// What it is called.
+        name: String,
+        /// Its one-line summary, which may be empty.
+        summary: String,
+    },
+    /// Create a unit of work in the container the row names: a top-level ticket of
+    /// an epic, or a subticket of a ticket.
+    ///
+    /// Which of the two is the row's answer rather than this write's — creation
+    /// acts on the container the cursor stands on — so one write covers both and
+    /// no caller chooses between them.
+    ///
+    /// No stamp, for the same reason an epic's creation carries none.
+    CreateNode {
+        /// The container it is created in: an epic, or the ticket it hangs under.
+        parent: Selection,
+        /// What it is called.
+        name: String,
+        /// Its one-line summary, which may be empty.
+        summary: String,
+    },
     /// Put one label on the container whose label set the row names, with the
     /// text the reader typed.
     AddLabel(Selection, String),
@@ -1156,7 +1190,9 @@ impl Write {
     /// a reference of its own.
     pub fn target(&self) -> &Selection {
         match self {
-            Write::AddLabel(target, _)
+            Write::CreateEpic { epic: target, .. }
+            | Write::CreateNode { parent: target, .. }
+            | Write::AddLabel(target, _)
             | Write::RemoveLabel(target)
             | Write::AddBlocker(target, _)
             | Write::RemoveBlocker(target)
@@ -1200,11 +1236,18 @@ impl Write {
 /// worded with the question that raised it, because the size of a cascade is
 /// something only the write knows — the count a surface showed was the plan as it
 /// stood when the surface opened, and the store recomputes it under the lock.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     /// Exactly what was asked for and nothing besides, which is every write the
     /// browser makes but one.
     AsAsked,
+    /// The reference the store recorded a newly created unit of work under.
+    ///
+    /// The browser cannot know it in advance: a number is allocated from its epic's
+    /// pool under the lock, and the reference that number makes is the only name
+    /// the new ticket has. An epic's own id is not one of these — the reader typed
+    /// it, so it was knowable before the write.
+    Created(String),
     /// A close that resolved this many of the row's open descendants with it.
     ///
     /// Never none: a cascade that finds nothing left to close — somebody else got
@@ -1253,6 +1296,18 @@ pub enum Refusal {
 /// here pre-checks a store rule.
 pub fn perform(store: &Store, write: &Write) -> Result<Effect, Refusal> {
     match write {
+        Write::CreateEpic {
+            epic,
+            name,
+            summary,
+        } => as_asked(create_epic(store, epic, name, summary)),
+        // The third write whose notice only the store can finish: which number the
+        // new ticket took is decided under the lock.
+        Write::CreateNode {
+            parent,
+            name,
+            summary,
+        } => create_node(store, parent, name, summary),
         // Only a state pick can do more than it was asked for, so every other write
         // reports what it was asked for: the one place a notice is finished by the
         // store cannot then be forgotten for the one write that needs it.
@@ -1475,6 +1530,81 @@ fn wrong_state(selection: &Selection, state: State) -> Refusal {
         "{} cannot be {}",
         selection.reference(),
         state.wire_name()
+    ))
+}
+
+/// Create an epic under the id the reader typed.
+///
+/// Whether the id is free is the store's rule and is not asked here: a duplicate
+/// comes back as the store's own refusal, in the store's own words, so that rule
+/// lives in exactly one place. What the *browser* insists on about an id is the
+/// shape of it, and that is settled before a write is built at all.
+///
+/// The new epic starts with no labels and an empty body: a creation form asks for
+/// what a row cannot be read without, and everything else is edited afterwards by
+/// the letter that owns it.
+fn create_epic(store: &Store, epic: &Selection, name: &str, summary: &str) -> Result<(), Refusal> {
+    let Selection::Epic(id) = epic else {
+        return Err(misdirected(format!(
+            "{} is not an epic id",
+            epic.reference()
+        )));
+    };
+    ops::create_epic(
+        store,
+        ops::NewEpic {
+            epic_id: id.clone(),
+            name: name.to_string(),
+            summary: summary.to_string(),
+            labels: Vec::new(),
+            body: String::new(),
+        },
+    )
+    .map(|_| ())
+    .map_err(refusal)
+}
+
+/// Create a unit of work in the container the row names: a top-level ticket of an
+/// epic, or a subticket of the ticket the row stands on.
+///
+/// Which of the two comes off the container alone, because creation acts on the
+/// container the cursor stands on — so there is nothing here to choose and no way
+/// to ask for a subticket of an epic. Any other kind of row holds no units of
+/// work, and is a caller that has lost track of what its row points at.
+///
+/// The number is the store's to allocate, out of its epic's pool and under the
+/// lock, so the reference is answered back rather than predicted: it is the only
+/// name the new ticket has, and the reader is told which ticket theirs became.
+fn create_node(
+    store: &Store,
+    parent: &Selection,
+    name: &str,
+    summary: &str,
+) -> Result<Effect, Refusal> {
+    let (epic_id, under) = match parent {
+        Selection::Epic(id) => (id.clone(), None),
+        Selection::Node(r) => (r.epic_id.clone(), Some(r.clone())),
+        other => {
+            return Err(misdirected(format!(
+                "{} holds no tickets",
+                other.reference()
+            )))
+        }
+    };
+    let created = ops::create_node(
+        store,
+        ops::NewNode {
+            epic_id: epic_id.clone(),
+            parent: under,
+            name: name.to_string(),
+            summary: summary.to_string(),
+            labels: Vec::new(),
+            body: String::new(),
+        },
+    )
+    .map_err(refusal)?;
+    Ok(Effect::Created(
+        NodeRef::new(epic_id, created.frontmatter.number).to_string(),
     ))
 }
 
@@ -2502,7 +2632,7 @@ pub(crate) mod fixture {
 mod tests {
     use super::fixture::Fixture;
     use super::*;
-    use loti_core::ops::{EpicEdits, NodeEdits};
+    use loti_core::ops::{EpicEdits, NewEpic, NodeEdits};
 
     /// The words a refusal is shown in.
     ///
@@ -3582,6 +3712,210 @@ mod tests {
             assert!(err.contains(&wrong.reference()), "{wrong:?}: {err}");
             assert_eq!(fx.epic_comments().len(), after.len(), "{wrong:?} wrote");
         }
+    }
+
+    /// What a level lists, as the selections its rows point at: the same listing
+    /// the browser draws, so a test about something created asserts that the row is
+    /// there rather than that a file is.
+    fn listed(store: &Store, level: &Level) -> Vec<Selection> {
+        rows(store, level)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.selection)
+            .collect()
+    }
+
+    /// The units of work a level lists, dropping the collection rows every epic and
+    /// node level leads with.
+    fn work_selections(store: &Store, level: &Level) -> Vec<Selection> {
+        work_rows(&rows(store, level).unwrap())
+            .into_iter()
+            .map(|row| row.selection)
+            .collect()
+    }
+
+    /// The unit of work a creation answered with, by the reference the store gave
+    /// it — which is the only name it has, so a test that could not read it back
+    /// could not say what was made.
+    fn created(effect: Effect) -> Selection {
+        match effect {
+            Effect::Created(reference) => Selection::Node(
+                NodeRef::parse(&reference).expect("the store answers with a reference it recorded"),
+            ),
+            other => panic!("a creation did not name what it created: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_ticket_is_created_in_the_container_its_row_names_and_the_store_names_what_it_made() {
+        let fx = Fixture::build();
+        let top_level = Level::Epic(fx.epic.clone());
+        let under_the_ticket = Level::Node(fx.node.clone());
+        let before_top = work_selections(&fx.store, &top_level);
+        let before_under = work_selections(&fx.store, &under_the_ticket);
+
+        // An epic's row is the container of its top-level tickets.
+        let made = created(
+            perform(
+                &fx.store,
+                &Write::CreateNode {
+                    parent: fx.epic_selection(),
+                    name: "A new thing".to_string(),
+                    summary: "what it is for".to_string(),
+                },
+            )
+            .unwrap(),
+        );
+
+        // The reference the write answered with names a ticket that is there, on the
+        // level the row it was made from lists, and holds what was filled in.
+        let after_top = work_selections(&fx.store, &top_level);
+        let arrivals: Vec<&Selection> = after_top
+            .iter()
+            .filter(|s| !before_top.contains(s))
+            .collect();
+        assert_eq!(arrivals, vec![&made], "{after_top:?}");
+        assert_eq!(fx.field(&made, FreeForm::Name), "A new thing");
+        assert_eq!(fx.field(&made, FreeForm::Summary), "what it is for");
+        // A creation form asks for neither, so a new unit of work starts with an
+        // empty body and no labels: everything else is edited once the row exists.
+        assert_eq!(fx.field(&made, FreeForm::Body), "");
+        assert_eq!(
+            work_selections(&fx.store, &under_the_ticket),
+            before_under,
+            "a ticket of the epic hung under one of its tickets"
+        );
+
+        // And a ticket's row is the container of its subtickets, so the same write
+        // aimed at one makes a subticket of it and not another top-level ticket.
+        let under = created(
+            perform(
+                &fx.store,
+                &Write::CreateNode {
+                    parent: fx.node_selection(),
+                    name: "Under it".to_string(),
+                    summary: String::new(),
+                },
+            )
+            .unwrap(),
+        );
+        assert!(
+            work_selections(&fx.store, &under_the_ticket).contains(&under),
+            "the subticket is not under the ticket its row named"
+        );
+        assert!(
+            !work_selections(&fx.store, &top_level).contains(&under),
+            "a subticket was made a top-level ticket of the epic"
+        );
+        // A summary is a line a reader may leave for later, and an empty one is
+        // written as empty rather than refused here: what makes a value acceptable
+        // is the store's rule.
+        assert_eq!(fx.field(&under, FreeForm::Summary), "");
+
+        // A row that holds no units of work at all is a caller that has lost track
+        // of what its row points at: refused by name, with nothing written.
+        let unchanged = work_selections(&fx.store, &top_level);
+        for wrong in [fx.comments_selection(), fx.blocked_by_selection()] {
+            let err = refusal_words(
+                perform(
+                    &fx.store,
+                    &Write::CreateNode {
+                        parent: wrong.clone(),
+                        name: "nowhere".to_string(),
+                        summary: String::new(),
+                    },
+                )
+                .expect_err("only a container of units of work takes a creation"),
+            );
+            assert!(err.contains(&wrong.reference()), "{wrong:?}: {err}");
+            assert_eq!(
+                work_selections(&fx.store, &top_level),
+                unchanged,
+                "{wrong:?} wrote something"
+            );
+        }
+    }
+
+    #[test]
+    fn an_epic_is_created_under_the_id_it_was_given_and_a_taken_one_is_the_stores_refusal() {
+        let fx = Fixture::build();
+        let before = listed(&fx.store, &Level::Epics);
+        let made = Selection::Epic("a-second-effort".to_string());
+        assert!(!before.contains(&made), "the fixture already holds it");
+
+        let effect = perform(
+            &fx.store,
+            &Write::CreateEpic {
+                epic: made.clone(),
+                name: "A second effort".to_string(),
+                summary: "somewhere else".to_string(),
+            },
+        )
+        .unwrap();
+        // The reader typed the id, so the store knew nothing about the new epic that
+        // the browser could not already say: unlike a ticket, whose number the store
+        // allocates, this write reports exactly what it was asked for.
+        assert_eq!(effect, Effect::AsAsked);
+
+        assert!(
+            listed(&fx.store, &Level::Epics).contains(&made),
+            "the epic is not on the roster the browser lists"
+        );
+        assert_eq!(fx.field(&made, FreeForm::Name), "A second effort");
+        assert_eq!(fx.field(&made, FreeForm::Summary), "somewhere else");
+        assert_eq!(fx.field(&made, FreeForm::Body), "");
+
+        // Whether an id is free is the store's rule and nothing here asks first: a
+        // second epic under a taken id comes back refused in the store's own words,
+        // compared against what the operation itself produces, which is what a
+        // wrapped or reworded refusal would fail.
+        let held = fx.epic_field(FreeForm::Name);
+        let shown = refusal_words(
+            perform(
+                &fx.store,
+                &Write::CreateEpic {
+                    epic: fx.epic_selection(),
+                    name: "Again".to_string(),
+                    summary: String::new(),
+                },
+            )
+            .expect_err("the store refuses an id it already holds"),
+        );
+        let its_own = ops::create_epic(
+            &fx.store,
+            NewEpic {
+                epic_id: fx.epic.clone(),
+                name: "Again".to_string(),
+                summary: String::new(),
+                labels: Vec::new(),
+                body: String::new(),
+            },
+        )
+        .expect_err("the store refuses an id it already holds")
+        .to_string();
+        assert_eq!(shown, its_own);
+        assert_eq!(
+            fx.epic_field(FreeForm::Name),
+            held,
+            "a refused creation overwrote the epic that holds the id"
+        );
+
+        // And an address that is not an epic's is a caller that has lost track of
+        // what it is creating: refused by name, with nothing written.
+        let roster = listed(&fx.store, &Level::Epics);
+        let err = refusal_words(
+            perform(
+                &fx.store,
+                &Write::CreateEpic {
+                    epic: fx.node_selection(),
+                    name: "nowhere".to_string(),
+                    summary: String::new(),
+                },
+            )
+            .expect_err("only an epic id addresses an epic"),
+        );
+        assert!(err.contains(&fx.node.to_string()), "{err}");
+        assert_eq!(listed(&fx.store, &Level::Epics), roster);
     }
 
     #[test]

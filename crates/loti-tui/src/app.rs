@@ -56,6 +56,21 @@ const EDITING_NEEDS_THE_NAV_PANE: &str = "editing needs the navigation pane — 
 /// editing session ended with the store's writability.
 const EDITING_STOPPED_READ_ONLY: &str = "the store can no longer be written — editing stopped";
 
+/// What the key that creates an epic says where an epic is not created from. It
+/// names where it is, because the key is the browser's own rather than a letter a
+/// row offers, and silence would read as a broken key.
+const EPICS_ARE_MADE_FROM_THE_EPICS_LIST: &str =
+    "a new epic is made from the epics list, not from inside one";
+
+/// What the key that ends a browsing session says while a buffer holds text the
+/// store has never been given.
+///
+/// A buffer of its own, rather than editing mode's notice: an epic is created
+/// outside the mode, so there is no frozen row and "not an editing action" would
+/// name a mode the reader is not in. It carries the way out itself, because a
+/// notice covers the whole hint strip for as long as it is up.
+const NOT_A_WAY_OUT_OF_A_BUFFER: &str = "nothing is written yet — Esc leaves this buffer";
+
 /// The title a question about the frozen row carries. Fixed, so what a dialog is
 /// stays legible when its text is the store's own and no browser word introduces
 /// it.
@@ -68,6 +83,11 @@ const REFUSAL_TITLE: &str = " the store refused the change ";
 const CONFLICT_TITLE: &str = " the entity changed while you were editing ";
 /// See [`CONFIRM_TITLE`].
 const REQUIRED_TITLE: &str = " a required field is empty ";
+/// See [`CONFIRM_TITLE`]. A value the *browser* will not send, as against one the
+/// store refuses: the titles differ because the two are different answers from
+/// different places, and a reader who cannot tell them apart cannot tell whose
+/// rule they have run into.
+const REJECTED_TITLE: &str = " that value cannot be used ";
 /// See [`CONFIRM_TITLE`]. The browser hands the terminal over for an external
 /// editor, so an editor that will not run is the browser's failure to report and
 /// not the store's.
@@ -102,6 +122,10 @@ const COMMENT_FIELD: &str = "comment";
 /// it says who is on the work rather than who wrote the change, so the field is
 /// named for the holder and never for an author.
 const CLAIM_FIELD: &str = "claim holder";
+/// See [`LABEL_FIELD`]. The id a new epic is created under. Named for the epic
+/// rather than called `id` alone, because the warning about it is read over a
+/// float that covers everything else on screen.
+const EPIC_ID_FIELD: &str = "epic id";
 
 /// What the field offering a cascade is called: the question it asks, with the
 /// number of nodes it would close in it.
@@ -136,6 +160,10 @@ fn reported(done: String, effect: data::Effect) -> String {
         // store assigns it under the lock, so the reader is told which comment they
         // now have rather than merely that they have one.
         data::Effect::Commented(id) => format!("{done}, numbered {id}"),
+        // A ticket is addressed by the reference its number makes, and the number
+        // comes out of its epic's pool under the lock: the reader is told which
+        // ticket theirs became rather than merely that there is one.
+        data::Effect::Created(reference) => format!("{done} as {reference}"),
     }
 }
 
@@ -415,6 +443,22 @@ impl Dialog {
         )
     }
 
+    /// The warning a surface accepted with a value the browser itself will not
+    /// send raises instead of writing. It carries the browser's own rule in the
+    /// browser's own words, under a title of its own, so a reader can tell it from
+    /// a store refusal shown verbatim — and dismissing it lands in the offending
+    /// field, exactly as an empty required one does.
+    fn rejected(why: String, index: usize) -> Self {
+        Self::report(
+            REJECTED_TITLE,
+            why,
+            Dismissal {
+                word: "back to the field",
+                performs: Some(OnDismissal::Focus(index)),
+            },
+        )
+    }
+
     /// The fixed title that says what kind of dialog this is, since the text in it
     /// may be the store's own and introduces itself with nothing.
     pub fn title(&self) -> &str {
@@ -499,6 +543,39 @@ enum Content {
     Pick { options: Vec<Choice>, at: usize },
 }
 
+/// What the browser itself insists on about a field's value, over and above there
+/// being one at all.
+///
+/// Invariant: this is never a store rule reimplemented. What makes a value
+/// acceptable is the store's judgement and its refusal is shown verbatim, so the
+/// only thing here is a value the store does not judge — an epic's id is used as
+/// a plain name, and a value that is no name addresses something other than what
+/// the reader asked for. Whether an id is *free* stays the store's answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Check {
+    /// Nothing: the store is the only judge of this value.
+    Store,
+    /// A usable epic id.
+    EpicId,
+}
+
+impl Check {
+    /// Why the browser will not send this value, and `None` where it will.
+    fn objection(self, value: &str) -> Option<String> {
+        match self {
+            Check::Store => None,
+            // An epic id is one plain name. It is the whole left-hand side of every
+            // `<epic-id>/<number>` reference, which is read by splitting on the
+            // separator, and it is the name the epic is kept under — so a separator
+            // in it names something other than the epic asked for, and the two names
+            // that mean "a directory" rather than a name name no epic at all.
+            Check::EpicId => (value.contains('/') || value == "." || value == "..").then(|| {
+                "an epic id is one name: it cannot contain / and cannot be . or ..".to_string()
+            }),
+        }
+    }
+}
+
 /// One field of an editing surface: something to type into, or something to pick
 /// from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -512,6 +589,9 @@ pub struct Field {
     label: String,
     /// Whether the store cannot be given this surface with the field left empty.
     required: bool,
+    /// What the browser itself insists on about the value, over and above there
+    /// being one; see [`Check`].
+    check: Check,
     /// What it holds, which is the whole of the difference between the kinds.
     content: Content,
     /// Whether a content-mutating keystroke has landed here.
@@ -533,6 +613,16 @@ impl Field {
         Self::filled(label, required, lines, String::new())
     }
 
+    /// An empty required line the browser has a rule of its own about; see
+    /// [`Check`]. Required, because a check on a value only means anything where
+    /// there has to be one.
+    fn checked(label: impl Into<String>, check: Check) -> Self {
+        Self {
+            check,
+            ..Self::new(label, true, Lines::One)
+        }
+    }
+
     /// A field the reader picks a value in, starting on the value given — which is
     /// the value the store holds, so a save that changes nothing writes what is
     /// there rather than whatever happened to be listed first.
@@ -543,6 +633,9 @@ impl Field {
         Self {
             label: label.into(),
             required: false,
+            // A picker offers only values the browser put there, so there is
+            // nothing about one for the browser to object to.
+            check: Check::Store,
             content: Content::Pick {
                 // A value the list does not offer marks the first one instead: a
                 // picker with nothing marked would have no value at all.
@@ -567,6 +660,7 @@ impl Field {
         let mut field = Self {
             label: label.into(),
             required,
+            check: Check::Store,
             content: Content::Text {
                 value: String::new(),
                 cursor: 0,
@@ -649,6 +743,17 @@ impl Field {
     /// why it is never required.
     fn unfilled(&self) -> bool {
         self.required && self.text().is_some_and(|text| text.trim().is_empty())
+    }
+
+    /// Why the browser itself will not send what this field holds, and `None`
+    /// where it will — which is every field but the one the browser has a rule of
+    /// its own about; see [`Check`].
+    ///
+    /// Asked of a field that has something in it: an empty one is answered for by
+    /// being required or not, and a rule about the shape of a value has nothing to
+    /// say about the absence of one.
+    fn rejected(&self) -> Option<String> {
+        self.check.objection(self.text()?)
     }
 
     /// Whether a character may land in a field of text at all.
@@ -902,6 +1007,16 @@ impl Placement {
 /// and can never come to name different things.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Commit {
+    /// Create an epic under the id the first field holds.
+    ///
+    /// It names no row: an epic has no container to be added to, which is why the
+    /// key that opens this surface is the browser's own rather than a letter a row
+    /// offers.
+    CreateEpic,
+    /// Create a unit of work in the container the frozen row names: a top-level
+    /// ticket of an epic, or a subticket of a ticket. Which of the two is the row's
+    /// answer, so one commit covers both.
+    CreateNode(Selection),
     /// Put the label the field holds on the set the frozen row names.
     AddLabel(Selection),
     /// Put the node the field's reference names on the dependency list the frozen
@@ -959,7 +1074,84 @@ enum Commit {
     },
 }
 
+/// What a new member of a container is called: an epic's is a ticket, and a
+/// ticket's is a subticket.
+///
+/// One answer, so the form's title and the notice its write raises cannot come to
+/// call the same thing two things. Only a container the offer table admits ever
+/// reaches it; every other kind of row holds no units of work at all.
+fn node_noun(parent: &Selection) -> &'static str {
+    match parent {
+        Selection::Node(_) => "subticket",
+        Selection::Epic(_)
+        | Selection::Collection(..)
+        | Selection::Label(..)
+        | Selection::Comment(..)
+        | Selection::Asset(..)
+        | Selection::Blocker(..) => "ticket",
+    }
+}
+
+/// The pair of fields every creation form ends with: what the new entity is
+/// called, and its one-line summary.
+///
+/// Named by the store's own words for those fields, so a form that fills one in
+/// and the surface that later replaces it call it the same thing — and required
+/// exactly as they are there. A name is how every row addresses what it names, so
+/// there is no creating something without one; a summary is a line a reader may
+/// leave for later.
+///
+/// A body is not among them: a creation form asks for what a row cannot be read
+/// without, and the long-form text has a letter of its own the moment the row
+/// exists.
+fn naming_fields() -> Vec<Field> {
+    vec![
+        Field::new(data::FreeForm::Name.noun(), true, Lines::One),
+        Field::new(data::FreeForm::Summary.noun(), false, Lines::One),
+    ]
+}
+
 impl Surface {
+    /// The surface that creates an epic: the id it will be addressed by, and the
+    /// pair every creation form ends with.
+    ///
+    /// A float, like every other short form: none of its fields holds prose, and
+    /// there is no row underneath for the reader to keep in view — an epic has no
+    /// container, which is why this one is opened by a key of the browser's own
+    /// rather than by a letter a row offers.
+    ///
+    /// The id leads because everything else about the epic can be changed later and
+    /// it cannot: it is the address, and the browser has a rule of its own about
+    /// the shape of one.
+    fn create_epic() -> Self {
+        let mut fields = vec![Field::checked(EPIC_ID_FIELD, Check::EpicId)];
+        fields.extend(naming_fields());
+        Self {
+            title: " new epic ".to_string(),
+            fields,
+            focus: 0,
+            placement: Placement::Float,
+            commit: Commit::CreateEpic,
+        }
+    }
+
+    /// The surface that creates a unit of work in the container the frozen row
+    /// names, which is a ticket on an epic's row and a subticket on a ticket's.
+    ///
+    /// One form for both, because what is created is decided by the row the cursor
+    /// stands on and not by anything the reader fills in — and what it is called
+    /// follows the same answer, so the title cannot name one and the write make the
+    /// other.
+    fn create_node(parent: Selection) -> Self {
+        Self {
+            title: format!(" new {} on {} ", node_noun(&parent), parent.reference()),
+            fields: naming_fields(),
+            focus: 0,
+            placement: Placement::Float,
+            commit: Commit::CreateNode(parent),
+        }
+    }
+
     /// The surface that adds one label: a single short line, so it is a float and
     /// not the preview pane — keeping the row visible buys nothing for a field this
     /// size, and the pane is where the long-form text goes.
@@ -1171,8 +1363,23 @@ impl Surface {
 
     /// The first required field left empty, which is the one an accept must warn
     /// about and land the reader back in.
+    ///
+    /// Every field is looked at, not only the one the keyboard is in: a form is
+    /// accepted from wherever the reader happens to be standing, so a check that
+    /// stopped at the field in front of them would send a form with a later one
+    /// blank.
     fn unfilled(&self) -> Option<usize> {
         self.fields.iter().position(Field::unfilled)
+    }
+
+    /// The first field whose value the browser itself will not send, and why; see
+    /// [`Check`]. Every field, for the same reason every one is checked for being
+    /// empty.
+    fn rejected(&self) -> Option<(usize, String)> {
+        self.fields
+            .iter()
+            .enumerate()
+            .find_map(|(index, field)| field.rejected().map(|why| (index, why)))
     }
 
     /// Give the focused field a key's intent, and bring the field list back in line
@@ -1294,6 +1501,28 @@ impl Surface {
             .to_string()
     }
 
+    /// What the field in this position holds, and nothing where the surface has no
+    /// such field or that field is not made of text.
+    fn text_at(&self, index: usize) -> String {
+        self.fields
+            .get(index)
+            .and_then(Field::text)
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// The name and the summary a creation form ends with, whatever it asks for in
+    /// front of them.
+    ///
+    /// Read from the end rather than from a position counted per form, so a form
+    /// that leads with something of its own — an epic's id — and one that does not
+    /// read the same pair, and neither can be handed the other's field by
+    /// miscounting. See [`naming_fields`], which is what puts them there.
+    fn named(&self) -> (String, String) {
+        let at = self.fields.len().saturating_sub(2);
+        (self.text_at(at), self.text_at(at + 1))
+    }
+
     /// The field taking keystrokes.
     fn focused_mut(&mut self) -> &mut Field {
         // The focus is read clamped to the fields the surface holds, so there is
@@ -1306,6 +1535,38 @@ impl Surface {
     /// is committed.
     fn write(&self) -> (data::Write, String) {
         match &self.commit {
+            Commit::CreateEpic => {
+                // The id is the form's own leading field; the pair after it is the
+                // pair every creation form ends with.
+                let id = self.text_at(0);
+                let (name, summary) = self.named();
+                (
+                    data::Write::CreateEpic {
+                        epic: Selection::Epic(id.clone()),
+                        name,
+                        summary,
+                    },
+                    // The notice names the epic by the id it now has: the reader
+                    // typed it, so nothing about the write is needed to say it, and
+                    // by the time the notice is read the form is gone.
+                    format!("epic {id} created"),
+                )
+            }
+            Commit::CreateNode(parent) => {
+                let (name, summary) = self.named();
+                (
+                    data::Write::CreateNode {
+                        parent: parent.clone(),
+                        name,
+                        summary,
+                    },
+                    // The notice names what was made and what it was made on. The
+                    // reference it took is added once the write has run: only the
+                    // store knows the number, and that reference is the only name
+                    // the new ticket has.
+                    format!("{} on {} added", node_noun(parent), parent.reference()),
+                )
+            }
             Commit::AddLabel(set) => {
                 let label = self.typed();
                 (
@@ -1661,6 +1922,15 @@ impl App {
         let target = self.editing.as_ref()?;
         match action {
             EditingAction::Add => match target {
+                // Creation acts on the container row the cursor stands on, and an
+                // epic and a ticket are containers of units of work: an epic's row
+                // makes a top-level ticket of that epic, a ticket's row a subticket
+                // of that ticket. There is no "new member of this level" action
+                // beside it, because leaving a level lands the cursor back on the
+                // row that contains it.
+                Selection::Epic(_) | Selection::Node(_) => {
+                    Some(Offer::Fill(Surface::create_node(target.clone())))
+                }
                 // Creation acts on the container row the cursor stands on, so a
                 // label is added from the label set's own row and nowhere else.
                 Selection::Collection(container, Collection::Labels) => Some(Offer::Fill(
@@ -1913,6 +2183,22 @@ impl App {
             // no layer states the rule a second time. See [`App::quit`].
             Action::Quit => {}
 
+            // An epic is created from the epics list and nowhere else: it has no
+            // container row to be added from, which is why this is a key of the
+            // browser's own rather than a letter a row offers.
+            //
+            // Being outside editing mode, it does not pass the offer table where
+            // every other write's availability is decided — so it asks the store's
+            // own state for itself. A store the format gate will not let this binary
+            // write offers no write anywhere, this one included.
+            Action::CreateEpic => match self.read_only {
+                Some(reason) => self.flash(reason.refusal()),
+                None => match self.nav.at_roster() {
+                    true => self.surface = Some(Surface::create_epic()),
+                    false => self.flash(EPICS_ARE_MADE_FROM_THE_EPICS_LIST),
+                },
+            },
+
             Action::EnterEditing => match self.read_only {
                 // A mode whose every action is unavailable is not entered at
                 // all: the key is as unknown as any other action the browser
@@ -1955,15 +2241,23 @@ impl App {
     ///
     /// The rule the layers are checked against is about unsaved work rather than
     /// about which key is live: **quitting never discards text the store has not
-    /// been given.** Editing mode is the only layer that can hold any — a surface
-    /// is open only while the mode is on — so while the mode is on the session
-    /// stays and the notice names the way out, whatever is layered over it.
+    /// been given.** Two layers can hold some — an open buffer, and editing mode,
+    /// which is where all but one buffer is opened from — so while either stands
+    /// the session stays and the notice names the way out of that layer, whatever
+    /// is layered over it.
     ///
     /// A dialog refuses it in silence: the question is on screen listing its own
     /// answers, it is raised only for something failed or costly, and it must be
     /// answered rather than escaped past.
     fn quit(&mut self) -> bool {
         if matches!(self.modal, Some(Modal::Dialog(_))) {
+            return false;
+        }
+        // A buffer holds text the store has never been given, and one of them — the
+        // form that creates an epic — is open outside editing mode, so the buffer
+        // is checked for itself rather than through the mode that usually holds it.
+        if self.surface.is_some() {
+            self.flash(NOT_A_WAY_OUT_OF_A_BUFFER);
             return false;
         }
         if self.editing.is_some() {
@@ -2167,6 +2461,13 @@ impl App {
         if let Some(index) = surface.unfilled() {
             let dialog = Dialog::required(&surface.fields[index].label, index);
             self.modal = Some(Modal::Dialog(Box::new(dialog)));
+            return;
+        }
+        // Emptiness first, then the shape of what is there: a field with nothing in
+        // it is not a field with the wrong thing in it, and a rule about a value has
+        // nothing to say where there is none.
+        if let Some((index, why)) = surface.rejected() {
+            self.modal = Some(Modal::Dialog(Box::new(Dialog::rejected(why, index))));
             return;
         }
         let (write, done) = surface.write();
@@ -2774,14 +3075,13 @@ mod tests {
     const A_THIRD_FIELD: &str = "reason";
 
     /// Open a surface with the fields a test gives it, which no shipped surface
-    /// has: the browser fills in one field today, and which multi-field surface
-    /// writes what belongs to the slice that adds it.
+    /// has: a shape built here is one no slice's own form has to be bent into.
     ///
-    /// Two rules about fields cannot be told from their absence while every
-    /// surface has exactly one — that a field being required is what makes the
-    /// unfilled check fire, and that the field a dismissal points at is the field
-    /// the reader lands in — so they are pinned on a shape built here. It borrows
-    /// the one write there is, and the field it writes is the first.
+    /// Two rules about fields are pinned on it — that a field being required is
+    /// what makes the unfilled check fire, and that the field a dismissal points at
+    /// is the field the reader lands in — because they are rules about any surface
+    /// rather than about the one that happens to hold three fields today. It
+    /// borrows a write that takes one value, and the field it writes is the first.
     fn open_a_surface_with_fields(app: &mut App, fields: Vec<Field>) {
         open_the_label_surface(app);
         let surface = app.surface.as_mut().expect("the surface is open");
@@ -6080,6 +6380,366 @@ mod tests {
         assert_eq!(app.editing_target(), None);
         assert_eq!(app.mode(), Mode::Browse);
         assert!(fx.node_claim().is_none(), "the claim is still held");
+    }
+
+    /// Open the form that creates an epic, the way a reader does: from the epics
+    /// list, with the browser's own key.
+    fn open_the_epic_form(app: &mut App) {
+        to_the_roster(app);
+        app.apply(Action::CreateEpic).unwrap();
+        assert!(app.surface().is_some(), "the epic key opened no form");
+    }
+
+    /// Fill the open form in, field by field from the first, the way a reader does:
+    /// type, move on with the field key, type again.
+    fn fill(app: &mut App, values: &[&str]) {
+        for (index, value) in values.iter().enumerate() {
+            if index > 0 {
+                app.apply(Action::NextField).unwrap();
+            }
+            type_into(app, value);
+        }
+    }
+
+    /// Replace the id the open epic form holds, the way a reader does: back to the
+    /// start of the field, out with what is there, in with the new.
+    ///
+    /// Bounded by how many fields the form holds, so a field key that stopped
+    /// moving fails here rather than spinning with nothing to say.
+    fn retype_the_id(app: &mut App, id: &str) {
+        let fields = app.surface().map_or(0, |surface| surface.fields().len());
+        for _ in 0..=fields {
+            if app.surface().map(Surface::focus) == Some(0) {
+                break;
+            }
+            app.apply(Action::NextField).unwrap();
+        }
+        assert_eq!(
+            app.surface().map(Surface::focus),
+            Some(0),
+            "the field keys would not reach the id"
+        );
+        app.apply(Action::MoveToStart).unwrap();
+        empty_the_field(app);
+        type_into(app, id);
+    }
+
+    /// What the open dialog is titled, which is what says whose rule the reader has
+    /// run into: the browser's own, or the store's shown verbatim.
+    fn dialog_title(app: &App) -> &str {
+        match app.modal() {
+            Some(Modal::Dialog(dialog)) => dialog.title(),
+            other => panic!("no dialog is open: {other:?}"),
+        }
+    }
+
+    /// What the open dialog says.
+    fn dialog_message(app: &App) -> &str {
+        match app.modal() {
+            Some(Modal::Dialog(dialog)) => dialog.message(),
+            other => panic!("no dialog is open: {other:?}"),
+        }
+    }
+
+    /// The epic ids the roster lists, as the browser holds them after its own
+    /// reload — so a test about a creation asserts what the reader now sees.
+    fn roster_ids(app: &App) -> Vec<String> {
+        app.nav()
+            .frame()
+            .rows
+            .iter()
+            .map(|row| row.label.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_epic_key_opens_its_form_at_the_epics_list_and_nowhere_else() {
+        let (fx, mut app) = app();
+        open_the_epic_form(&mut app);
+        let surface = app.surface().expect("the form is open");
+        // Three fields: the address it will have, and the pair every creation form
+        // ends with. A float, because none of them holds prose.
+        assert_eq!(
+            surface
+                .fields()
+                .iter()
+                .map(Field::label)
+                .collect::<Vec<_>>(),
+            vec![EPIC_ID_FIELD, "name", "summary"]
+        );
+        assert_eq!(surface.placement(), Placement::Float);
+        assert_eq!(surface.focus(), 0);
+        // Several fields, and the key map is told so, which is what binds the keys
+        // that move between them.
+        assert_eq!(
+            app.mode(),
+            surface_mode(Fields::Several, FieldKind::OneLine)
+        );
+        // No row is frozen: an epic has no container row to be added from, which is
+        // the whole reason this is not an action inside the mode.
+        assert_eq!(app.editing_target(), None);
+        app.apply(Action::Unwind).unwrap();
+
+        // And nowhere else. Inside an epic and inside one of its tickets the key
+        // opens nothing and says where an epic is made instead — silence would read
+        // as a broken key, since the key list teaches it without saying where.
+        app.apply(Action::Descend).unwrap(); // into the epic
+        for _ in 0..2 {
+            app.clear_flash();
+            app.apply(Action::CreateEpic).unwrap();
+            assert!(
+                app.surface().is_none(),
+                "a form opened below the epics list: {:?}",
+                app.nav().crumbs()
+            );
+            assert_eq!(
+                app.flash_message(),
+                Some(EPICS_ARE_MADE_FROM_THE_EPICS_LIST),
+                "{:?}",
+                app.nav().crumbs()
+            );
+            to_work_row(&mut app);
+            app.apply(Action::Descend).unwrap(); // into the ticket
+        }
+        // Nothing was created on the way: the key that opened nothing wrote nothing.
+        to_the_roster(&mut app);
+        assert_eq!(roster_ids(&app), vec![fx.epic.clone()]);
+    }
+
+    #[test]
+    fn the_epic_key_is_the_one_write_the_roster_of_an_empty_store_still_offers() {
+        let (_dir, store) = crate::data::fixture::empty_store();
+        let mut app = App::new(store, Theme::with_color(false)).unwrap();
+        assert!(app.nav().frame().current().is_none());
+
+        // Editing mode acts on a row and this screen has none — which is exactly why
+        // creating an epic is a key of the browser's own: it is the one write that
+        // still works where there is nothing to stand on.
+        app.apply(Action::EnterEditing).unwrap();
+        assert_eq!(app.editing_target(), None);
+        app.apply(Action::CreateEpic).unwrap();
+        assert!(app.surface().is_some(), "the epic key opened no form");
+
+        fill(&mut app, &["first", "The first effort", ""]);
+        app.apply(Action::Accept).unwrap();
+
+        // The reader is no longer on a screen with no selection: the write reloaded
+        // the level, and the cursor has something to stand on.
+        assert_eq!(app.modal(), None, "{:?}", app.modal());
+        assert_eq!(roster_ids(&app), vec!["first".to_string()]);
+        assert!(app.nav().frame().current().is_some());
+        assert_eq!(app.mode(), Mode::Browse);
+    }
+
+    #[test]
+    fn the_epic_key_is_as_unavailable_as_every_other_write_while_the_store_refuses_them() {
+        let (fx, mut app) = app();
+        turn_read_only_behind_the_browser(&fx, &mut app);
+        let reason = app.read_only().expect("the store refuses every write");
+        to_the_roster(&mut app);
+
+        // This key does not pass the offer table, which is where every other write's
+        // availability is decided, so it asks the store's own state for itself: a
+        // store the format gate will not let this binary write offers no write at
+        // all, and the reason is the store's own words rather than a paraphrase that
+        // could go stale.
+        app.apply(Action::CreateEpic).unwrap();
+        assert!(
+            app.surface().is_none(),
+            "a store that may not be written opened a form"
+        );
+        assert_eq!(app.flash_message(), Some(reason.refusal().as_str()));
+        assert_eq!(roster_ids(&app), vec![fx.epic.clone()]);
+
+        // And it comes back with the store: read-only is a state a session leaves as
+        // well as enters, so the refusal must not outlive the condition.
+        crate::data::fixture::turn_writable(&fx.store);
+        app.apply(Action::Reload).unwrap();
+        app.apply(Action::CreateEpic).unwrap();
+        assert!(app.surface().is_some(), "the form did not come back");
+    }
+
+    #[test]
+    fn a_malformed_id_is_the_forms_own_refusal_and_a_taken_one_is_the_stores() {
+        let (fx, mut app) = app();
+        let before = roster_ids(&app);
+
+        // The browser's own check, and the only value it makes one about: an epic
+        // id is a plain name, and the store judges nothing about one today. Every
+        // shape that is no name is caught before anything is sent at all, under a
+        // title of the browser's own — a name with a separator in it, and the two
+        // names that mean a directory rather than a name.
+        open_the_epic_form(&mut app);
+        fill(&mut app, &["", "Escaping", ""]);
+        for malformed in ["../elsewhere", "a/b", ".", ".."] {
+            retype_the_id(&mut app, malformed);
+            // Accepted from a field that is not the id, so where the dismissal lands
+            // is somewhere the keyboard was not already: a form is saved from
+            // wherever the reader finished typing, and the field that has to change
+            // is not that one.
+            app.apply(Action::NextField).unwrap();
+            assert_ne!(app.surface().map(Surface::focus), Some(0));
+            app.apply(Action::Accept).unwrap();
+            assert_eq!(dialog_title(&app), REJECTED_TITLE, "{malformed:?}");
+            assert!(
+                dialog_message(&app).contains("one name"),
+                "{malformed:?}: {:?}",
+                dialog_message(&app)
+            );
+            assert_eq!(roster_ids(&app), before, "{malformed:?} wrote something");
+            // The buffer was never what the warning was about, so dismissing lands
+            // back in the field that has to change, with the typing still there.
+            app.apply(Action::Unwind).unwrap();
+            assert_eq!(app.surface().map(Surface::focus), Some(0));
+            assert_eq!(field_value(&app), malformed);
+        }
+
+        // A taken id is a different mechanism and reads as one: the browser asks
+        // nothing about it, the store refuses under the lock, and what the reader is
+        // shown is the store's own sentence under the store's own title.
+        retype_the_id(&mut app, &fx.epic);
+        app.apply(Action::Accept).unwrap();
+        assert_eq!(dialog_title(&app), REFUSAL_TITLE);
+        let its_own = store_refusal(
+            &fx.store,
+            &data::Write::CreateEpic {
+                epic: fx.epic_selection(),
+                name: "Escaping".to_string(),
+                summary: String::new(),
+            },
+            "the store refuses an id it already holds",
+        );
+        assert_eq!(dialog_message(&app), its_own);
+        assert_ne!(
+            dialog_title(&app),
+            REJECTED_TITLE,
+            "the store's refusal was dressed as the browser's own"
+        );
+        // A refused write keeps the buffer and the form, so the reader can fix the
+        // id rather than retype the whole thing.
+        app.apply(Action::Unwind).unwrap();
+        assert!(app.surface().is_some(), "a refusal closed the form");
+        assert_eq!(roster_ids(&app), before);
+    }
+
+    #[test]
+    fn accepting_a_form_looks_past_the_field_the_reader_is_in_at_every_required_one() {
+        let (fx, mut app) = app();
+        let before = roster_ids(&app);
+        open_the_epic_form(&mut app);
+
+        // An epic with no id has nowhere to live — the id is the name of the place
+        // the store keeps it — so the id is required, and an empty form names it
+        // first, being the first required field the accept walks past.
+        app.apply(Action::Accept).unwrap();
+        assert_eq!(dialog_title(&app), REQUIRED_TITLE);
+        assert!(
+            dialog_message(&app).contains(EPIC_ID_FIELD),
+            "an empty id was sent: {:?}",
+            dialog_message(&app)
+        );
+        assert_eq!(roster_ids(&app), before, "the warning wrote something");
+        app.apply(Action::Unwind).unwrap();
+
+        // The first field is filled and valid and the reader is standing in the
+        // last: what stops the write is a required field neither of those is, so a
+        // check that looked only at the field in front of the reader — or only at
+        // the first — would send a form with no name in it.
+        // The two fields the browser has no rule of its own about carry a separator,
+        // which is ordinary text in them: the id's check is the id's alone, and a
+        // rule that leaked onto its neighbours would refuse a name a reader may
+        // perfectly well write.
+        fill(&mut app, &["a-second-effort", "", "the read/write path"]);
+        assert_eq!(app.surface().map(Surface::focus), Some(2));
+        app.apply(Action::Accept).unwrap();
+
+        assert_eq!(dialog_title(&app), REQUIRED_TITLE);
+        assert!(
+            dialog_message(&app).contains(data::FreeForm::Name.noun()),
+            "{:?}",
+            dialog_message(&app)
+        );
+        assert!(
+            !dialog_message(&app).contains(EPIC_ID_FIELD),
+            "a filled field was warned about: {:?}",
+            dialog_message(&app)
+        );
+        assert_eq!(roster_ids(&app), before, "the warning wrote something");
+
+        // Acknowledging lands in the field it named rather than where the reader
+        // was, and what they type then goes there.
+        app.apply(Action::Unwind).unwrap();
+        assert_eq!(app.surface().map(Surface::focus), Some(1));
+        type_into(&mut app, "Rework read/write");
+        assert_eq!(field_value(&app), "Rework read/write");
+
+        // The summary was never required, so with the name in place the form goes.
+        app.apply(Action::Accept).unwrap();
+        assert_eq!(app.modal(), None, "{:?}", app.modal());
+        assert!(roster_ids(&app).contains(&"a-second-effort".to_string()));
+        assert!(roster_ids(&app).contains(&fx.epic));
+    }
+
+    #[test]
+    fn the_add_key_makes_a_ticket_on_an_epics_row_and_a_subticket_on_a_tickets() {
+        let (fx, mut app) = app();
+        freeze_the_epics_row(&mut app);
+        // The row offers the addition and the strip teaches it, and every other
+        // letter on the row agrees with the strip about itself.
+        assert!(app.editing_hints().contains(&hint_for(EditingAction::Add)));
+        hints_and_keys_agree(&mut app);
+
+        app.apply(Action::Add).unwrap();
+        let surface = app.surface().expect("the letter opened a form");
+        // The pair every creation form ends with, and no id: an epic gives the new
+        // ticket its number, so there is nothing here to address it by.
+        assert_eq!(
+            surface
+                .fields()
+                .iter()
+                .map(Field::label)
+                .collect::<Vec<_>>(),
+            vec!["name", "summary"]
+        );
+        assert_eq!(surface.placement(), Placement::Float);
+        // The float says what is being made and on what, since it covers the row it
+        // was opened from.
+        assert!(
+            surface.title().contains("ticket") && surface.title().contains(&fx.epic),
+            "{:?}",
+            surface.title()
+        );
+        assert!(
+            !surface.title().contains("subticket"),
+            "an epic's row offered a subticket: {:?}",
+            surface.title()
+        );
+        app.apply(Action::Unwind).unwrap();
+        app.apply(Action::Unwind).unwrap();
+
+        // A ticket's row is a container too, and what it makes is a subticket: the
+        // row decides, so one form covers both and the title follows the same answer
+        // the write does.
+        to_the_tickets_row(&mut app);
+        app.apply(Action::EnterEditing).unwrap();
+        app.apply(Action::Add).unwrap();
+        let surface = app.surface().expect("the letter opened a form");
+        let (_, reference) = fx.node_reference_forms();
+        assert!(
+            surface.title().contains("subticket") && surface.title().contains(&reference),
+            "{:?}",
+            surface.title()
+        );
+
+        // And a row that is no container of units of work offers no addition at all:
+        // a collection member is a leaf.
+        app.apply(Action::Unwind).unwrap();
+        app.apply(Action::Unwind).unwrap();
+        to_a_label_row(&mut app);
+        app.apply(Action::EnterEditing).unwrap();
+        app.apply(Action::Add).unwrap();
+        assert!(app.surface().is_none(), "a label row offered a creation");
+        assert_eq!(app.flash_message(), Some(NOT_AN_EDITING_ACTION));
     }
 
     #[test]

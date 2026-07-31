@@ -115,6 +115,12 @@ pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
         // field `?` is a literal character and a reader must not have to learn a
         // second help key on arriving there.
         (KeyCode::Char('e'), false) => Action::EnterEditing,
+        // The one write key that is not a letter a row offers: an epic has no
+        // container row to be added to, so creating one is the browser's own key
+        // rather than an action inside the mode. Shifted, because the unshifted
+        // letter is a motion a reader's fingers rest on and this one writes — the
+        // same reason no editing letter is bound while browsing.
+        (KeyCode::Char('N'), false) => Action::CreateEpic,
         (KeyCode::Char('r'), false) => Action::Reload,
         (KeyCode::Char('?'), false) | (KeyCode::F(1), _) => Action::ToggleHelp,
 
@@ -298,7 +304,11 @@ pub const HELP: &[(&str, &str)] = &[
     ),
     ("< / > / =", "narrow / widen / reset the panes"),
     ("z", "preview fills the width; mouse released"),
-    ("e", "editing mode, on the highlighted row"),
+    // Two keys on one row, for the same reason the groups below share theirs: the
+    // list is as tall as the shortest terminal the browser supports and a row past
+    // that is clipped without saying so. These two are the ways into a write from
+    // browsing, and neither is answered on a store that may not be written.
+    ("e / N", "editing mode on the row / a new epic, from epics"),
     ("a / d", "editing mode: add a member / remove it, confirmed"),
     // Three keys on one row, because the list is as tall as the shortest terminal
     // the browser supports and a row past that is clipped without saying so: the
@@ -576,6 +586,47 @@ mod tests {
             action_for(plain(KeyCode::Esc), Mode::Browse),
             Some(Action::Unwind)
         );
+    }
+
+    #[test]
+    fn creating_an_epic_is_the_browsers_own_key_and_no_other_key_carries_it() {
+        // An epic has no container row to be added from, so creating one is not a
+        // letter a row offers: it is the browser's own key, bound wherever the
+        // reader is not inside a field. Inside editing mode it carries the same
+        // intent, which that mode does not admit — exactly as the key that enters
+        // the mode does — so the mode answers it rather than the key going dead.
+        for mode in [Mode::Browse, Mode::Editing] {
+            let key = plain(KeyCode::Char('N'));
+            assert_eq!(action_for(key, mode), Some(Action::CreateEpic), "{mode:?}");
+            // And nothing else on the board carries it: a key that writes must not
+            // be one stray keystroke away from a key that does not, and the keys
+            // that must not carry it are the list nobody thinks to write down.
+            for other in every_key().into_iter().filter(|other| *other != key) {
+                assert_ne!(
+                    action_for(other, mode),
+                    Some(Action::CreateEpic),
+                    "{other:?} creates an epic in {mode:?}"
+                );
+            }
+        }
+        // Inside a field it is a character like any other letter, so nothing typed
+        // into a buffer can open another one.
+        for mode in surface_modes() {
+            assert_eq!(
+                action_for(plain(KeyCode::Char('N')), mode),
+                Some(Action::Insert('N')),
+                "{mode:?}"
+            );
+        }
+        // And no question answers it: a dialog admits the answers it lists and
+        // nothing underneath it may write while one is open.
+        for mode in dialog_modes() {
+            assert_eq!(
+                action_for(plain(KeyCode::Char('N')), mode),
+                None,
+                "{mode:?}"
+            );
+        }
     }
 
     #[test]

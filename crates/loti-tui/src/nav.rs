@@ -174,6 +174,16 @@ impl Nav {
         matches!(self.frame().level, Level::Collection(..))
     }
 
+    /// Whether the level on screen is the epic roster — the root, and the one
+    /// level whose container is nothing, which is why an epic is created there and
+    /// nowhere else.
+    ///
+    /// Read off the level rather than off the depth of the stack, so a level that
+    /// merely happens to be the outermost one left cannot answer for it.
+    pub fn at_roster(&self) -> bool {
+        matches!(self.frame().level, Level::Epics)
+    }
+
     /// Re-read every level from the store, keeping each cursor on the same
     /// selection.
     ///
