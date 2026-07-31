@@ -2634,6 +2634,7 @@ mod tests {
     use super::fixture::Fixture;
     use super::*;
     use loti_core::ops::{EpicEdits, NewEpic, NodeEdits};
+    use loti_core::store::StoreError;
 
     /// The words a refusal is shown in.
     ///
@@ -4226,8 +4227,10 @@ mod tests {
         assert_eq!(store.read_epic(&fx.epic).unwrap().body, "mine\n");
 
         // The write bumped the stamp, so the one read before it is now stale and
-        // the same precondition refuses.
-        assert!(ops::edit_epic(
+        // the same precondition refuses — as a conflict specifically, not merely
+        // as some error, so a regression that turns this into a different
+        // refusal (the version gate, a lock failure) does not pass unnoticed.
+        let err = ops::edit_epic(
             store,
             &fx.epic,
             EpicEdits {
@@ -4236,7 +4239,11 @@ mod tests {
                 ..Default::default()
             },
         )
-        .is_err());
+        .unwrap_err();
+        assert!(
+            matches!(err, ops::OpError::Store(StoreError::Conflict { .. })),
+            "unexpected error: {err}"
+        );
         assert_eq!(store.read_epic(&fx.epic).unwrap().body, "mine\n");
     }
 
@@ -4261,7 +4268,7 @@ mod tests {
             "mine\n"
         );
 
-        assert!(ops::edit_node(
+        let err = ops::edit_node(
             store,
             r,
             NodeEdits {
@@ -4270,7 +4277,11 @@ mod tests {
                 ..Default::default()
             },
         )
-        .is_err());
+        .unwrap_err();
+        assert!(
+            matches!(err, ops::OpError::Store(StoreError::Conflict { .. })),
+            "unexpected error: {err}"
+        );
         assert_eq!(
             store.read_node(&r.epic_id, r.number).unwrap().body,
             "mine\n"

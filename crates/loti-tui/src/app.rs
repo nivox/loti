@@ -2413,7 +2413,17 @@ impl App {
             // The store's own words, so the browser and the CLI teach the same
             // rule in the same words and the browser cannot go stale when a
             // store rule gains a nuance.
-            data::Refusal::Rule(message) => Dialog::refusal(message),
+            //
+            // A rule refusal can be the version gate itself — a migration can
+            // start or finish while the mode is open — and the writability
+            // marker is a snapshot from whenever it was last asked, not a
+            // licence that stays valid until the next reload. So a refusal is
+            // asked again here rather than left to go on claiming a write is
+            // possible until something else happens to reload.
+            data::Refusal::Rule(message) => {
+                self.read_only = data::read_only(&self.store);
+                Dialog::refusal(message)
+            }
         };
         self.modal = Some(Modal::Dialog(Box::new(dialog)));
     }
@@ -5084,8 +5094,35 @@ mod tests {
         assert_eq!(app.mode(), Mode::Browse);
     }
 
-    /// Stand on the fixture's first ticket row, inside the epic, which is the other
-    /// kind of row that carries a name, a summary and a body of its own.
+    #[test]
+    fn a_body_refused_by_the_read_only_gate_asks_and_marks_the_store_at_once() {
+        let (fx, mut app) = app();
+        open_the_body_buffer(&mut app);
+        type_into(&mut app, "mine");
+        let state = ReadOnly::MigrationInProgress;
+        crate::data::fixture::turn_read_only(&fx.store, state);
+
+        app.apply(Action::Accept).unwrap();
+
+        assert_eq!(app.mode(), Mode::Dialog(Answers::Acknowledge));
+        let Modal::Dialog(dialog) = app.modal().expect("the refusal is reported") else {
+            panic!("the refusal did not open a dialog");
+        };
+        assert_eq!(dialog.message(), state.refusal());
+        assert_eq!(dialog.answers(), Answers::Acknowledge);
+        assert_eq!(app.read_only(), Some(state));
+
+        app.apply(Action::Unwind).unwrap();
+        assert!(field_value(&app).starts_with("mine"));
+        assert_eq!(app.mode(), surface_mode(Fields::One, FieldKind::ManyLines));
+        assert!(
+            app.editing_target().is_some(),
+            "a refusal ended the session"
+        );
+    }
+
+    /// Enter editing mode on the ticket nested inside the epic, which is the
+    /// other kind of row that carries a name, a summary and a body of its own.
     fn freeze_a_ticket_row(app: &mut App) {
         to_the_roster(app);
         app.apply(Action::Descend).unwrap(); // into the epic
