@@ -362,8 +362,39 @@ fn a_flash_too_wide_for_the_line_is_clipped_rather_than_wrapped() {
 
     assert!(lines[23].chars().count() <= 100, "{:?}", lines[23]);
     assert!(lines[23].ends_with('…'), "{:?}", lines[23]);
+    // The marker is a fixed cost paid before the truncation budget, not part
+    // of the text being clipped, so it survives even a message this long.
+    assert!(lines[23].contains('\u{2502}'), "{:?}", lines[23]);
     // The line above is still the panes' bottom border, not spilled notice text.
     assert!(!lines[22].contains("a notice"), "{:?}", lines[22]);
+}
+
+#[test]
+fn a_flash_leads_with_a_marker_that_survives_colour_disabled() {
+    // With colour off a notice and the hint strip below it are the same shape
+    // on the same line, so the marker is the only signal left that this line
+    // is a message rather than a binding. Read the raw line rather than the
+    // flash's own message string: the claim is that the marker was drawn, not
+    // that the app holds one.
+    let (_dir, store) = fixture();
+    let mut app = App::new(store, Theme::with_color(false)).unwrap();
+    let (_t, hinted) = draw(&mut app);
+    // The hint strip itself must not already carry whatever glyph the notice
+    // leads with, or the marker would prove nothing about the notice.
+    assert!(
+        !hinted[23].contains('\u{2502}'),
+        "the hint strip already carries the notice marker: {:?}",
+        hinted[23]
+    );
+
+    app.flash("saved");
+    let (_t2, flashed) = draw(&mut app);
+
+    assert!(
+        flashed[23].contains("\u{2502} saved"),
+        "the notice line has no marker ahead of its words: {:?}",
+        flashed[23]
+    );
 }
 
 #[test]
@@ -2598,8 +2629,15 @@ fn the_assets_row_teaches_no_letter_and_names_the_command_that_attaches_one() {
     // epic id a reader chose and no width can be promised for all of them.
     for width in [80u16, 60, 40] {
         let (_t, narrow) = draw_at(&mut app, width, 24);
+        // The notice marker leads every notice regardless of what it reports,
+        // so it is stripped here before checking what the notice itself leads
+        // with.
+        let words = narrow[23]
+            .trim_start()
+            .trim_start_matches('\u{2502}')
+            .trim_start();
         assert!(
-            narrow[23].trim_start().starts_with("loti epic asset add"),
+            words.starts_with("loti epic asset add"),
             "width {width}: {:?}",
             narrow[23]
         );

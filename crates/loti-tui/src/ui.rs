@@ -96,6 +96,18 @@ const GUTTER_BAR: &str = "▌";
 /// the row.
 const CLAIM_MARKER: &str = "@";
 
+/// The marker every notice leads with, whatever it reports.
+///
+/// With colour disabled a notice and the hint strip beneath it are the same
+/// shape on the same line, so the colour that used to tell them apart carries
+/// nothing: a shape is needed instead, like every other state signal this
+/// browser draws. It is deliberately neutral rather than an alarm, because the
+/// channel carries confirmations as well as refusals — a warning glyph would
+/// misread half of what it introduces. One glyph and a space, in the same
+/// family as the rules and separators drawn elsewhere, is what says "message,
+/// not a binding"; the words after it say whether the news is good or bad.
+const NOTICE_MARKER: &str = "│";
+
 /// The mark on the value a picker holds, and the blank of the same width on every
 /// other value.
 ///
@@ -635,8 +647,9 @@ fn area_text_width(width: u16) -> usize {
 /// A notice replaces the whole strip for its lifetime — one line, never wrapped,
 /// truncated if it does not fit — so the essential hints are hidden for those
 /// seconds and a notice's own wording has to carry the way out where that
-/// matters. It is painted in the notice colour, so it reads as a message rather
-/// than as one more binding.
+/// matters. It is painted in the notice colour and leads with [`NOTICE_MARKER`],
+/// so it reads as a message rather than as one more binding whether or not
+/// colour is available.
 ///
 /// The strip is the keys that apply right now, so each mode brings its own: while
 /// editing, neither the level's keys nor `q` are among them.
@@ -644,10 +657,17 @@ fn footer(app: &App, width: u16) -> Span<'static> {
     let theme = app.theme();
     let columns = area_text_width(width);
     match app.flash_message() {
-        Some(message) => Span::styled(
-            format!(" {}", truncate(message, columns)),
-            Style::default().fg(theme.notice()),
-        ),
+        Some(message) => {
+            // The marker and the space after it are as fixed a cost as the
+            // one-column indent every other line pays, so the message's own
+            // budget shrinks by their width rather than by being appended
+            // unbudgeted and left to overrun the line.
+            let budget = columns.saturating_sub(NOTICE_MARKER.chars().count() + 1);
+            Span::styled(
+                format!(" {NOTICE_MARKER} {}", truncate(message, budget)),
+                Style::default().fg(theme.notice()),
+            )
+        }
         None => {
             // Editing mode's droppable hints are the actions the frozen row
             // offers, which only the state machine knows; browse mode's are the
