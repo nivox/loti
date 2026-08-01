@@ -89,6 +89,26 @@ open as centred dialogs. A save returns you to browsing and confirms what change
 If you cancel changed text, the browser asks first; destructive confirmations use
 `d`, never `Enter`.
 
+## Launch an agent
+
+The `w` action is available only while editing an epic or ticket. It opens a
+centred picker for the frozen target, with `workflow` first and `agent` second.
+Choices identify whether their configured resource is local or global. Choose
+both values and accept the form to launch immediately; there is no second
+confirmation.
+
+Loti validates the selected target, resources, and launch configuration before
+it gives up the terminal. A validation failure leaves the picker open and shows
+the reason. Once the agent starts, the browser temporarily releases its terminal
+screen and input modes; when the agent exits, it restores and repaints the
+browser. A launch failure or non-zero agent exit is reported only after that
+restoration.
+
+Launching an agent never changes claims, statuses, comments, or other tracker
+data. The selected workflow directs the agent's work; see [Launching external
+agents](agents.md) to configure profiles and workflows or to use the equivalent
+CLI command.
+
 ## Read-only stores and concurrent changes
 
 A store that needs migration is browseable but read-only. The banner says why,
