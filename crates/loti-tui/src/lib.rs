@@ -96,15 +96,17 @@ fn enter() -> Result<Tui> {
         previous(info);
     }));
 
-    enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let mut raw_mode = CrosstermRawMode;
+    for step in HELD_BY_BROWSER {
+        hold_step(*step, &mut stdout, &mut raw_mode)?;
+    }
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
 
 /// Give the terminal back.
 fn leave(terminal: &mut Tui) -> Result<()> {
-    disable_raw_mode()?;
+    CrosstermRawMode.set(false)?;
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
@@ -117,7 +119,7 @@ fn leave(terminal: &mut Tui) -> Result<()> {
 /// Best-effort restore for the panic path, where errors can no longer be
 /// reported and a half-restored terminal is worse than a silent failure.
 fn restore() {
-    let _ = disable_raw_mode();
+    let _ = CrosstermRawMode.set(false);
     let mut stdout = io::stdout();
     let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
     let _ = stdout.flush();
@@ -149,13 +151,12 @@ const RELEASED_FOR_EXTERNAL_PROCESS: &[Hold] = &[
     Hold::RawMode(false),
 ];
 
-/// Everything taken back once an external process has exited, in the order the
-/// browser takes it at startup.
+/// Everything the browser holds after startup, in the order it takes each part.
 ///
-/// Invariant: exactly what [`RELEASED_FOR_EXTERNAL_PROCESS`] gave up, so a
-/// round-trip cannot leave the browser running with less of the terminal than it
-/// began with.
-const RECLAIMED_AFTER_EXTERNAL_PROCESS: &[Hold] = &[
+/// This is also the reclaim order after an external process. One list decides
+/// both boundaries, so the browser cannot start in one terminal state and return
+/// from an editor in another by letting two orderings drift apart.
+const HELD_BY_BROWSER: &[Hold] = &[
     Hold::RawMode(true),
     Hold::AlternateScreen(true),
     Hold::MouseCapture(true),
@@ -176,35 +177,73 @@ trait TerminalHandoff {
     fn repaint(&mut self) -> Result<()>;
 }
 
-/// A terminal the round-trip performs on for real. Generic over the backend and
-/// over where the control sequences go, because neither can be looked at on the
-/// browser's own terminal — and an implementation nothing can look at is one that
-/// can be gutted while a seam's own tests stay green.
-struct Screen<'t, B: Backend, W: Write>(&'t mut Terminal<B>, W);
+/// The terminal device's raw-mode switch.
+///
+/// Control sequences make the other handoff steps visible in the output sink.
+/// Raw mode changes the device instead, so it has its own seam: without it, a
+/// round-trip could forget to restore raw mode while every observable sequence
+/// still looked correct.
+trait RawMode {
+    fn set(&mut self, enabled: bool) -> Result<()>;
+}
 
-impl<B: Backend, W: Write> TerminalHandoff for Screen<'_, B, W> {
+/// The browser's real raw-mode switch.
+struct CrosstermRawMode;
+
+impl RawMode for CrosstermRawMode {
+    fn set(&mut self, enabled: bool) -> Result<()> {
+        if enabled {
+            enable_raw_mode()?;
+        } else {
+            disable_raw_mode()?;
+        }
+        Ok(())
+    }
+}
+
+/// A terminal the round-trip performs on for real. Generic over the backend,
+/// output sink, and raw-mode device so each externally visible handoff effect is
+/// exercised by the same implementation production uses.
+struct Screen<'t, B: Backend, W: Write, R: RawMode = CrosstermRawMode> {
+    terminal: &'t mut Terminal<B>,
+    output: W,
+    raw_mode: R,
+}
+
+impl<'t, B: Backend, W: Write> Screen<'t, B, W> {
+    fn new(terminal: &'t mut Terminal<B>, output: W) -> Self {
+        Self::with_raw_mode(terminal, output, CrosstermRawMode)
+    }
+}
+
+impl<'t, B: Backend, W: Write, R: RawMode> Screen<'t, B, W, R> {
+    fn with_raw_mode(terminal: &'t mut Terminal<B>, output: W, raw_mode: R) -> Self {
+        Self {
+            terminal,
+            output,
+            raw_mode,
+        }
+    }
+}
+
+impl<B: Backend, W: Write, R: RawMode> TerminalHandoff for Screen<'_, B, W, R> {
     fn hold(&mut self, step: Hold) -> Result<()> {
-        hold_step(step, &mut self.1)
+        hold_step(step, &mut self.output, &mut self.raw_mode)
     }
 
     fn repaint(&mut self) -> Result<()> {
-        self.0.clear()?;
+        self.terminal.clear()?;
         Ok(())
     }
 }
 
 /// Let go of, or take back, one part of the terminal, writing whatever control
-/// sequences that takes to `out`.
-///
-/// Raw mode is the one step that writes nothing: it is a mode of the terminal
-/// device rather than a sequence sent to it, so it is set through the device and
-/// not through `out`.
-fn hold_step(step: Hold, out: &mut impl Write) -> Result<()> {
+/// sequences that takes to `out` and changing raw mode through its device seam.
+fn hold_step(step: Hold, out: &mut impl Write, raw_mode: &mut impl RawMode) -> Result<()> {
     match step {
         Hold::AlternateScreen(true) => execute!(out, EnterAlternateScreen)?,
         Hold::AlternateScreen(false) => execute!(out, LeaveAlternateScreen)?,
-        Hold::RawMode(true) => enable_raw_mode()?,
-        Hold::RawMode(false) => disable_raw_mode()?,
+        Hold::RawMode(enabled) => raw_mode.set(enabled)?,
         Hold::MouseCapture(true) => execute!(out, EnableMouseCapture)?,
         Hold::MouseCapture(false) => execute!(out, DisableMouseCapture)?,
     }
@@ -215,10 +254,10 @@ fn hold_step(step: Hold, out: &mut impl Write) -> Result<()> {
 ///
 /// Invariant: every part named by [`RELEASED_FOR_EXTERNAL_PROCESS`] is let go of
 /// before the process runs, one step per part, and every part named by
-/// [`RECLAIMED_AFTER_EXTERNAL_PROCESS`] is taken back afterwards **whatever the
-/// process did** — which is why its outcome is carried past the reclaim rather
-/// than propagated at once: a failure that returned early would leave the browser
-/// drawing with raw mode off onto a screen it no longer owns.
+/// [`HELD_BY_BROWSER`] is taken back afterwards **whatever the process did** —
+/// which is why its outcome is carried past the reclaim rather than propagated at
+/// once: a failure that returned early would leave the browser drawing with raw
+/// mode off onto a screen it no longer owns.
 fn around_external_process<T>(
     handoff: &mut impl TerminalHandoff,
     process: impl FnOnce() -> Result<T>,
@@ -227,11 +266,34 @@ fn around_external_process<T>(
         handoff.hold(*step)?;
     }
     let outcome = process();
-    for step in RECLAIMED_AFTER_EXTERNAL_PROCESS {
-        handoff.hold(*step)?;
-    }
-    handoff.repaint()?;
+    reclaim_after_external_process(handoff)?;
     outcome
+}
+
+/// Restore every terminal part even if an earlier restore step failed.
+///
+/// The first restoration failure remains the result because the browser cannot
+/// safely continue without the terminal it owns, but no later part is abandoned
+/// while reporting it. Repaint is part of that best effort too: the editor may
+/// have drawn over the ordinary screen even when one device operation failed.
+fn reclaim_after_external_process(handoff: &mut impl TerminalHandoff) -> Result<()> {
+    let mut failure = None;
+    for step in HELD_BY_BROWSER {
+        if let Err(error) = handoff.hold(*step) {
+            if failure.is_none() {
+                failure = Some(error);
+            }
+        }
+    }
+    if let Err(error) = handoff.repaint() {
+        if failure.is_none() {
+            failure = Some(error);
+        }
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// The normalized outcome of a prepared foreground child. A child status is kept
@@ -323,7 +385,7 @@ fn edit_externally(terminal: &mut Tui, text: &str) -> Result<Option<String>> {
     // Looked up before anything is given away: a setting that is not there is not
     // worth blanking the reader's screen for.
     let editor = editor_setting(env::var("VISUAL").ok(), env::var("EDITOR").ok())?;
-    around_external_process(&mut Screen(terminal, io::stdout()), || {
+    around_external_process(&mut Screen::new(terminal, io::stdout()), || {
         run_editor(&editor, text)
     })
 }
@@ -552,7 +614,7 @@ fn event_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
         if launch_queued_agent(
             &mut app,
             env::vars().collect(),
-            &mut Screen(terminal, io::stdout()),
+            &mut Screen::new(terminal, io::stdout()),
             &mut DirectChild,
         )? {
             // A successful plan always crossed the terminal handoff; reclaim resets
@@ -613,7 +675,7 @@ mod tests {
             .iter()
             .copied()
             .all(|h| !held(h)));
-        assert!(RECLAIMED_AFTER_EXTERNAL_PROCESS.iter().copied().all(held));
+        assert!(HELD_BY_BROWSER.iter().copied().all(held));
 
         // The same parts both ways: a round-trip cannot leave the browser running
         // with less of the terminal than it began with.
@@ -622,11 +684,7 @@ mod tests {
             .copied()
             .map(part)
             .collect();
-        let mut reclaimed: Vec<&str> = RECLAIMED_AFTER_EXTERNAL_PROCESS
-            .iter()
-            .copied()
-            .map(part)
-            .collect();
+        let mut reclaimed: Vec<&str> = HELD_BY_BROWSER.iter().copied().map(part).collect();
         released.sort_unstable();
         reclaimed.sort_unstable();
         assert_eq!(released, reclaimed);
@@ -679,6 +737,45 @@ mod tests {
         }
     }
 
+    /// A terminal device that records raw-mode state instead of changing the test
+    /// runner's terminal.
+    #[derive(Clone, Default)]
+    struct RawRecorder(Rc<RefCell<Vec<bool>>>);
+
+    impl RawRecorder {
+        fn states(&self) -> Vec<bool> {
+            self.0.borrow().clone()
+        }
+    }
+
+    impl RawMode for RawRecorder {
+        fn set(&mut self, enabled: bool) -> Result<()> {
+            self.0.borrow_mut().push(enabled);
+            Ok(())
+        }
+    }
+
+    /// A terminal that fails configured restore operations after recording them.
+    struct FailingReclaim {
+        recorder: Recorder,
+        failures: Vec<(Hold, &'static str)>,
+    }
+
+    impl TerminalHandoff for FailingReclaim {
+        fn hold(&mut self, step: Hold) -> Result<()> {
+            self.recorder.note(Asked::Hold(step));
+            if let Some((_, message)) = self.failures.iter().find(|(failed, _)| *failed == step) {
+                bail!("cannot restore {step:?}: {message}");
+            }
+            Ok(())
+        }
+
+        fn repaint(&mut self) -> Result<()> {
+            self.recorder.note(Asked::Repaint);
+            Ok(())
+        }
+    }
+
     /// A child boundary that records the validated payload it received instead of
     /// starting a process. It is the same production handoff seam uses at runtime.
     struct FakeChild {
@@ -695,7 +792,7 @@ mod tests {
 
     /// Everything taken back after a process, ending in the repaint.
     fn reclaiming() -> Vec<Asked> {
-        RECLAIMED_AFTER_EXTERNAL_PROCESS
+        HELD_BY_BROWSER
             .iter()
             .copied()
             .map(Asked::Hold)
@@ -726,7 +823,7 @@ mod tests {
             );
         }
         // And nothing is taken back while the editor is still using it.
-        for step in RECLAIMED_AFTER_EXTERNAL_PROCESS {
+        for step in HELD_BY_BROWSER {
             assert!(
                 terminal.at(&Asked::Hold(*step)) > ran,
                 "{step:?} was taken back before the editor was done with it"
@@ -738,16 +835,136 @@ mod tests {
             terminal.at(&Asked::Repaint) > terminal.at(&Asked::Hold(Hold::AlternateScreen(true)))
         );
 
-        // One step per part, and no step twice: a part released twice would hide a
-        // part never released at all.
-        let expected: Vec<Asked> = RELEASED_FOR_EXTERNAL_PROCESS
-            .iter()
-            .copied()
-            .map(Asked::Hold)
-            .chain([Asked::Editor])
-            .chain(reclaiming())
-            .collect();
-        assert_eq!(terminal.asked(), expected);
+        // Startup and reclaim share `HELD_BY_BROWSER`; this literal keeps that
+        // one source pinned to the terminal order the browser must actually hold.
+        assert_eq!(
+            terminal.asked(),
+            vec![
+                Asked::Hold(Hold::MouseCapture(false)),
+                Asked::Hold(Hold::AlternateScreen(false)),
+                Asked::Hold(Hold::RawMode(false)),
+                Asked::Editor,
+                Asked::Hold(Hold::RawMode(true)),
+                Asked::Hold(Hold::AlternateScreen(true)),
+                Asked::Hold(Hold::MouseCapture(true)),
+                Asked::Repaint,
+            ]
+        );
+    }
+
+    #[test]
+    fn reclaiming_one_part_still_attempts_every_later_part() {
+        let recorder = Recorder::default();
+        let editor = recorder.clone();
+        let mut terminal = FailingReclaim {
+            recorder: recorder.clone(),
+            failures: vec![(Hold::RawMode(true), "cannot restore raw mode")],
+        };
+
+        let failure = around_external_process(&mut terminal, || {
+            editor.note(Asked::Editor);
+            Ok(())
+        })
+        .expect_err("a failed reclaim must reach the terminal caller");
+        assert!(failure.to_string().contains("RawMode(true)"), "{failure}");
+
+        // The first reclaim is allowed to fail, but the alternate screen and
+        // mouse capture that follow it still have to be restored before that
+        // failure reaches the caller.
+        assert_eq!(
+            recorder.asked(),
+            vec![
+                Asked::Hold(Hold::MouseCapture(false)),
+                Asked::Hold(Hold::AlternateScreen(false)),
+                Asked::Hold(Hold::RawMode(false)),
+                Asked::Editor,
+                Asked::Hold(Hold::RawMode(true)),
+                Asked::Hold(Hold::AlternateScreen(true)),
+                Asked::Hold(Hold::MouseCapture(true)),
+                Asked::Repaint,
+            ]
+        );
+    }
+
+    #[test]
+    fn multiple_reclaim_failures_restore_every_part_and_report_the_first() {
+        let recorder = Recorder::default();
+        let editor = recorder.clone();
+        let mut terminal = FailingReclaim {
+            recorder: recorder.clone(),
+            failures: vec![
+                (Hold::RawMode(true), "raw mode did not return"),
+                (
+                    Hold::AlternateScreen(true),
+                    "alternate screen did not return",
+                ),
+            ],
+        };
+
+        let failure = around_external_process(&mut terminal, || {
+            editor.note(Asked::Editor);
+            Ok(())
+        })
+        .expect_err("a failed reclaim must reach the terminal caller");
+        assert_eq!(
+            failure.to_string(),
+            "cannot restore RawMode(true): raw mode did not return"
+        );
+
+        // Both failed operations are observable, as are the later mouse restore
+        // and repaint: reclaiming keeps trying after an error rather than returning
+        // at the first failed device operation.
+        assert_eq!(
+            recorder.asked(),
+            vec![
+                Asked::Hold(Hold::MouseCapture(false)),
+                Asked::Hold(Hold::AlternateScreen(false)),
+                Asked::Hold(Hold::RawMode(false)),
+                Asked::Editor,
+                Asked::Hold(Hold::RawMode(true)),
+                Asked::Hold(Hold::AlternateScreen(true)),
+                Asked::Hold(Hold::MouseCapture(true)),
+                Asked::Repaint,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_reclaim_failure_outranks_an_editor_failure_after_restoring_everything() {
+        let recorder = Recorder::default();
+        let editor = recorder.clone();
+        let mut terminal = FailingReclaim {
+            recorder: recorder.clone(),
+            failures: vec![(Hold::RawMode(true), "raw mode did not return")],
+        };
+
+        let failure = around_external_process(&mut terminal, || {
+            editor.note(Asked::Editor);
+            Err::<(), _>(anyhow!("editor could not start"))
+        })
+        .expect_err("the editor and reclaim both fail");
+        assert_eq!(
+            failure.to_string(),
+            "cannot restore RawMode(true): raw mode did not return"
+        );
+        assert_ne!(failure.to_string(), "editor could not start");
+
+        // The editor's failure remains pending while every reclaim operation and
+        // repaint are attempted; the terminal failure is the result because the
+        // browser cannot safely continue without recovering its terminal state.
+        assert_eq!(
+            recorder.asked(),
+            vec![
+                Asked::Hold(Hold::MouseCapture(false)),
+                Asked::Hold(Hold::AlternateScreen(false)),
+                Asked::Hold(Hold::RawMode(false)),
+                Asked::Editor,
+                Asked::Hold(Hold::RawMode(true)),
+                Asked::Hold(Hold::AlternateScreen(true)),
+                Asked::Hold(Hold::MouseCapture(true)),
+                Asked::Repaint,
+            ]
+        );
     }
 
     #[test]
@@ -1102,7 +1319,7 @@ mod tests {
         };
         assert!(on_screen(&terminal).contains("leftovers"));
 
-        Screen(&mut terminal, Vec::new()).repaint().unwrap();
+        Screen::new(&mut terminal, Vec::new()).repaint().unwrap();
         assert!(
             !on_screen(&terminal).contains("leftovers"),
             "the screen the editor drew on was kept: {:?}",
@@ -1111,9 +1328,8 @@ mod tests {
     }
 
     #[test]
-    fn each_part_of_the_screen_is_let_go_of_and_taken_back_by_a_sequence_of_its_own() {
-        // Raw mode is absent on purpose: it is a mode of the terminal device rather
-        // than a sequence sent to it, and a test has no terminal device to set.
+    fn each_control_sequence_part_of_the_screen_is_let_go_of_and_taken_back() {
+        let mut raw_mode = RawRecorder::default();
         let mut sent: Vec<(Hold, Vec<u8>)> = Vec::new();
         for step in [
             Hold::AlternateScreen(false),
@@ -1122,9 +1338,7 @@ mod tests {
             Hold::MouseCapture(true),
         ] {
             let mut out = Vec::new();
-            hold_step(step, &mut out).unwrap();
-            // A step that writes nothing leaves that part exactly as it was while
-            // the screen goes on looking right.
+            hold_step(step, &mut out, &mut raw_mode).unwrap();
             assert!(!out.is_empty(), "{step:?} sent the terminal nothing");
             for (other, sequence) in &sent {
                 assert_ne!(*sequence, out, "{step:?} sends what {other:?} sends");
@@ -1132,15 +1346,15 @@ mod tests {
             sent.push((step, out));
         }
 
-        // And the terminal the browser really performs on sends exactly that, for
-        // every step: a seam whose own implementation is unobservable can be gutted
-        // while the tests that read the seam stay green.
+        // The terminal the browser really performs on sends exactly those
+        // sequences. A production implementation that does not perform its seam
+        // would otherwise leave this protocol test green.
         let mut terminal = Terminal::new(TestBackend::new(4, 1)).unwrap();
         for (step, sequence) in &sent {
-            let mut screen = Screen(&mut terminal, Vec::new());
+            let mut screen = Screen::new(&mut terminal, Vec::new());
             screen.hold(*step).unwrap();
             assert_eq!(
-                &screen.1, sequence,
+                &screen.output, sequence,
                 "the real terminal does not perform {step:?}"
             );
         }
@@ -1149,15 +1363,32 @@ mod tests {
         // implements it: releasing a part must send what turns it off, and taking it
         // back what turns it on. Inverted, the round-trip would enable mouse capture
         // on the way into the editor — whose input is then read as typed characters.
-        let sequence = |step: Hold| -> String {
+        let mut sequence = |step: Hold| -> String {
             let mut out = Vec::new();
-            hold_step(step, &mut out).unwrap();
+            hold_step(step, &mut out, &mut raw_mode).unwrap();
             String::from_utf8(out).expect("a control sequence is text")
         };
         assert!(sequence(Hold::AlternateScreen(true)).ends_with("h"));
         assert!(sequence(Hold::AlternateScreen(false)).ends_with("l"));
         assert!(sequence(Hold::MouseCapture(true)).ends_with("h"));
         assert!(sequence(Hold::MouseCapture(false)).ends_with("l"));
+    }
+
+    #[test]
+    fn the_screen_sets_raw_mode_off_for_the_editor_and_back_on_afterwards() {
+        let mut terminal = Terminal::new(TestBackend::new(4, 1)).unwrap();
+        let raw_mode = RawRecorder::default();
+        let observed = raw_mode.clone();
+        let mut screen = Screen::with_raw_mode(&mut terminal, Vec::new(), raw_mode);
+
+        screen.hold(Hold::RawMode(false)).unwrap();
+        screen.hold(Hold::RawMode(true)).unwrap();
+
+        assert_eq!(observed.states(), [false, true]);
+        assert!(
+            screen.output.is_empty(),
+            "raw mode is a device setting, not a control sequence"
+        );
     }
 
     #[test]
