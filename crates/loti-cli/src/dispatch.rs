@@ -25,6 +25,7 @@ use loti_core::ops::{
 use loti_core::read::{self, ListScope, MatchRequest};
 use loti_core::render::{self, Color, Projection};
 use loti_core::resource;
+use loti_core::session::SessionPolicy;
 use loti_core::store::{self, Store};
 use loti_core::Actor;
 
@@ -77,10 +78,22 @@ pub fn run<R: Read, O: Write, E: Write>(
             out,
             err,
         ),
-        Command::Agent(agent) => run_agent(cli, &agent.command, stdout_is_tty, out, err),
-        Command::Workflow(workflow) => {
-            run_workflow(cli, &workflow.command, stdout_is_tty, out, err)
-        }
+        Command::Agent(agent) => run_agent(
+            cli,
+            &agent.command,
+            &session_policy_from_environment(),
+            stdout_is_tty,
+            out,
+            err,
+        ),
+        Command::Workflow(workflow) => run_workflow(
+            cli,
+            &workflow.command,
+            &session_policy_from_environment(),
+            stdout_is_tty,
+            out,
+            err,
+        ),
     }
 }
 
@@ -1144,13 +1157,29 @@ fn parse_list_scope(scope: &str, shallow: bool) -> Result<ListScope> {
 // agent / workflow (the effective-resource read surface)
 // ---------------------------------------------------------------------------
 
+/// Capture the process environment once at the CLI boundary, then keep the
+/// cooperative visibility decision independent of environment access.
+fn session_policy_from_environment() -> SessionPolicy {
+    SessionPolicy::from_env(&std::env::vars().collect())
+}
+
 fn run_agent<O: Write, E: Write>(
     cli: &Cli,
     cmd: &AgentCommand,
+    session: &SessionPolicy,
     stdout_is_tty: bool,
     out: &mut O,
     err: &mut E,
 ) -> Result<()> {
+    // A launched agent must not inspect operator-facing profiles or begin a
+    // nested agent session. This is cooperative visibility, not access control.
+    if !session.agent_namespace_available() {
+        bail!(
+            "agent commands are unavailable in a cooperative agent session; \
+             follow the selected workflow instead"
+        );
+    }
+
     match cmd {
         AgentCommand::List(a) => {
             let store = open_store(cli, err)?;
@@ -1173,6 +1202,7 @@ fn run_agent<O: Write, E: Write>(
 fn run_workflow<O: Write, E: Write>(
     cli: &Cli,
     cmd: &WorkflowCommand,
+    session: &SessionPolicy,
     stdout_is_tty: bool,
     out: &mut O,
     err: &mut E,
@@ -1180,7 +1210,12 @@ fn run_workflow<O: Write, E: Write>(
     match cmd {
         WorkflowCommand::List(a) => {
             let store = open_store(cli, err)?;
-            let effective = resource::list_workflows(&workflow_roots(&store)?)?;
+            // Resolve the effective roster before filtering so a selected but
+            // invalid workflow remains visible with its own diagnostics.
+            let mut effective = resource::list_workflows(&workflow_roots(&store)?)?;
+            if let Some(selected) = session.workflow_id() {
+                effective.retain(|entry| entry.id == selected);
+            }
             list_resources(
                 &effective,
                 &a.fields,
@@ -1190,6 +1225,15 @@ fn run_workflow<O: Write, E: Write>(
             )
         }
         WorkflowCommand::Show(a) => {
+            // Refuse a non-selected ID before resource resolution. Therefore an
+            // existing workflow outside the session is indistinguishable from
+            // a missing one, while the selected workflow keeps normal errors.
+            if session
+                .workflow_id()
+                .is_some_and(|selected| selected != a.id)
+            {
+                return Err(workflow_not_found(&a.id));
+            }
             let store = open_store(cli, err)?;
             show_workflow(&store, a, out)
         }
@@ -1294,7 +1338,7 @@ fn show_agent<O: Write>(store: &Store, a: &AgentShowArgs, out: &mut O) -> Result
 /// absent from the roster entirely.
 fn show_workflow<O: Write>(store: &Store, a: &ResourceIdArg, out: &mut O) -> Result<()> {
     let effective = resource::resolve_workflow(&workflow_roots(store)?, &a.id)?
-        .ok_or_else(|| anyhow!("workflow '{}' does not exist", a.id))?;
+        .ok_or_else(|| workflow_not_found(&a.id))?;
     let text = effective.value.ok_or_else(|| {
         anyhow!(
             "workflow '{}' is invalid: {}",
@@ -1304,6 +1348,12 @@ fn show_workflow<O: Write>(store: &Store, a: &ResourceIdArg, out: &mut O) -> Res
     })?;
     out.write_all(text.as_bytes())?;
     Ok(())
+}
+
+/// Build the ordinary workflow-not-found error. Both a missing workflow and a
+/// workflow hidden by session visibility use this one path.
+fn workflow_not_found(id: &str) -> anyhow::Error {
+    anyhow!("workflow '{id}' does not exist")
 }
 
 /// Join a resource's diagnostics into one line for an error message; each

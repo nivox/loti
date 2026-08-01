@@ -432,6 +432,162 @@ fn workflow_show_reports_invalid_utf8_and_unknown_id_distinctly() {
 }
 
 // ---------------------------------------------------------------------------
+// cooperative agent-session visibility
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_session_marker_hides_agent_commands_before_resource_lookup() {
+    let s = Store::new();
+    // A broken root would normally fail an agent command. Session visibility
+    // must win before any profile-root lookup, for every marker arrangement.
+    std::fs::write(
+        s.root().join(".loti.conf"),
+        "agent-root = \"does-not-exist\"\n",
+    )
+    .unwrap();
+    let marker_sets: &[&[(&str, &str)]] = &[
+        &[("LOTI_AGENT_SESSION", "target")],
+        &[("LOTI_AGENT_SESSION", "")],
+        &[("LOTI_AGENT_WORKFLOW", "review")],
+        &[("LOTI_AGENT_WORKFLOW", "")],
+        &[
+            ("LOTI_AGENT_SESSION", ""),
+            ("LOTI_AGENT_WORKFLOW", "review"),
+        ],
+    ];
+
+    for markers in marker_sets {
+        for command in [&["agent", "list"][..], &["agent", "show", "profile"][..]] {
+            let err = s.fail_env(command, markers);
+            assert!(
+                err.contains("agent commands are unavailable"),
+                "marker set {markers:?}, command {command:?}: {err}"
+            );
+            assert!(
+                !err.contains("agent-root"),
+                "agent resources were consulted for {markers:?}, {command:?}: {err}"
+            );
+        }
+    }
+}
+
+#[test]
+fn session_marker_without_workflow_marker_keeps_ordinary_workflow_access() {
+    let s = Store::new();
+    let (_agents, workflows) = local_roots(&s);
+    write_workflow(&workflows, "one", "first workflow");
+    write_workflow(&workflows, "two", "second workflow");
+    let session_only = [("LOTI_AGENT_SESSION", "target")];
+
+    let list = rows(&s.ok_env(&["workflow", "list", "--json"], &session_only));
+    let ids: Vec<&str> = list.iter().map(|row| row["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec!["one", "two"]);
+    assert_eq!(
+        s.ok_env(&["workflow", "show", "two"], &session_only),
+        "second workflow"
+    );
+}
+
+#[test]
+fn workflow_marker_filters_the_effective_roster_to_its_exact_id() {
+    let s = Store::new();
+    let (_agents, workflows) = local_roots(&s);
+    write_workflow(&workflows, "selected", "selected workflow");
+    write_workflow(&workflows, "other", "other workflow");
+
+    let list = rows(&s.ok_env(
+        &["workflow", "list", "--json"],
+        &[("LOTI_AGENT_WORKFLOW", "selected")],
+    ));
+    let ids: Vec<&str> = list.iter().map(|row| row["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec!["selected"]);
+}
+
+#[test]
+fn selected_workflow_show_remains_verbatim_accessible() {
+    let s = Store::new();
+    let (_agents, workflows) = local_roots(&s);
+    let source = "# Selected  \nNo trailing newline";
+    write_workflow(&workflows, "selected", source);
+
+    let out = s
+        .cmd_env(
+            &["workflow", "show", "selected"],
+            &[("LOTI_AGENT_WORKFLOW", "selected")],
+        )
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(out.stdout, source.as_bytes());
+}
+
+#[test]
+fn hidden_and_missing_workflow_show_failures_are_byte_identical() {
+    let with_hidden = Store::new();
+    let (_agents, workflows) = local_roots(&with_hidden);
+    write_workflow(&workflows, "selected", "selected workflow");
+    write_workflow(&workflows, "other", "hidden workflow");
+
+    let without_hidden = Store::new();
+    let (_agents, workflows) = local_roots(&without_hidden);
+    write_workflow(&workflows, "selected", "selected workflow");
+
+    let marker = [("LOTI_AGENT_WORKFLOW", "selected")];
+    let hidden = with_hidden.fail_env(&["workflow", "show", "other"], &marker);
+    let missing = without_hidden.fail_env(&["workflow", "show", "other"], &marker);
+    assert_eq!(hidden, missing);
+    assert!(hidden.contains("workflow 'other' does not exist"));
+}
+
+#[test]
+fn absent_selected_workflow_lists_successfully_as_an_empty_roster() {
+    let s = Store::new();
+    let (_agents, workflows) = local_roots(&s);
+    write_workflow(&workflows, "present", "present workflow");
+
+    assert_eq!(
+        rows(&s.ok_env(
+            &["workflow", "list", "--json"],
+            &[("LOTI_AGENT_WORKFLOW", "missing")],
+        )),
+        Vec::<serde_json::Value>::new()
+    );
+}
+
+#[test]
+fn invalid_selected_workflow_remains_listed_with_its_diagnostic() {
+    let s = Store::new();
+    let (_agents, workflows) = local_roots(&s);
+    write_invalid_workflow(&workflows);
+    write_workflow(&workflows, "other", "other workflow");
+
+    let list = rows(&s.ok_env(
+        &["workflow", "list", "--json"],
+        &[("LOTI_AGENT_WORKFLOW", "bad")],
+    ));
+    let selected = row(&list, "bad");
+    assert_eq!(selected["origin"], "local");
+    assert!(selected["diagnostics"][0]
+        .as_str()
+        .unwrap()
+        .contains("UTF-8"));
+}
+
+#[test]
+fn skill_stays_available_and_static_in_a_cooperative_session() {
+    let s = Store::new();
+    let ordinary = s.ok(&["skill"]);
+    let session = s.ok_env(
+        &["skill"],
+        &[
+            ("LOTI_AGENT_SESSION", "target"),
+            ("LOTI_AGENT_WORKFLOW", "selected"),
+        ],
+    );
+    assert_eq!(session, ordinary);
+}
+
+// ---------------------------------------------------------------------------
 // grammar: id validation happens before dispatch touches the store
 // ---------------------------------------------------------------------------
 

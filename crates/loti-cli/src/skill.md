@@ -16,6 +16,11 @@ Two audiences share one store: **agents** driving the work autonomously, and
 recording — planning a feature, tracking sub-tasks, or reporting progress — so
 the human always has a legible picture of what happened and why.
 
+When you are a launched agent, follow the workflow named for your session: read
+it with `loti workflow show <workflow-id>` before acting. Do not use the
+operator-facing `loti agent` profile commands; they are for the person launching
+an agent, not for the launched agent itself.
+
 ## The one hard rule (read this first)
 
 **Never touch the store files directly — for reading or writing. Every

@@ -41,16 +41,8 @@ use std::path::{Path, PathBuf};
 
 use crate::domain::NodeRef;
 use crate::resource::{Profile, ResourceId};
-
-/// Marks an active cooperative agent session: set to the launched target's
-/// reference. Presence alone (even an empty value) is the signal; the value
-/// is not parsed by [`session_active`].
-pub const SESSION_ENV_VAR: &str = "LOTI_AGENT_SESSION";
-
-/// Marks the workflow a cooperative agent session is bound to. Presence alone
-/// (even an empty value) is the signal; the value is not parsed by
-/// [`session_active`].
-pub const WORKFLOW_ENV_VAR: &str = "LOTI_AGENT_WORKFLOW";
+use crate::session::SessionPolicy;
+pub use crate::session::{SESSION_ENV_VAR, WORKFLOW_ENV_VAR};
 
 /// The case-sensitive prefix reserved for loti's own launch-environment keys.
 /// A profile may never define a key under this prefix, so it can never shadow
@@ -125,7 +117,7 @@ pub struct CallerContext {
 /// always alter its own environment — so it is never treated as a security
 /// boundary, only as a guardrail an ordinary launch respects.
 pub fn session_active(env: &BTreeMap<String, String>) -> bool {
-    env.contains_key(SESSION_ENV_VAR) || env.contains_key(WORKFLOW_ENV_VAR)
+    !SessionPolicy::from_env(env).agent_namespace_available()
 }
 
 /// A validated, ready-to-spawn direct launch: no shell text, no shell

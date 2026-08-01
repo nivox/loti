@@ -39,6 +39,19 @@ fn skill_prints_the_hard_rule() {
 }
 
 #[test]
+fn skill_guides_launched_agents_to_their_workflow_not_operator_profiles() {
+    let text = stdout_of(&["skill"]);
+    assert!(
+        text.contains("follow the workflow named for your session"),
+        "skill must direct a launched agent to its workflow:\n{text}"
+    );
+    assert!(
+        text.contains("Do not use the\noperator-facing `loti agent` profile commands"),
+        "skill must keep launched agents away from operator profiles:\n{text}"
+    );
+}
+
+#[test]
 fn skill_is_self_contained_prose_with_concepts() {
     let text = stdout_of(&["skill"]);
     // Distilled core concepts ship in the skill (states, epics/tickets), so it
