@@ -2736,6 +2736,22 @@ pub(crate) mod fixture {
             entry
         }
 
+        /// Add one malformed dependency beside the valid blocker the fixture
+        /// already holds.
+        ///
+        /// A damaged store can reach the browser outside the normal writer, so
+        /// this writes through the store boundary rather than creating a
+        /// test-only navigation row.
+        pub(crate) fn add_unparseable_blocker_entry(&self) -> String {
+            let entry = "not-a-reference".to_string();
+            let mut node = ops::read_node(&self.store, &self.node).unwrap();
+            node.frontmatter.blocked_by.push(entry.clone());
+            self.store
+                .write_node(&self.node.epic_id, self.node.number, &node)
+                .unwrap();
+            entry
+        }
+
         /// The ticket under test in the two forms a reader may type its reference
         /// in; see [`reference_forms`]. It is the one reference no dependency list
         /// of its own may hold, and only the store may say so.

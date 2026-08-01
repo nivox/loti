@@ -3167,6 +3167,17 @@ mod tests {
         (fx, app)
     }
 
+    /// Build the browser from a damaged store rather than inserting a row into
+    /// navigation, so the eligibility walk reaches the same fallback selection a
+    /// reader can reach from persisted malformed data.
+    fn app_with_unremovable_blocker() -> (Fixture, Selection, App) {
+        let fx = Fixture::build();
+        let entry = fx.add_unparseable_blocker_entry();
+        let blocker = Selection::UnremovableBlocker(Container::Node(fx.node.clone()), entry);
+        let app = App::new(fx.store.clone(), Theme::with_color(false)).unwrap();
+        (fx, blocker, app)
+    }
+
     // Resource discovery reads this process-global setting. Hold it from setup
     // until the fixture drops so concurrently running picker tests cannot make
     // either catalog observe the other's global resources.
@@ -3504,26 +3515,60 @@ mod tests {
         app.apply(Action::EnterEditing).unwrap();
     }
 
+    /// Walk each reachable row and prove the workflow hint belongs only to units
+    /// of work, both in the state machine and in the frame the reader sees.
+    fn assert_workflow_eligibility(app: &mut App, required_row: Option<&Selection>) -> bool {
+        let depth = app.nav().crumbs().len();
+        let mut reached_required_row = false;
+        for index in 0..app.nav().rows().len() {
+            app.apply(Action::CursorFirst).unwrap();
+            for _ in 0..index {
+                app.apply(Action::CursorDown).unwrap();
+            }
+            app.clear_flash();
+            app.apply(Action::EnterEditing).unwrap();
+            let target = app.editing_target().expect("editing froze no row").clone();
+            let eligible = matches!(target, Selection::Epic(_) | Selection::Node(_));
+            let hinted = app
+                .editing_hints()
+                .contains(&hint_for(EditingAction::RunAgent));
+            assert_eq!(hinted, eligible, "{target:?}");
+
+            // A bound action that never reaches the footer is not offered to a
+            // reader. This width leaves room for every editing hint, so omission
+            // here is eligibility rather than responsive truncation.
+            let frame = frame_lines(app, 160, 24);
+            assert_eq!(
+                frame[23].contains("w workflow"),
+                eligible,
+                "{target:?}: {frame:#?}"
+            );
+            reached_required_row |= required_row.is_some_and(|required| target == *required);
+
+            app.apply(Action::Unwind).unwrap();
+            app.apply(Action::Descend).unwrap();
+            if app.nav().crumbs().len() > depth {
+                reached_required_row |= assert_workflow_eligibility(app, required_row);
+                app.apply(Action::Ascend).unwrap();
+            }
+        }
+        reached_required_row
+    }
+
     #[test]
     fn a_workflow_picker_is_offered_only_on_epics_and_tickets() {
-        let (_fx, _resources, mut app) = app_with_agent_resources();
-        freeze_the_epics_row(&mut app);
-        assert!(app
-            .editing_hints()
-            .contains(&hint_for(EditingAction::RunAgent)));
-        app.apply(Action::Unwind).unwrap();
+        let (_fx, mut app) = app();
+        assert_workflow_eligibility(&mut app, None);
+    }
 
-        to_the_labels_row(&mut app);
-        app.apply(Action::EnterEditing).unwrap();
-        assert!(!app
-            .editing_hints()
-            .contains(&hint_for(EditingAction::RunAgent)));
-
-        app.apply(Action::Unwind).unwrap();
-        freeze_a_ticket_row(&mut app);
-        assert!(app
-            .editing_hints()
-            .contains(&hint_for(EditingAction::RunAgent)));
+    #[test]
+    fn a_malformed_blocker_offers_no_workflow_hint_or_footer_action() {
+        let (_fx, blocker, mut app) = app_with_unremovable_blocker();
+        assert!(matches!(blocker, Selection::UnremovableBlocker(..)));
+        assert!(
+            assert_workflow_eligibility(&mut app, Some(&blocker)),
+            "the damaged-store row was not reachable: {blocker:?}"
+        );
     }
 
     #[test]

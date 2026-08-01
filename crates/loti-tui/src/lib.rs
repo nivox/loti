@@ -773,9 +773,16 @@ mod tests {
         assert_eq!(asked[ran + 1..], reclaiming()[..]);
     }
 
+    /// The two navigation rows that may start an agent launch.
+    #[derive(Clone, Copy)]
+    enum QueuedTarget {
+        Epic,
+        Ticket,
+    }
+
     /// A selected agent picker backed by a local, direct profile. The directory
     /// stays alive because preparation resolves the resources again at acceptance.
-    fn queued_agent() -> (data::fixture::Fixture, tempfile::TempDir, App) {
+    fn queued_agent(target: QueuedTarget) -> (data::fixture::Fixture, tempfile::TempDir, App) {
         let fixture = data::fixture::Fixture::build();
         let resources = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(resources.path().join("workflows")).unwrap();
@@ -801,7 +808,25 @@ mod tests {
             resources.path(),
         )
         .unwrap();
-        app.apply(Action::EnterEditing).unwrap();
+        match target {
+            QueuedTarget::Epic => {
+                app.apply(Action::EnterEditing).unwrap();
+            }
+            QueuedTarget::Ticket => {
+                app.apply(Action::Descend).unwrap();
+                let ticket = app
+                    .nav()
+                    .rows()
+                    .iter()
+                    .position(|row| matches!(row.kind, data::RowKind::Work { .. }))
+                    .expect("the fixture epic has a ticket row");
+                app.apply(Action::CursorFirst).unwrap();
+                for _ in 0..ticket {
+                    app.apply(Action::CursorDown).unwrap();
+                }
+                app.apply(Action::EnterEditing).unwrap();
+            }
+        }
         app.apply(Action::RunAgent).unwrap();
         app.apply(Action::Accept).unwrap();
         (fixture, resources, app)
@@ -817,21 +842,36 @@ mod tests {
             .collect()
     }
 
-    fn drawn_text(app: &mut App) -> String {
+    /// A browser frame as real terminal rows, drawn through the headless backend.
+    fn drawn_frame(app: &mut App) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
-        terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
             .collect()
+    }
+
+    /// A failed child returns to the ordinary browser before its dialog is drawn.
+    fn assert_restored_browser(app: &mut App, notice: &[&str]) {
+        let frame = drawn_frame(app);
+        let text = frame.join("\n");
+        assert!(frame[0].trim().starts_with("epics"), "{frame:#?}");
+        assert!(frame[1].contains("navigation"), "{frame:#?}");
+        for words in notice {
+            assert!(text.contains(words), "{words:?}: {frame:#?}");
+        }
     }
 
     #[test]
     fn launch_preparation_refuses_before_the_terminal_or_child_runs() {
-        let (fixture, resources, mut app) = queued_agent();
+        let (fixture, resources, mut app) = queued_agent(QueuedTarget::Epic);
         // The picker read this profile before it was selected. Re-resolving now
         // catches the changed value and core rejects it before the screen is lost.
         std::fs::write(
@@ -859,7 +899,13 @@ mod tests {
         assert!(dialog
             .message()
             .contains("profile command must not be empty"));
-        assert!(drawn_text(&mut app).contains("profile command must not be empty"));
+        let frame = drawn_frame(&mut app);
+        let refusal = frame.join("\n");
+        assert!(
+            refusal.contains("profile command must not be empty"),
+            "{frame:#?}"
+        );
+        assert!(refusal.contains("back to the picker"), "{frame:#?}");
         assert_eq!(
             fixture.tracker_state(),
             before,
@@ -869,7 +915,7 @@ mod tests {
 
     #[test]
     fn an_invalid_selected_workflow_is_refused_before_the_terminal_or_child_runs() {
-        let (fixture, resources, mut app) = queued_agent();
+        let (fixture, resources, mut app) = queued_agent(QueuedTarget::Epic);
         // A local resource keeps shadowing a global resource with the same id, so
         // invalidating it proves acceptance re-resolves the picker selection.
         std::fs::write(resources.path().join("workflows").join("review.md"), [0xff]).unwrap();
@@ -891,7 +937,13 @@ mod tests {
             panic!("the preparation refusal opened no dialog")
         };
         assert_eq!(dialog.message(), "workflow 'review' is invalid");
-        assert!(drawn_text(&mut app).contains("workflow 'review' is invalid"));
+        let frame = drawn_frame(&mut app);
+        let refusal = frame.join("\n");
+        assert!(
+            refusal.contains("workflow 'review' is invalid"),
+            "{frame:#?}"
+        );
+        assert!(refusal.contains("back to the picker"), "{frame:#?}");
         assert_eq!(
             fixture.tracker_state(),
             before,
@@ -901,52 +953,65 @@ mod tests {
 
     #[test]
     fn a_zero_exit_runs_the_prepared_payload_and_restores_the_browser_silently() {
-        let (fixture, _resources, mut app) = queued_agent();
-        let before = fixture.tracker_state();
-        let recorder = Recorder::default();
-        let mut child = FakeChild {
-            recorder: recorder.clone(),
-            outcome: ChildOutcome::ZeroExit,
-        };
+        for target in [QueuedTarget::Epic, QueuedTarget::Ticket] {
+            let (fixture, _resources, mut app) = queued_agent(target);
+            let (kind, reference) = match target {
+                QueuedTarget::Epic => ("epic", fixture.epic.clone()),
+                QueuedTarget::Ticket => (
+                    "ticket",
+                    format!("{}/{}", fixture.node.epic_id, fixture.node.number),
+                ),
+            };
+            let before = fixture.tracker_state();
+            let recorder = Recorder::default();
+            let mut child = FakeChild {
+                recorder: recorder.clone(),
+                outcome: ChildOutcome::ZeroExit,
+            };
 
-        launch_queued_agent(&mut app, BTreeMap::new(), &mut recorder.clone(), &mut child).unwrap();
-        let plan = recorder
-            .asked()
-            .into_iter()
-            .find_map(|asked| match asked {
-                Asked::Agent(plan) => Some(plan),
-                Asked::Hold(_) | Asked::Editor | Asked::Repaint => None,
-            })
-            .expect("the child was not run");
-        assert_eq!(plan.program, "agent");
-        assert_eq!(plan.cwd, fixture.store.root());
-        assert_eq!(
-            plan.env.get(loti_core::launch::SESSION_ENV_VAR),
-            Some(&fixture.epic)
-        );
-        assert_eq!(
-            plan.env.get(loti_core::launch::WORKFLOW_ENV_VAR),
-            Some(&"review".to_string())
-        );
-        assert!(
-            plan.args[0].contains("workflow \"review\""),
-            "{:?}",
-            plan.args
-        );
-        assert_eq!(recorder.asked(), agent_events(plan));
-        assert!(app.modal().is_none(), "a zero exit raised a report");
-        assert!(app.surface().is_none());
-        assert!(app.editing_target().is_none());
-        assert_eq!(
-            fixture.tracker_state(),
-            before,
-            "a successful agent exit changed tracker data"
-        );
+            launch_queued_agent(&mut app, BTreeMap::new(), &mut recorder.clone(), &mut child)
+                .unwrap();
+            let plan = recorder
+                .asked()
+                .into_iter()
+                .find_map(|asked| match asked {
+                    Asked::Agent(plan) => Some(plan),
+                    Asked::Hold(_) | Asked::Editor | Asked::Repaint => None,
+                })
+                .expect("the child was not run");
+            assert_eq!(plan.program, "agent");
+            assert_eq!(plan.cwd, fixture.store.root());
+            assert_eq!(
+                plan.env.get(loti_core::launch::SESSION_ENV_VAR),
+                Some(&reference)
+            );
+            assert_eq!(
+                plan.env.get(loti_core::launch::WORKFLOW_ENV_VAR),
+                Some(&"review".to_string())
+            );
+            assert!(
+                plan.args[0].contains(&format!("workflow \"review\" on {kind} \"{reference}\"")),
+                "{:?}",
+                plan.args
+            );
+            assert_eq!(recorder.asked(), agent_events(plan));
+            assert!(app.modal().is_none(), "a zero exit raised a report");
+            assert!(app.surface().is_none());
+            assert!(app.editing_target().is_none());
+            let frame = drawn_frame(&mut app);
+            assert!(frame[0].trim().starts_with("epics"), "{frame:#?}");
+            assert!(frame[1].contains("navigation"), "{frame:#?}");
+            assert_eq!(
+                fixture.tracker_state(),
+                before,
+                "a successful {kind} agent exit changed tracker data"
+            );
+        }
     }
 
     #[test]
     fn a_nonzero_agent_exit_is_reported_after_reclaiming_the_terminal() {
-        let (fixture, _resources, mut app) = queued_agent();
+        let (fixture, _resources, mut app) = queued_agent(QueuedTarget::Epic);
         let before = fixture.tracker_state();
         let recorder = Recorder::default();
         let mut child = FakeChild {
@@ -973,7 +1038,7 @@ mod tests {
             dialog.message(),
             "agent profile 'agent' exited with exit status: 7"
         );
-        assert!(drawn_text(&mut app).contains("exit status: 7"));
+        assert_restored_browser(&mut app, &["agent profile 'agent'", "exit status: 7"]);
         assert_eq!(
             fixture.tracker_state(),
             before,
@@ -983,7 +1048,7 @@ mod tests {
 
     #[test]
     fn a_spawn_failure_is_reported_after_reclaiming_the_terminal() {
-        let (fixture, _resources, mut app) = queued_agent();
+        let (fixture, _resources, mut app) = queued_agent(QueuedTarget::Epic);
         let before = fixture.tracker_state();
         let recorder = Recorder::default();
         let mut child = FakeChild {
@@ -1001,9 +1066,15 @@ mod tests {
             dialog.message(),
             "agent profile 'agent' could not start: missing executable"
         );
-        let frame = drawn_text(&mut app);
-        assert!(frame.contains("missing"), "{frame:?}");
-        assert!(frame.contains("executable"), "{frame:?}");
+        assert_restored_browser(
+            &mut app,
+            &[
+                "agent profile 'agent'",
+                "could not start",
+                "missing",
+                "executable",
+            ],
+        );
         assert_eq!(
             fixture.tracker_state(),
             before,
