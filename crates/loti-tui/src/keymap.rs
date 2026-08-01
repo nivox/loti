@@ -247,6 +247,7 @@ fn action_for_binding(binding: HelpBinding, key: KeyEvent, mode: Mode) -> Option
             (KeyCode::Char('s'), false) => Some(Action::SetState),
             (KeyCode::Char('c'), false) => Some(Action::TakeClaim),
             (KeyCode::Char('C'), false) => Some(Action::ReleaseClaim),
+            (KeyCode::Char('w'), false) => Some(Action::RunAgent),
             _ => None,
         },
         HelpBinding::Save
@@ -388,8 +389,8 @@ pub const HELP: &[HelpEntry] = &[
         binding: HelpBinding::EditFields,
     },
     HelpEntry {
-        keys: "s / c / C",
-        description: "edit: state / take / release claim",
+        keys: "s / c / C / w",
+        description: "edit: state / take / release / workflow",
         requires_write: true,
         binding: HelpBinding::StateClaim,
     },
@@ -506,6 +507,7 @@ pub const FOOTER_HINTS_EDITING: &[(EditingAction, &str)] = &[
     (EditingAction::SetState, "s state"),
     (EditingAction::TakeClaim, "c claim"),
     (EditingAction::ReleaseClaim, "C release"),
+    (EditingAction::RunAgent, "w workflow"),
 ];
 
 /// The droppable hints of an open surface, ranked rather than in key order: they
@@ -1409,6 +1411,18 @@ mod tests {
                 "{mode:?}"
             );
         }
+    }
+
+    #[test]
+    fn workflow_is_an_editing_action_bound_and_hinted_by_w() {
+        // The offer table decides whether this action is available on a frozen
+        // row; this layer pins only the intent and the words teaching its key.
+        assert_eq!(
+            action_for(plain(KeyCode::Char('w')), Mode::Editing),
+            Some(Action::RunAgent)
+        );
+        assert_eq!(action_for(plain(KeyCode::Char('w')), Mode::Browse), None);
+        assert!(FOOTER_HINTS_EDITING.contains(&(EditingAction::RunAgent, "w workflow")));
     }
 
     #[test]

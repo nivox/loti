@@ -9,10 +9,12 @@
 use anyhow::{Context, Result};
 use jiff::Timestamp;
 use loti_core::domain::{EpicStatus, NodeRef};
+use loti_core::launch;
 use loti_core::lock::VersionRefusal;
 use loti_core::ops::{self, CommentView, NodeStatusChange, Target};
 use loti_core::read;
 use loti_core::render;
+use loti_core::resource::{self, Origin, ResourceId, Roots};
 use loti_core::store::Store;
 use loti_core::{Actor, NodeState};
 
@@ -128,6 +130,60 @@ pub enum Selection {
     /// node. It remains visible, but cannot become a removal target because
     /// removal requires a parsed reference.
     UnremovableBlocker(Container, String),
+}
+
+/// One valid resource an agent picker can select. Its id is the value a launch
+/// request carries; its origin is only the provenance shown to the reader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentChoice {
+    /// The effective resource id.
+    pub id: ResourceId,
+    /// Whether that effective definition came from this project or the user's
+    /// global configuration.
+    pub origin: Origin,
+}
+
+impl AgentChoice {
+    /// The one-line value a picker shows. The origin remains beside the id so two
+    /// otherwise identical-looking catalogs explain which definition won.
+    pub fn shown(&self) -> String {
+        let origin = match self.origin {
+            Origin::Local => "local",
+            Origin::Global => "global",
+        };
+        format!("{} ({origin})", self.id)
+    }
+}
+
+/// The valid effective resources and frozen target gathered when an agent picker
+/// is requested. Invalid effective entries are deliberately absent: a picker can
+/// only produce a request that later launch preparation can resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentPicker {
+    /// The epic or ticket the request remains scoped to.
+    pub target: launch::Target,
+    /// Workflows, in the core roster's stable effective-id order.
+    pub workflows: Vec<AgentChoice>,
+    /// Agent profiles, in the core roster's stable effective-id order.
+    pub profiles: Vec<AgentChoice>,
+}
+
+impl AgentPicker {
+    /// Whether both values a launch request requires are selectable.
+    pub fn is_selectable(&self) -> bool {
+        !self.workflows.is_empty() && !self.profiles.is_empty()
+    }
+
+    /// Why an empty picker cannot open, in terms of the missing selectable
+    /// resources rather than invalid candidates the picker never offered.
+    pub fn unavailable_reason(&self) -> String {
+        match (self.workflows.is_empty(), self.profiles.is_empty()) {
+            (true, true) => "no valid workflows or agent profiles are available".to_string(),
+            (true, false) => "no valid workflows are available".to_string(),
+            (false, true) => "no valid agent profiles are available".to_string(),
+            (false, false) => String::new(),
+        }
+    }
 }
 
 impl Selection {
@@ -398,6 +454,82 @@ pub fn open(root: Option<&std::path::Path>) -> Result<Store> {
         .verify_readable()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(store)
+}
+
+/// Discover the values an agent-picker surface needs from `start`, which is the
+/// directory the browser was opened from. Configuration and resource directories
+/// are read here — at the requested action — never while editing hints are drawn.
+///
+/// The target is read with the same operation that later launch preparation uses,
+/// so the request carries the frozen reference and display name rather than a
+/// string reconstructed by the UI. Only epics and tickets can be launch targets;
+/// every structural or metadata selection is refused by name.
+pub fn agent_picker(
+    store: &Store,
+    selection: &Selection,
+    start: &std::path::Path,
+) -> Result<AgentPicker> {
+    let target = match selection {
+        Selection::Epic(id) => {
+            let epic = ops::read_epic(store, id)?;
+            launch::Target::Epic {
+                id: id.clone(),
+                name: epic.frontmatter.name,
+            }
+        }
+        Selection::Node(reference) => {
+            let node = ops::read_node(store, reference)?;
+            launch::Target::Ticket {
+                reference: reference.clone(),
+                name: node.frontmatter.name,
+            }
+        }
+        Selection::Collection(..)
+        | Selection::Label(..)
+        | Selection::Comment(..)
+        | Selection::Asset(..)
+        | Selection::Blocker(..)
+        | Selection::UnremovableBlocker(..) => {
+            anyhow::bail!("{} is not an epic or ticket", selection.reference())
+        }
+    };
+
+    // A project config is optional. When it is present, its resource roots are
+    // validated by core rather than treated as an empty local catalog.
+    let local = loti_core::discovery::find_project_config(start)
+        .map(|path| resource::local_roots(&path))
+        .transpose()?
+        .unwrap_or_default();
+    let workflows = resource::list_workflows(&Roots {
+        local: local.workflows,
+        global: resource::global_workflow_root(),
+    })?
+    .into_iter()
+    .filter(|effective| effective.is_valid())
+    .map(|effective| AgentChoice {
+        id: ResourceId::parse(&effective.id)
+            .expect("a valid effective resource always has a valid resource id"),
+        origin: effective.origin,
+    })
+    .collect();
+    let profiles = resource::list_profiles(&Roots {
+        local: local.agents,
+        global: resource::global_agent_root(),
+    })?
+    .into_iter()
+    .filter(|effective| effective.is_valid())
+    .map(|effective| AgentChoice {
+        id: ResourceId::parse(&effective.id)
+            .expect("a valid effective resource always has a valid resource id"),
+        origin: effective.origin,
+    })
+    .collect();
+
+    Ok(AgentPicker {
+        target,
+        workflows,
+        profiles,
+    })
 }
 
 /// The rows of one level, in the order every other loti surface lists them:

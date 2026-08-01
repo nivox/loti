@@ -5,9 +5,12 @@
 //! machine testable without a terminal, and means a future write path is an
 //! extra arm in [`App::apply`] rather than a change to the event loop.
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use loti_core::launch;
+use loti_core::resource::ResourceId;
 use loti_core::store::Store;
 use ratatui_markdown::viewer::MarkdownViewer;
 
@@ -126,6 +129,14 @@ const CLAIM_FIELD: &str = "claim holder";
 /// rather than called `id` alone, because the warning about it is read over a
 /// float that covers everything else on screen.
 const EPIC_ID_FIELD: &str = "epic id";
+/// See [`EPIC_ID_FIELD`]. The picker is unavailable before a surface opens, so
+/// this report preserves the browser rather than presenting an empty control.
+const AGENT_PICKER_TITLE: &str = " agent picker unavailable ";
+/// See [`EPIC_ID_FIELD`]. The second field names the configured harness profile
+/// rather than an operator identity.
+const AGENT_FIELD: &str = "agent";
+/// See [`EPIC_ID_FIELD`].
+const WORKFLOW_FIELD: &str = "workflow";
 
 /// What the field offering a cascade is called: the question it asks, with the
 /// number of nodes it would close in it.
@@ -256,6 +267,10 @@ enum Composed {
     /// descendants are still open — the state to mark, and what a cascade would have
     /// to close.
     State,
+    /// The valid effective workflows and profiles available from the browser's
+    /// working directory. Discovery is deferred because the hint strip asks the
+    /// offer table every frame.
+    RunAgent,
 }
 
 /// A dialog: what it says, how it may be answered, what its answers are called,
@@ -493,22 +508,37 @@ impl Dialog {
 /// a field, so the write carries the value the reader marked and never a string
 /// parsed into a meaning — two pickers offer the word `closed` and mean different
 /// things by it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Choice {
     /// A state the frozen row is put into.
     State(data::State),
     /// Whether closing the frozen row takes its open descendants with it.
     Cascade(bool),
+    /// A runtime-discovered resource. Its id is the value a request carries;
+    /// `shown` is the complete text every picker renderer presents.
+    Resource { id: ResourceId, shown: String },
 }
 
 impl Choice {
     /// The word the reader picks it by. A state's word is the store's own; the
-    /// cascade's two are a plain answer to the question its label asks.
-    fn word(self) -> &'static str {
+    /// cascade's two are a plain answer to the question its label asks, and a
+    /// discovered resource owns its dynamic display text rather than asking a
+    /// picker renderer to recognize a special case.
+    fn word(&self) -> &str {
         match self {
             Choice::State(state) => state.wire_name(),
             Choice::Cascade(true) => "yes",
             Choice::Cascade(false) => "no",
+            Choice::Resource { shown, .. } => shown,
+        }
+    }
+
+    /// The selected effective id, if this is one of the dynamically discovered
+    /// choices a launch request may carry.
+    fn resource_id(&self) -> Option<ResourceId> {
+        match self {
+            Choice::Resource { id, .. } => Some(id.clone()),
+            Choice::State(_) | Choice::Cascade(_) => None,
         }
     }
 }
@@ -703,7 +733,7 @@ impl Field {
                 cursor: *cursor,
             },
             Content::Pick { options, at } => Shown::Pick {
-                options: options.iter().map(|o| o.word()).collect(),
+                options: options.iter().map(Choice::word).collect(),
                 at: *at,
             },
         }
@@ -728,7 +758,7 @@ impl Field {
     /// The value a picker holds, and `None` for a field of text.
     fn chosen(&self) -> Option<Choice> {
         match &self.content {
-            Content::Pick { options, at } => options.get(*at).copied(),
+            Content::Pick { options, at } => options.get(*at).cloned(),
             Content::Text { .. } => None,
         }
     }
@@ -904,7 +934,7 @@ pub enum Shown<'a> {
     /// which of them the field holds.
     Pick {
         /// The words the values go by.
-        options: Vec<&'static str>,
+        options: Vec<&'a str>,
         /// Which of them is marked, which is the field's value.
         at: usize,
     },
@@ -1001,11 +1031,23 @@ impl Placement {
     pub const ALL: &'static [Placement] = &[Placement::Float, Placement::Pane];
 }
 
-/// What accepting a surface writes.
+/// A selected agent launch that has not been prepared or spawned. The terminal
+/// owner consumes it later, keeping resource selection separate from process and
+/// terminal effects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchRequest {
+    /// The frozen epic or ticket the launched agent will work on.
+    pub target: launch::Target,
+    /// The selected effective workflow id.
+    pub workflow: ResourceId,
+    /// The selected effective agent-profile id.
+    pub profile: ResourceId,
+}
+
+/// What accepting a surface writes or requests.
 ///
 /// Invariant: named when the surface opens and built from the fields at the moment
-/// it is accepted, so the write and the notice that reports it are one decision
-/// and can never come to name different things.
+/// it is accepted, so the write or request and the selected values cannot diverge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Commit {
     /// Create an epic under the id the first field holds.
@@ -1073,6 +1115,9 @@ enum Commit {
         /// The stamp that field's text was read at.
         stamp: data::Stamp,
     },
+    /// Request a later launch from this frozen target. This is deliberately not a
+    /// write: selection neither prepares a plan nor changes tracker state.
+    RunAgent { target: launch::Target },
 }
 
 /// What a new member of a container is called: an epic's is a ticket, and a
@@ -1209,6 +1254,54 @@ impl Surface {
             focus: 0,
             placement: Placement::Float,
             commit: Commit::TakeClaim(node),
+        }
+    }
+
+    /// The two-step agent picker. Its options are valid effective resource ids;
+    /// their local/global provenance is display text owned by the generic choice
+    /// model, so drawing a dynamic picker needs no special renderer.
+    fn run_agent(picker: data::AgentPicker) -> Self {
+        let workflows: Vec<Choice> = picker
+            .workflows
+            .into_iter()
+            .map(|choice| {
+                let shown = choice.shown();
+                Choice::Resource {
+                    id: choice.id,
+                    shown,
+                }
+            })
+            .collect();
+        let profiles: Vec<Choice> = picker
+            .profiles
+            .into_iter()
+            .map(|choice| {
+                let shown = choice.shown();
+                Choice::Resource {
+                    id: choice.id,
+                    shown,
+                }
+            })
+            .collect();
+        let workflow = workflows
+            .first()
+            .cloned()
+            .expect("an agent picker surface has a selectable workflow");
+        let profile = profiles
+            .first()
+            .cloned()
+            .expect("an agent picker surface has a selectable profile");
+        Self {
+            title: format!(" workflow for {} ", picker.target.reference()),
+            fields: vec![
+                Field::pick(WORKFLOW_FIELD, workflows, workflow),
+                Field::pick(AGENT_FIELD, profiles, profile),
+            ],
+            focus: 0,
+            placement: Placement::Float,
+            commit: Commit::RunAgent {
+                target: picker.target,
+            },
         }
     }
 
@@ -1471,7 +1564,7 @@ impl Surface {
     fn picked_state(&self, current: data::State) -> data::State {
         match self.fields.first().and_then(Field::chosen) {
             Some(Choice::State(state)) => state,
-            Some(Choice::Cascade(_)) | None => current,
+            Some(Choice::Cascade(_) | Choice::Resource { .. }) | None => current,
         }
     }
 
@@ -1511,6 +1604,21 @@ impl Surface {
             .and_then(Field::text)
             .unwrap_or_default()
             .to_string()
+    }
+
+    /// The selected launch request, if this is the agent picker and both generic
+    /// resource choices still hold ids. Selecting it prepares nothing and keeps the
+    /// surface open until the terminal-owning handoff either takes the request or
+    /// reports a later refusal over this preserved surface.
+    fn launch_request(&self) -> Option<LaunchRequest> {
+        let Commit::RunAgent { target } = &self.commit else {
+            return None;
+        };
+        Some(LaunchRequest {
+            target: target.clone(),
+            workflow: self.fields.first()?.chosen()?.resource_id()?,
+            profile: self.fields.get(1)?.chosen()?.resource_id()?,
+        })
     }
 
     /// The name and the summary a creation form ends with, whatever it asks for in
@@ -1647,6 +1755,9 @@ impl Surface {
                     format!("{} of {reference} saved", field.noun()),
                 )
             }
+            Commit::RunAgent { .. } => {
+                unreachable!("an agent picker produces a launch request, not a tracker write")
+            }
         }
     }
 }
@@ -1676,6 +1787,9 @@ struct Preview {
 /// The browser.
 pub struct App {
     store: Store,
+    /// The directory resource discovery starts from. It is captured without
+    /// reading configuration so `w`, not rendering or startup, owns discovery.
+    working_directory: PathBuf,
     nav: Nav,
     theme: Theme,
     preview: Preview,
@@ -1720,17 +1834,31 @@ pub struct App {
     /// alternate screen gone, raw mode off and mouse capture off, and none of those
     /// belong to the state machine. So the handoff is left here to be picked up.
     editor_handoff: Option<String>,
+    /// A selected agent launch waiting for the terminal-owning handoff slice.
+    launch_request: Option<LaunchRequest>,
 }
 
 impl App {
     /// Open the browser on a store, positioned at the epic roster.
     pub fn new(store: Store, theme: Theme) -> Result<Self> {
+        Self::at_working_directory(store, theme, std::env::current_dir()?)
+    }
+
+    /// Open the browser with resource discovery rooted at `working_directory`.
+    /// The directory is a caller input rather than a cached catalog: configuration
+    /// and resource files are still read only when the workflow action is invoked.
+    pub fn at_working_directory(
+        store: Store,
+        theme: Theme,
+        working_directory: impl Into<PathBuf>,
+    ) -> Result<Self> {
         let rows = data::rows(&store, &Level::Epics)?;
         // Asked before the first frame, beside the readability check the store
         // was opened with: a session that cannot write must not offer to.
         let read_only = data::read_only(&store);
         Ok(Self {
             store,
+            working_directory: working_directory.into(),
             nav: Nav::new(rows),
             theme,
             preview: Preview {
@@ -1751,6 +1879,7 @@ impl App {
             editing: None,
             surface: None,
             editor_handoff: None,
+            launch_request: None,
         })
     }
 
@@ -1792,6 +1921,13 @@ impl App {
     /// The open editing surface, if any.
     pub fn surface(&self) -> Option<&Surface> {
         self.surface.as_ref()
+    }
+
+    /// Take the selected agent launch request. The terminal-owning handoff is
+    /// intentionally separate: it may prepare or reject the request while this
+    /// picker remains open beneath its report surface.
+    pub fn take_launch_request(&mut self) -> Option<LaunchRequest> {
+        self.launch_request.take()
     }
 
     /// Which set of bindings the keyboard is under.
@@ -2041,6 +2177,12 @@ impl App {
                 }
                 _ => None,
             },
+            // The picker may only be asked for a frozen epic or ticket. Discovery
+            // does not happen here: this table also feeds hints on every frame.
+            EditingAction::RunAgent => match target {
+                Selection::Epic(_) | Selection::Node(_) => Some(Offer::Compose(Composed::RunAgent)),
+                _ => None,
+            },
             EditingAction::Delete => match target {
                 // A label set has no rename, so a label is only ever removed.
                 Selection::Label(_, label) => Some(Offer::Ask(Dialog::confirm(
@@ -2197,6 +2339,7 @@ impl App {
             | Action::SetState
             | Action::TakeClaim
             | Action::ReleaseClaim
+            | Action::RunAgent
             | Action::Overwrite
             | Action::Accept
             | Action::ExternalEditor
@@ -2533,6 +2676,13 @@ impl App {
             self.modal = Some(Modal::Dialog(Box::new(Dialog::rejected(why, index))));
             return;
         }
+        if let Some(request) = surface.launch_request() {
+            // Selection is not a tracker write and must not prepare or spawn a
+            // process here. Leave the picker standing for the handoff slice to
+            // preserve if preparation later refuses the request.
+            self.launch_request = Some(request);
+            return;
+        }
         let (write, done) = surface.write();
         self.commit(&write, done);
     }
@@ -2660,6 +2810,7 @@ impl App {
         let Some(target) = self.editing.clone() else {
             return;
         };
+        let agent_picker = matches!(composed, Composed::RunAgent);
         let opened = match composed {
             Composed::Field(field) => data::edit_target(&self.store, &target).map(|read| {
                 Surface::replace(
@@ -2678,9 +2829,32 @@ impl App {
                 )
             }),
             Composed::State => data::state_target(&self.store, &target).map(Surface::set_state),
+            Composed::RunAgent => data::agent_picker(&self.store, &target, &self.working_directory)
+                .and_then(|picker| {
+                    if picker.is_selectable() {
+                        Ok(Surface::run_agent(picker))
+                    } else {
+                        anyhow::bail!(picker.unavailable_reason())
+                    }
+                }),
         };
         match opened {
             Ok(surface) => self.surface = Some(surface),
+            // A resource catalog is unavailable for the same reader-facing reason
+            // whether it contains no valid choices or configuration could not be
+            // read: report it over the preserved browser rather than open an empty
+            // picker. Other composed surfaces are store reads and retain their
+            // existing unreadable-store report.
+            Err(e) if agent_picker => {
+                self.modal = Some(Modal::Dialog(Box::new(Dialog::report(
+                    AGENT_PICKER_TITLE,
+                    e.to_string(),
+                    Dismissal {
+                        word: "dismiss",
+                        performs: None,
+                    },
+                ))));
+            }
             Err(e) => self.store_unreadable(e.to_string()),
         }
     }
@@ -2922,6 +3096,7 @@ mod tests {
     use loti_core::lock::{self, LockConfig};
     use loti_core::ops::{self, NewNode};
     use loti_core::NodeState;
+    use std::sync::{Mutex, MutexGuard};
     use std::time::Duration;
 
     /// The browser on the shared fixture store. The fixture is returned with it
@@ -2930,6 +3105,123 @@ mod tests {
         let fx = Fixture::build();
         let app = App::new(fx.store.clone(), Theme::with_color(false)).unwrap();
         (fx, app)
+    }
+
+    // Resource discovery reads this process-global setting. Hold it from setup
+    // until the fixture drops so concurrently running picker tests cannot make
+    // either catalog observe the other's global resources.
+    static XDG_CONFIG_HOME_LOCK: Mutex<()> = Mutex::new(());
+
+    /// An isolated working directory and global resource home for picker tests.
+    ///
+    /// The browser discovers the global roster from the process environment, so
+    /// restoring it on drop keeps these fixtures from changing another test's
+    /// catalog after their assertions finish.
+    struct AgentResourceFixture {
+        directory: tempfile::TempDir,
+        previous_xdg_config_home: Option<std::ffi::OsString>,
+        _environment_lock: MutexGuard<'static, ()>,
+    }
+
+    impl AgentResourceFixture {
+        fn new() -> Self {
+            let environment_lock = XDG_CONFIG_HOME_LOCK.lock().unwrap();
+            let previous_xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
+            let directory = tempfile::tempdir().unwrap();
+            std::env::set_var("XDG_CONFIG_HOME", directory.path());
+            Self {
+                directory,
+                previous_xdg_config_home,
+                _environment_lock: environment_lock,
+            }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            self.directory.path()
+        }
+
+        fn add_local_resources(&self, workflows: bool, profiles: bool) {
+            let mut config = String::new();
+            if workflows {
+                std::fs::create_dir_all(self.path().join("workflows")).unwrap();
+                std::fs::write(
+                    self.path().join("workflows").join("000-picker-workflow.md"),
+                    "# Picker workflow\n",
+                )
+                .unwrap();
+                config.push_str("workflow-root = \"workflows\"\n");
+            }
+            if profiles {
+                std::fs::create_dir_all(self.path().join("agents")).unwrap();
+                std::fs::write(
+                    self.path().join("agents").join("000-picker-agent.toml"),
+                    "command = \"agent\"\nargs = [\"{{ loti_prompt }}\"]\n",
+                )
+                .unwrap();
+                std::fs::write(
+                    self.path().join("agents").join("001-picker-agent.toml"),
+                    "command = \"agent\"\nargs = [\"{{ loti_prompt }}\"]\n",
+                )
+                .unwrap();
+                config.push_str("agent-root = \"agents\"\n");
+            }
+            std::fs::write(self.path().join(".loti.conf"), config).unwrap();
+        }
+
+        fn add_global_resources(&self) {
+            let global = self.path().join("loti");
+            std::fs::create_dir_all(global.join("workflows")).unwrap();
+            std::fs::create_dir_all(global.join("agents")).unwrap();
+            std::fs::write(
+                global.join("workflows").join("global-workflow.md"),
+                "# Global workflow\n",
+            )
+            .unwrap();
+            std::fs::write(
+                global.join("agents").join("global-agent.toml"),
+                "command = \"agent\"\nargs = [\"{{ loti_prompt }}\"]\n",
+            )
+            .unwrap();
+        }
+    }
+
+    impl Drop for AgentResourceFixture {
+        fn drop(&mut self) {
+            match &self.previous_xdg_config_home {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
+    /// A browser whose `w` action discovers a local catalog. The directory is
+    /// kept separate from the fixture store because resource discovery starts at
+    /// the browser's working directory, not at a cached store path.
+    fn app_with_local_agent_resources(
+        workflows: bool,
+        profiles: bool,
+    ) -> (Fixture, AgentResourceFixture, App) {
+        let fx = Fixture::build();
+        let resources = AgentResourceFixture::new();
+        resources.add_local_resources(workflows, profiles);
+        let app =
+            App::at_working_directory(fx.store.clone(), Theme::with_color(false), resources.path())
+                .unwrap();
+        (fx, resources, app)
+    }
+
+    fn app_with_agent_resources() -> (Fixture, AgentResourceFixture, App) {
+        app_with_local_agent_resources(true, true)
+    }
+
+    fn app_with_global_agent_resources() -> (Fixture, AgentResourceFixture, App) {
+        let fx = Fixture::build();
+        let resources = AgentResourceFixture::new();
+        resources.add_global_resources();
+        let app =
+            App::at_working_directory(fx.store.clone(), Theme::with_color(false), resources.path())
+                .unwrap();
+        (fx, resources, app)
     }
 
     #[test]
@@ -3152,6 +3444,205 @@ mod tests {
         app.apply(Action::EnterEditing).unwrap();
     }
 
+    #[test]
+    fn a_workflow_picker_is_offered_only_on_epics_and_tickets() {
+        let (_fx, _resources, mut app) = app_with_agent_resources();
+        freeze_the_epics_row(&mut app);
+        assert!(app
+            .editing_hints()
+            .contains(&hint_for(EditingAction::RunAgent)));
+        app.apply(Action::Unwind).unwrap();
+
+        to_the_labels_row(&mut app);
+        app.apply(Action::EnterEditing).unwrap();
+        assert!(!app
+            .editing_hints()
+            .contains(&hint_for(EditingAction::RunAgent)));
+
+        app.apply(Action::Unwind).unwrap();
+        freeze_a_ticket_row(&mut app);
+        assert!(app
+            .editing_hints()
+            .contains(&hint_for(EditingAction::RunAgent)));
+    }
+
+    #[test]
+    fn a_workflow_picker_shows_global_resource_options_and_origins() {
+        let (_fx, _resources, mut app) = app_with_global_agent_resources();
+        freeze_the_epics_row(&mut app);
+        app.apply(Action::RunAgent).unwrap();
+
+        let surface = app.surface().expect("the workflow key opened no picker");
+        let (workflows, _) = options_of(&surface.fields()[0]);
+        let (profiles, _) = options_of(&surface.fields()[1]);
+        assert_eq!(workflows, ["global-workflow (global)"]);
+        assert_eq!(profiles, ["global-agent (global)"]);
+
+        let frame = frame_lines(&mut app, 100, 24);
+        assert!(
+            frame
+                .iter()
+                .any(|line| line.contains("global-workflow (global)")),
+            "{frame:#?}"
+        );
+        assert!(
+            frame
+                .iter()
+                .any(|line| line.contains("global-agent (global)")),
+            "{frame:#?}"
+        );
+    }
+
+    /// Press `w` on a frozen target and verify that a partial catalog reports
+    /// its missing half instead of constructing a picker without both values.
+    fn assert_partial_catalog_is_refused(app: &mut App, expected_reason: &str) {
+        freeze_the_epics_row(app);
+        let target = app.editing_target().cloned().expect("the epic row froze");
+        app.apply(Action::RunAgent).unwrap();
+
+        let Some(Modal::Dialog(dialog)) = app.modal() else {
+            panic!("a partial catalog opened no unavailable dialog");
+        };
+        assert_eq!(dialog.title(), AGENT_PICKER_TITLE);
+        assert_eq!(dialog.message(), expected_reason);
+        assert!(
+            app.surface().is_none(),
+            "a partial catalog opened an empty picker"
+        );
+        assert_eq!(
+            app.editing_target(),
+            Some(&target),
+            "the unavailable dialog discarded the frozen target"
+        );
+    }
+
+    #[test]
+    fn a_catalog_with_only_workflows_refuses_the_agent_picker() {
+        let (_fx, _resources, mut app) = app_with_local_agent_resources(true, false);
+        assert_partial_catalog_is_refused(&mut app, "no valid agent profiles are available");
+    }
+
+    #[test]
+    fn a_catalog_with_only_profiles_refuses_the_agent_picker() {
+        let (_fx, _resources, mut app) = app_with_local_agent_resources(false, true);
+        assert_partial_catalog_is_refused(&mut app, "no valid workflows are available");
+    }
+
+    #[test]
+    fn a_workflow_picker_keeps_dynamic_origins_and_the_frozen_target_on_screen() {
+        let (_fx, _resources, mut app) = app_with_agent_resources();
+        freeze_a_ticket_row(&mut app);
+        let frozen = app.editing_target().unwrap().reference();
+        app.apply(Action::RunAgent).unwrap();
+
+        let surface = app.surface().expect("the workflow key opened no picker");
+        assert!(surface.title().contains(&frozen), "{}", surface.title());
+        assert_eq!(surface.placement(), Placement::Float);
+        assert_eq!(surface.fields().len(), 2);
+        assert_eq!(surface.fields()[0].label(), WORKFLOW_FIELD);
+        assert_eq!(surface.fields()[1].label(), AGENT_FIELD);
+        let (workflows, workflow_at) = options_of(&surface.fields()[0]);
+        let (profiles, profile_at) = options_of(&surface.fields()[1]);
+        assert_eq!(workflows[workflow_at], "000-picker-workflow (local)");
+        assert_eq!(profiles[profile_at], "000-picker-agent (local)");
+        let frame = frame_lines(&mut app, 100, 24);
+        assert!(
+            frame
+                .iter()
+                .any(|line| line.contains("workflow for") && line.contains(&frozen)),
+            "{frame:#?}"
+        );
+        assert!(
+            frame
+                .iter()
+                .any(|line| line.contains("000-picker-workflow (local)")),
+            "{frame:#?}"
+        );
+        assert!(
+            frame
+                .iter()
+                .any(|line| line.contains("000-picker-agent (local)")),
+            "{frame:#?}"
+        );
+
+        assert_eq!(app.mode(), surface_mode(Fields::Several, FieldKind::Pick));
+        app.apply(Action::NextField).unwrap();
+        assert_eq!(app.mode(), surface_mode(Fields::Several, FieldKind::Pick));
+        let before = marked(&app.surface().unwrap().fields()[1]);
+        app.apply(Action::MoveDown).unwrap();
+        let after = marked(&app.surface().unwrap().fields()[1]);
+        // The resource catalog may contain other global choices, but movement is
+        // still the generic picker's marked value and never opens another UI.
+        assert_ne!(after, before);
+
+        app.apply(Action::Unwind).unwrap();
+        assert!(
+            app.surface().is_some(),
+            "a dirty picker should ask before discarding"
+        );
+        assert!(matches!(app.modal(), Some(Modal::Dialog(_))));
+        app.apply(Action::Unwind).unwrap();
+        assert!(
+            app.surface().is_some(),
+            "dismissing discard lost the picker"
+        );
+        app.apply(Action::Unwind).unwrap();
+        app.apply(Action::Delete).unwrap();
+        assert!(app.surface().is_none(), "discard did not cancel the picker");
+        assert!(app.editing_target().is_some(), "cancel left editing mode");
+    }
+
+    #[test]
+    fn an_unreadable_agent_catalog_reports_over_the_preserved_browser() {
+        let fx = Fixture::build();
+        let resources = tempfile::tempdir().unwrap();
+        std::fs::write(
+            resources.path().join(".loti.conf"),
+            "agent-root = [broken\n",
+        )
+        .unwrap();
+        let mut app =
+            App::at_working_directory(fx.store.clone(), Theme::with_color(false), resources.path())
+                .unwrap();
+        freeze_the_epics_row(&mut app);
+
+        app.apply(Action::RunAgent).unwrap();
+        let Some(Modal::Dialog(dialog)) = app.modal() else {
+            panic!("an unreadable catalog opened no report");
+        };
+        assert_eq!(dialog.title(), AGENT_PICKER_TITLE);
+        assert!(
+            app.surface().is_none(),
+            "an unavailable catalog opened a picker"
+        );
+        assert!(
+            app.editing_target().is_some(),
+            "the report discarded the frozen row"
+        );
+        app.apply(Action::Unwind).unwrap();
+        assert!(
+            app.editing_target().is_some(),
+            "dismissing the report left editing"
+        );
+    }
+
+    #[test]
+    fn accepting_a_workflow_picker_only_queues_a_launch_request() {
+        let (fx, _resources, mut app) = app_with_agent_resources();
+        freeze_the_epics_row(&mut app);
+        app.apply(Action::RunAgent).unwrap();
+        app.apply(Action::Accept).unwrap();
+
+        let request = app.take_launch_request().expect("accept queued no request");
+        assert_eq!(request.target.reference(), fx.epic);
+        assert_eq!(request.workflow.as_str(), "000-picker-workflow");
+        assert_eq!(request.profile.as_str(), "000-picker-agent");
+        // There is no preparation or handoff in this slice: preserving the picker
+        // lets the next slice report a preparation refusal over the chosen values.
+        assert!(app.surface().is_some());
+        assert!(app.editing_target().is_some());
+    }
+
     /// Open the body buffer, the way a reader does: freeze the epic's row and press
     /// the letter that edits its long-form text.
     fn open_the_body_buffer(app: &mut App) {
@@ -3255,9 +3746,9 @@ mod tests {
     ///
     /// A field of text is a failure rather than an empty answer, for the same reason
     /// the other way round is.
-    fn options_of(field: &Field) -> (Vec<&'static str>, usize) {
+    fn options_of(field: &Field) -> (Vec<String>, usize) {
         match field.shown() {
-            Shown::Pick { options, at } => (options, at),
+            Shown::Pick { options, at } => (options.into_iter().map(str::to_string).collect(), at),
             Shown::Text { .. } => {
                 panic!("{} is a field of text rather than a picker", field.label())
             }
@@ -3265,9 +3756,9 @@ mod tests {
     }
 
     /// The value a picker holds, which is the value it has marked.
-    fn marked(field: &Field) -> &'static str {
+    fn marked(field: &Field) -> String {
         let (options, at) = options_of(field);
-        options[at]
+        options[at].clone()
     }
 
     /// The name of a field invented for a test, so a rule about one field has a

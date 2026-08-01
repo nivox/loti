@@ -280,6 +280,8 @@ pub enum EditingAction {
     /// Offered only while a claim is held: the pair's two halves are the same
     /// noun, and there is nothing to give up on a row nobody is on.
     ReleaseClaim,
+    /// Choose a workflow and agent profile for a frozen unit of work.
+    RunAgent,
 }
 
 impl EditingAction {
@@ -298,6 +300,7 @@ impl EditingAction {
         EditingAction::SetState,
         EditingAction::TakeClaim,
         EditingAction::ReleaseClaim,
+        EditingAction::RunAgent,
     ];
 
     /// The intent a key carries for this action. The state machine reads an
@@ -310,6 +313,7 @@ impl EditingAction {
             EditingAction::SetState => Action::SetState,
             EditingAction::TakeClaim => Action::TakeClaim,
             EditingAction::ReleaseClaim => Action::ReleaseClaim,
+            EditingAction::RunAgent => Action::RunAgent,
         }
     }
 
@@ -415,6 +419,11 @@ pub enum Action {
     /// nothing is asked: the row carries the claim, so the write is what the key
     /// performs.
     ReleaseClaim,
+    /// Choose a workflow and agent profile for the frozen epic or ticket.
+    ///
+    /// Discovery is deferred until this intent is applied: rendering an editing
+    /// hint must never read configuration or resource directories.
+    RunAgent,
     /// Write anyway, over a change that landed under the open buffer. The
     /// affirmative answer of the one question whose two answers both lose
     /// something, which is why it is not the destructive letter: what this throws
@@ -509,7 +518,8 @@ mod tests {
                 | EditingAction::Delete
                 | EditingAction::SetState
                 | EditingAction::TakeClaim
-                | EditingAction::ReleaseClaim => {}
+                | EditingAction::ReleaseClaim
+                | EditingAction::RunAgent => {}
                 // Every replaceable field is an action of its own, so a field
                 // added without a key and a hint fails here rather than being an
                 // action no reader can reach.
@@ -518,7 +528,7 @@ mod tests {
                 },
             }
         }
-        assert_eq!(EditingAction::ALL.len(), 5 + FreeForm::ALL.len());
+        assert_eq!(EditingAction::ALL.len(), 6 + FreeForm::ALL.len());
         for field in FreeForm::ALL {
             assert!(
                 EditingAction::ALL.contains(&EditingAction::Edit(*field)),
