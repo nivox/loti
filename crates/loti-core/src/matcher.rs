@@ -518,17 +518,26 @@ mod tests {
 
     // -- external matcher process protocol (hermetic, via a fake matcher) ---
 
-    /// Write an executable `/bin/sh` script into `dir` and return its path. The
-    /// script is the fake matcher; its body decides the protocol behaviour under
-    /// test. Made executable so it can be spawned directly.
+    /// Write a POSIX shell fake matcher into `dir` and return its path. Tests
+    /// invoke it through `/bin/sh`, so a freshly written script is never exec'd
+    /// while the filesystem may still consider it busy.
     fn write_matcher(dir: &Path, name: &str, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let path = dir.join(name);
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
         path
+    }
+
+    /// Build the command template every fake matcher uses. The interpreter is
+    /// the executable; the temporary script is an argument it reads.
+    fn shell_matcher(script: &Path) -> MatcherConfig {
+        MatcherConfig {
+            command: vec![
+                "/bin/sh".to_string(),
+                script.to_string_lossy().into_owned(),
+                QUERY_PLACEHOLDER.to_string(),
+                CANDIDATES_PLACEHOLDER.to_string(),
+            ],
+        }
     }
 
     fn candidate_files(dir: &Path, count: usize) -> Vec<PathBuf> {
@@ -547,15 +556,9 @@ mod tests {
         let candidates = candidate_files(dir.path(), 3);
         // Echo the third candidate then the first: order significant.
         let script = write_matcher(dir.path(), "m.sh", "shift; printf '%s\\n' \"$3\" \"$1\"");
-        // Template: script <QUERY> <CANDIDATES>. After `shift` the candidates
-        // are $1..$3; the script prints $3 then $1.
-        let config = MatcherConfig {
-            command: vec![
-                script.to_string_lossy().into_owned(),
-                QUERY_PLACEHOLDER.to_string(),
-                CANDIDATES_PLACEHOLDER.to_string(),
-            ],
-        };
+        // Template: /bin/sh script <QUERY> <CANDIDATES>. After `shift` the
+        // candidates are $1..$3; the script prints $3 then $1.
+        let config = shell_matcher(&script);
         let outcome = run_external("m", &config, "needle", &candidates).unwrap();
         assert_eq!(
             outcome.matched,
@@ -574,13 +577,7 @@ mod tests {
             "m.sh",
             "shift; printf '%s\\n' \"$1\"; printf '%s\\n' \"/nowhere/9.md\"",
         );
-        let config = MatcherConfig {
-            command: vec![
-                script.to_string_lossy().into_owned(),
-                QUERY_PLACEHOLDER.to_string(),
-                CANDIDATES_PLACEHOLDER.to_string(),
-            ],
-        };
+        let config = shell_matcher(&script);
         let outcome = run_external("m", &config, "q", &candidates).unwrap();
         assert_eq!(outcome.matched, vec![candidates[0].clone()]);
         assert_eq!(outcome.warnings.len(), 1);
@@ -601,13 +598,7 @@ mod tests {
             "m.sh",
             "shift; printf '%s\\n' 'not a path at all'; printf '%s\\n' \"$1\"",
         );
-        let config = MatcherConfig {
-            command: vec![
-                script.to_string_lossy().into_owned(),
-                QUERY_PLACEHOLDER.to_string(),
-                CANDIDATES_PLACEHOLDER.to_string(),
-            ],
-        };
+        let config = shell_matcher(&script);
         let outcome = run_external("m", &config, "q", &candidates).unwrap();
         assert_eq!(outcome.matched, vec![candidates[0].clone()]);
         assert_eq!(outcome.warnings.len(), 1);
@@ -619,13 +610,7 @@ mod tests {
         let candidates = candidate_files(dir.path(), 2);
         // grep convention: exit 1 with no stdout, no stderr = no matches.
         let script = write_matcher(dir.path(), "m.sh", "exit 1");
-        let config = MatcherConfig {
-            command: vec![
-                script.to_string_lossy().into_owned(),
-                QUERY_PLACEHOLDER.to_string(),
-                CANDIDATES_PLACEHOLDER.to_string(),
-            ],
-        };
+        let config = shell_matcher(&script);
         let outcome = run_external("m", &config, "q", &candidates).unwrap();
         assert!(outcome.matched.is_empty());
         assert!(outcome.warnings.is_empty());
@@ -636,13 +621,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let candidates = candidate_files(dir.path(), 1);
         let script = write_matcher(dir.path(), "m.sh", "echo 'boom' 1>&2; exit 2");
-        let config = MatcherConfig {
-            command: vec![
-                script.to_string_lossy().into_owned(),
-                QUERY_PLACEHOLDER.to_string(),
-                CANDIDATES_PLACEHOLDER.to_string(),
-            ],
-        };
+        let config = shell_matcher(&script);
         let err = run_external("m", &config, "q", &candidates).unwrap_err();
         match err {
             MatcherError::Failed { name, stderr } => {
@@ -668,17 +647,56 @@ mod tests {
             c = count_out.to_string_lossy(),
         );
         let script = write_matcher(dir.path(), "m.sh", &body);
-        let config = MatcherConfig {
-            command: vec![
-                script.to_string_lossy().into_owned(),
-                QUERY_PLACEHOLDER.to_string(),
-                CANDIDATES_PLACEHOLDER.to_string(),
-            ],
-        };
+        let config = shell_matcher(&script);
         let outcome = run_external("m", &config, "find-me", &candidates).unwrap();
         assert_eq!(std::fs::read_to_string(&query_out).unwrap(), "find-me");
         // Three candidate path args were expanded.
         assert_eq!(std::fs::read_to_string(&count_out).unwrap(), "3");
         assert_eq!(outcome.matched, vec![candidates[0].clone()]);
+    }
+
+    #[test]
+    fn external_matchers_survive_parallel_fresh_script_writes() {
+        const WORKERS: usize = 8;
+        const RUNS_PER_WORKER: usize = 20;
+
+        // Every run writes a fresh script immediately before invoking it. Any
+        // failure is terminal; this increases contention without retrying it.
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..WORKERS)
+                .map(|worker| {
+                    scope.spawn(move || {
+                        for run in 0..RUNS_PER_WORKER {
+                            let dir = tempfile::tempdir().unwrap();
+                            let candidates = candidate_files(dir.path(), 2);
+                            let script = write_matcher(
+                                dir.path(),
+                                "m.sh",
+                                "test \"$1\" = needle || exit 9; shift; test \"$#\" -eq 2 || exit 9; printf '%s\\n' \"$1\"",
+                            );
+                            let outcome = run_external(
+                                "m",
+                                &shell_matcher(&script),
+                                "needle",
+                                &candidates,
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!("worker {worker}, run {run} failed: {error}")
+                            });
+                            assert_eq!(
+                                outcome.matched,
+                                vec![candidates[0].clone()],
+                                "worker {worker}, run {run}"
+                            );
+                            assert!(outcome.warnings.is_empty(), "worker {worker}, run {run}");
+                        }
+                    })
+                })
+                .collect();
+
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
     }
 }
