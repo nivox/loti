@@ -17,10 +17,12 @@ use jiff::Timestamp;
 
 /// `loti` — a local, markdown-backed ticket tracker driven entirely by this CLI.
 ///
-/// Grammar is noun-verb: `loti <epic|ticket> <verb> ...`, with collections
-/// (`label`/`comment`/`asset`) nesting a third level. Free-form/binary payloads
-/// (body, comment text, asset data) are read from stdin or `--file` — never
-/// inline. Run `loti skill` for concepts and workflow.
+/// Grammar is noun-verb: `loti <epic|ticket|agent|workflow> <verb> ...`.
+/// `agent` manages effective agent profiles and foreground launches; `workflow`
+/// manages effective workflow instructions. Collections (`label`/`comment`/`asset`)
+/// nest a third level. Free-form/binary payloads (body, comment text, asset data)
+/// are read from stdin or `--file` — never inline. Run `loti skill` for concepts
+/// and workflow.
 #[derive(Debug, Parser)]
 #[command(
     name = "loti",
@@ -510,7 +512,24 @@ pub struct ResourceListArgs {
     #[command(flatten)]
     pub fields: FieldSel,
     #[command(flatten)]
-    pub format: ListFormat,
+    pub format: ResourceListFormat,
+}
+
+/// Resource-list output mode: at most one of json/ndjson/raw; default is plain
+/// text. Resource rows are not hierarchy rows, so their JSON has no parent
+/// pointers.
+#[derive(Debug, Args)]
+#[group(required = false, multiple = false)]
+pub struct ResourceListFormat {
+    /// Flat JSON array of resource rows: `id`, `origin`, and `diagnostics`.
+    #[arg(long)]
+    pub json: bool,
+    /// Stream one resource JSON object per line.
+    #[arg(long)]
+    pub ndjson: bool,
+    /// Flat, tab-separated resource rows: id, origin, diagnostics.
+    #[arg(long)]
+    pub raw: bool,
 }
 
 /// A bare resource id — an agent-profile or workflow id — for a reader that
@@ -817,8 +836,8 @@ pub struct ShowArgs {
     pub format: ShowFormat,
 }
 
-/// `list` output mode: at most one of json/ndjson/raw; default is plain text
-/// (`list` never presents, so there is no `--markdown`).
+/// Epic/ticket `list` output mode: at most one of json/ndjson/raw; default is
+/// plain text (`list` never presents, so there is no `--markdown`).
 #[derive(Debug, Args)]
 #[group(required = false, multiple = false)]
 pub struct ListFormat {

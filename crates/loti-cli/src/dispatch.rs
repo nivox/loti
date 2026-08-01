@@ -39,7 +39,8 @@ use loti_core::Actor;
 use crate::cli::{
     ActorArg, AgentCommand, AgentRunArgs, AgentShowArgs, AssetCommand, Cli, Command,
     CommentCommand, EpicCommand, FieldSel, InitArgs, LabelCommand, ListFilterArgs, ListFormat,
-    MigrateStoreArgs, ResourceIdArg, ShowArgs, ShowFormat, TicketCommand, WorkflowCommand,
+    MigrateStoreArgs, ResourceIdArg, ResourceListFormat, ShowArgs, ShowFormat, TicketCommand,
+    WorkflowCommand,
 };
 use crate::content_input;
 
@@ -1141,6 +1142,12 @@ fn is_plain(format: &ListFormat) -> bool {
     !format.json && !format.ndjson && !format.raw
 }
 
+/// Resource lists share the output-mode flags with hierarchy lists but not
+/// their row shape, so their help and parsing type stay separate.
+fn is_plain_resource(format: &ResourceListFormat) -> bool {
+    !format.json && !format.ndjson && !format.raw
+}
+
 /// Validate and normalise the label/state filter flags into the core's
 /// structured-filter value, surfacing usage errors (conflicts, unknown states)
 /// before any store access.
@@ -1432,7 +1439,7 @@ fn workflow_roots(store: &Store) -> Result<resource::Roots> {
 fn list_resources<T, O: Write>(
     effective: &[resource::Effective<T>],
     fields: &FieldSel,
-    format: &ListFormat,
+    format: &ResourceListFormat,
     color: Color,
     out: &mut O,
 ) -> Result<()> {
@@ -1442,7 +1449,7 @@ fn list_resources<T, O: Write>(
     }
     let rows: Vec<render::ListResource> =
         effective.iter().map(render::ListResource::from).collect();
-    let text = if !selected.is_empty() && (format.raw || is_plain(format)) {
+    let text = if !selected.is_empty() && (format.raw || is_plain_resource(format)) {
         render::list_resources_fields_raw(&rows, &selected)
     } else if format.json {
         render::list_resources_json(&rows)

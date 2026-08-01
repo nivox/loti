@@ -13,14 +13,17 @@ document assumes that model.
 ## 1. CLI command surface & grammar
 
 - **Grammar: noun-verb.** Nouns: `epic`, `ticket` (a subticket is
-  `ticket create <epic-id> --parent <ref>`), plus top-level `init`, `skill`,
-  `tui`, `migrate-store`. Collections nest a third level (`ticket comment add`).
+  `ticket create <epic-id> --parent <ref>`), `agent`, and `workflow`, plus
+  top-level `init`, `skill`, `tui`, `migrate-store`. Collections nest a third
+  level (`ticket comment add`).
 - **Operations grouped by nature:** `edit` = plain scalar fields
   (`name`/`summary`/`body`/`parent`); `status` = the state machine (**set-only**;
   read via `show`); `claim` = the node-only single-holder claim
   (`take`/`release`; **set-only**, read via `show`); `label`/`comment`/`asset` =
   collections (`add`/`remove`|`delete`/`list`, plus asset `update`/`show`);
-  `show` = the **sole projectable reader** of nodes/epics.
+  `show` = the **sole projectable reader** of nodes/epics. `agent` and
+  `workflow` expose effective configured resources; `agent run` is an explicit
+  foreground launch rather than a tracker mutation.
 - **Create never overwrites; modify targets what exists.** Every creator refuses
   a duplicate (`epic create` an existing id; `ticket create`/`comment add` cannot
   collide — their keys are machine-allocated, never-reused numbers/ids); every
@@ -53,7 +56,7 @@ document assumes that model.
   to the wrong node.
 
 ```
-loti [--root <path>] <init|epic|ticket|skill|tui|migrate-store> ...
+loti [--root <path>] <init|epic|ticket|agent|workflow|skill|tui|migrate-store> ...
 
 loti init [<dir>]        # default container: .loti/ here (no pointer). --root or
                          # the positional <dir> (equivalent, mutually exclusive)
@@ -103,6 +106,13 @@ loti <e|t> asset show   <ref> <name>                                 # data → 
 loti <e|t> asset delete <ref> <name>                                 # hard
 loti <e|t> asset list   <ref>
 
+# Effective agent profiles and workflows
+loti agent list [--field <f> | --fields <f,…>] [--json|--ndjson|--raw]
+loti agent show <id> [--field <f> | --fields <f,…>] [--markdown|--json|--raw]
+loti agent run <epic-id>|<epic-id>/<n> --agent <id> --workflow <id>
+loti workflow list [--field <f> | --fields <f,…>] [--json|--ndjson|--raw]
+loti workflow show <id>  # Markdown → stdout, verbatim
+
 loti skill              # prints the static SKILL.md (see The `skill` subcommand & help)
 loti tui                # full-screen browser for epics and tickets; requires an
                         #   interactive terminal (see docs/tui.md for the keys)
@@ -117,9 +127,12 @@ loti tui                # full-screen browser for epics and tickets; requires an
 
 ## 2. Read / output formats
 
-- **`--json` is the source of truth** on every read command; the human form is the
-  default (one extra flag for machine output).
-- **`show`** has three modes: **`--markdown` (default)**, `--json`, `--raw`.
+- **`--json` is the source of truth** on every formatted read command that
+  offers it; the human form is the default (one extra flag for machine output).
+  `workflow show` is deliberately different: it writes the selected workflow
+  source verbatim and has no formatting flags.
+- **Epic and ticket `show`** have three modes: **`--markdown` (default)**,
+  `--json`, `--raw`.
   - **Markdown** (viewer-friendly) emits *everything* in order: metadata table →
     name (H1) → summary (blockquote) → direct-children table → assets table →
     body (verbatim) → comments.
@@ -128,8 +141,8 @@ loti tui                # full-screen browser for epics and tickets; requires an
   - **`--raw`** operates on **leaves**, one value per line, **strict-unambiguous**;
     any ambiguous multi-field selection is a **hard error** pointing at `--json`
     (no `--sep`).
-- **`list`** has three modes: **default plain text** (git-log-like, management-
-  oriented — indented depth-first tree with a trailing `[blocked-by: …]` tag
+- **Epic and ticket `list`** have three modes: **default plain text**
+  (git-log-like, management-oriented — indented depth-first tree with a trailing `[blocked-by: …]` tag
   listing a node's dependency refs (shown in any state), closed
   by a **per-status progress footer**: the total plus one entry per non-empty
   status in lifecycle order, over the nodes actually listed, tagged when a filter
@@ -138,7 +151,7 @@ loti tui                # full-screen browser for epics and tickets; requires an
   stream one object per line), and `--raw` (flat, tab-separated). **No
   `--markdown`** — `list` never *presents*.
 - **`--fields`** takes **dotted leaf paths** (e.g. `comments.author`), in all
-  three modes. `list` is restricted to **summary/listable fields**
+  three modes. Epic and ticket `list` are restricted to **summary/listable fields**
   (`ref|number|name|status|parent|labels|blocked-by`; epics
   `id|name|status|labels|nodes`+counts); requesting heavy/structured fields
   (`body`/`comments`/`assets`/`subtickets`) on `list` is a **hard error** — those
@@ -200,7 +213,68 @@ loti tui                # full-screen browser for epics and tickets; requires an
 
 ---
 
-## 4. The `skill` subcommand & help
+## 4. Agent profiles, workflows & foreground launch
+
+- **Effective resources.** `agent` reads harness profiles and `workflow` reads
+  opaque Markdown instructions. A project MAY configure repository-local roots
+  in the nearest `.loti.conf` found by walking upward from the store:
+  `agent-root` for profiles and `workflow-root` for workflows. Each configured
+  root is absolute or relative to that config file and MUST resolve to an
+  existing directory; an absent key supplies no local root, while a broken
+  configured root is an error. The user-global roots are
+  `$XDG_CONFIG_HOME/loti/agents` and `$XDG_CONFIG_HOME/loti/workflows` (or the
+  normal XDG config-home equivalent). Only direct `.toml` profile files and
+  direct `.md` workflow files are candidates.
+- **IDs and precedence.** An operator-supplied resource ID MUST be non-empty
+  ASCII letters, digits, `-`, or `_`; IDs are case-sensitive. A local candidate
+  with the same filename stem shadows the global candidate before either is
+  validated, so a bad local override is reported rather than silently falling
+  back to global. Effective rosters sort IDs in bytewise lexical order.
+- **Resource lists.** `agent list` and `workflow list` list every effective
+  resource, including invalid ones. Each row carries exactly `id`, `origin`
+  (`local` or `global`), and diagnostics; there is no separate validity flag.
+  Plain output is one resource per line with its origin and diagnostic tag;
+  `--json` is a flat array of those rows; `--ndjson` writes one row per line;
+  and `--raw` writes tab-separated `id`, `origin`, and diagnostics. Their only
+  listable fields are `id`, `origin`, and `diagnostics`.
+- **Profile show.** `agent show <id>` resolves the selected usable effective
+  profile. Its default is viewer-friendly Markdown; `--json` is the canonical
+  parsed profile (`id`, `origin`, `command`, `args`, `cwd`, `env`, and
+  `diagnostics`), and `--raw` provides strict-unambiguous leaf projections.
+  An invalid selected profile fails with its diagnostic; an absent selected ID
+  fails as not found.
+- **Workflow show.** `workflow show <id>` resolves the selected usable
+  effective workflow and writes its valid UTF-8 Markdown source to stdout
+  exactly as loaded: no wrapper, formatting mode, normalization, or trailing
+  bytes are added. An invalid selected workflow or an absent ID fails.
+- **Cooperative session visibility.** Presence of either
+  `LOTI_AGENT_SESSION` or `LOTI_AGENT_WORKFLOW` (including an empty value)
+  makes the operator-facing `agent` namespace unavailable. A
+  `LOTI_AGENT_WORKFLOW` marker additionally narrows `workflow list` and
+  `workflow show` to that exact ID; a non-selected workflow has the ordinary
+  not-found behaviour. `LOTI_AGENT_SESSION` alone does not narrow workflow
+  access. These markers are cooperative guidance, not access control: a child
+  process can alter its own environment.
+- **Explicit foreground launch.** `loti agent run <target> --agent <id>
+  --workflow <id>` requires both selections; it has no profile or workflow
+  default. The target is an existing epic ID or ticket reference. The command
+  first refuses a caller already in a cooperative agent session, then requires
+  stdin, stdout, and stderr all to be terminals before it opens the store.
+  It then resolves the target and both selected effective resources and
+  validates the prepared launch plan. Refusal at any preflight step hands off
+  no process and makes no tracker mutation.
+- **Direct foreground handoff.** On Unix, a successful `agent run` replaces
+  the `loti` process with the prepared profile command directly: no shell and
+  no wrapper child. The replacement retains the terminal streams and its exit
+  status is the command's exit status. The prepared argv, working directory,
+  and environment are passed to that process, including the cooperative session
+  markers and the bootstrap instruction required by the selected profile. On
+  non-Unix platforms the command refuses rather than emulating those process
+  replacement semantics.
+
+---
+
+## 5. The `skill` subcommand & help
 
 - **`loti skill` prints a fully static, hand-authored SKILL.md** verbatim — no
   generation, no template markers, no splicing.
@@ -231,7 +305,7 @@ loti tui                # full-screen browser for epics and tickets; requires an
 
 ---
 
-## 5. The `tui` subcommand
+## 6. The `tui` subcommand
 
 - **`loti tui` is a full-screen browser** for the store's epics and tickets: a
   navigation pane over the epic/ticket hierarchy beside a preview pane, with a

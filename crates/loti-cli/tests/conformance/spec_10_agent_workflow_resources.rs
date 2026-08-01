@@ -1,5 +1,5 @@
-//! Conformance: effective agent profiles & workflows (`agent`/`workflow`
-//! list/show).
+//! Conformance: effective agent profiles, workflows, and foreground launch
+//! (`agent`/`workflow` list/show plus `agent run`).
 //!
 //! The normative rules exercised here:
 //!   * local (config-relative `agent-root`/`workflow-root`) shadows global
@@ -17,7 +17,14 @@
 //!     exactly as loaded — no wrapper, no trailing bytes added;
 //!   * an unknown id and an invalid id both fail, with distinct diagnostics;
 //!   * a configured local root that does not resolve is a hard error, not a
-//!     silently empty local catalog.
+//!     silently empty local catalog;
+//!   * `agent run` requires an explicit profile and workflow before store
+//!     lookup, accepts either an epic or ticket target, and refuses a
+//!     cooperative session, non-terminal streams, invalid selections, or an
+//!     invalid launch plan without mutating the tracker;
+//!   * on Unix a successful launch replaces the CLI with the prepared direct
+//!     child, preserving its terminal streams, planned argv/cwd/environment,
+//!     and exit status.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -27,7 +34,7 @@ use std::process::{Command, Output};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use super::harness::Store;
+use super::harness::{run_bare, Store};
 
 /// Write a project config at the store root naming both resource roots
 /// relative to it, and create the two local directories. The config sits
@@ -124,6 +131,54 @@ fn row<'a>(list: &'a [serde_json::Value], id: &str) -> &'a serde_json::Value {
     list.iter()
         .find(|r| r["id"] == id)
         .unwrap_or_else(|| panic!("row {id} missing from {list:?}"))
+}
+
+// ---------------------------------------------------------------------------
+// generated help: agent/workflow grammar and resource-list row shape
+// ---------------------------------------------------------------------------
+
+#[test]
+fn generated_help_names_agent_workflow_groups_and_resource_list_rows() {
+    let root = run_bare(&["--help"]);
+    assert!(
+        root.status.success(),
+        "root help failed: {}",
+        String::from_utf8_lossy(&root.stderr)
+    );
+    let root = String::from_utf8_lossy(&root.stdout);
+    assert!(
+        root.contains("loti <epic|ticket|agent|workflow> <verb> ..."),
+        "root grammar omits resource groups:\n{root}"
+    );
+    assert!(
+        root.contains("`agent` manages effective agent profiles and foreground launches"),
+        "root description does not identify the agent group:\n{root}"
+    );
+    assert!(
+        root.contains("`workflow` manages effective workflow instructions"),
+        "root description does not identify the workflow group:\n{root}"
+    );
+
+    for args in [
+        &["agent", "list", "--help"][..],
+        &["workflow", "list", "--help"][..],
+    ] {
+        let output = run_bare(args);
+        assert!(
+            output.status.success(),
+            "{args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let help = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            help.contains("Flat JSON array of resource rows: `id`, `origin`, and `diagnostics`"),
+            "{args:?} must describe its own row shape:\n{help}"
+        );
+        assert!(
+            !help.contains("parent"),
+            "{args:?} must not claim resource rows carry parent pointers:\n{help}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
