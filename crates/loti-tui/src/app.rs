@@ -5,6 +5,7 @@
 //! machine testable without a terminal, and means a future write path is an
 //! extra arm in [`App::apply`] rather than a change to the event loop.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -132,6 +133,12 @@ const EPIC_ID_FIELD: &str = "epic id";
 /// See [`EPIC_ID_FIELD`]. The picker is unavailable before a surface opens, so
 /// this report preserves the browser rather than presenting an empty control.
 const AGENT_PICKER_TITLE: &str = " agent picker unavailable ";
+/// See [`AGENT_PICKER_TITLE`]. A selected launch can later be refused after its
+/// resources are re-resolved, while its picker remains open for correction.
+const AGENT_LAUNCH_REFUSED_TITLE: &str = " agent launch was refused ";
+/// See [`AGENT_PICKER_TITLE`]. A child that could not start or exited unsuccessfully
+/// is reported only after the browser owns its terminal again.
+const AGENT_LAUNCH_FAILED_TITLE: &str = " agent launch failed ";
 /// See [`EPIC_ID_FIELD`]. The second field names the configured harness profile
 /// rather than an operator identity.
 const AGENT_FIELD: &str = "agent";
@@ -1930,6 +1937,59 @@ impl App {
         self.launch_request.take()
     }
 
+    /// Re-resolve a selected launch and render its shared core plan before the
+    /// terminal is released. The environment is an explicit snapshot so preparing
+    /// is deterministic at this boundary and never reads process state itself.
+    pub fn prepare_agent_launch(
+        &self,
+        request: &LaunchRequest,
+        environment: BTreeMap<String, String>,
+    ) -> Result<launch::LaunchPlan> {
+        let caller = launch::CallerContext {
+            project_root: self.store.root().to_path_buf(),
+            current_directory: self.working_directory.clone(),
+            env: environment,
+        };
+        data::prepare_agent_launch(
+            &self.working_directory,
+            &request.target,
+            &request.workflow,
+            &request.profile,
+            &caller,
+        )
+    }
+
+    /// Keep the picker open when preparation refused its selected values.
+    pub fn agent_launch_refused(&mut self, message: String) {
+        self.modal = Some(Modal::Dialog(Box::new(Dialog::report(
+            AGENT_LAUNCH_REFUSED_TITLE,
+            message,
+            Dismissal {
+                word: "back to the picker",
+                performs: None,
+            },
+        ))));
+    }
+
+    /// Close the accepted picker once preparation succeeded, before terminal
+    /// ownership passes to the child. Agent launch neither writes nor reloads.
+    pub fn agent_launch_prepared(&mut self) {
+        self.surface = None;
+        self.editing = None;
+    }
+
+    /// Report a child failure after terminal ownership has been reclaimed.
+    pub fn agent_launch_failed(&mut self, message: String) {
+        self.modal = Some(Modal::Dialog(Box::new(Dialog::report(
+            AGENT_LAUNCH_FAILED_TITLE,
+            message,
+            Dismissal {
+                word: "dismiss",
+                performs: None,
+            },
+        ))));
+    }
+
     /// Which set of bindings the keyboard is under.
     ///
     /// A dialog is a mode of its own, because a question must admit its own
@@ -3637,8 +3697,8 @@ mod tests {
         assert_eq!(request.target.reference(), fx.epic);
         assert_eq!(request.workflow.as_str(), "000-picker-workflow");
         assert_eq!(request.profile.as_str(), "000-picker-agent");
-        // There is no preparation or handoff in this slice: preserving the picker
-        // lets the next slice report a preparation refusal over the chosen values.
+        // Selection alone preserves the picker; the terminal-owning handoff later
+        // prepares it and either reports a refusal here or closes it for the child.
         assert!(app.surface().is_some());
         assert!(app.editing_target().is_some());
     }

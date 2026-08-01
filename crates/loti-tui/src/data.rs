@@ -456,6 +456,35 @@ pub fn open(root: Option<&std::path::Path>) -> Result<Store> {
     Ok(store)
 }
 
+/// The two effective-resource roots used by agent selection and preparation.
+///
+/// Both operations must resolve the same local-over-global catalog at their own
+/// boundary: a resource can change after it was displayed but before it is run.
+struct AgentRoots {
+    workflows: Roots,
+    profiles: Roots,
+}
+
+/// Resolve the resource roots from the browser's starting directory.
+fn agent_roots(start: &std::path::Path) -> Result<AgentRoots> {
+    // A project config is optional. When it is present, its resource roots are
+    // validated by core rather than treated as an empty local catalog.
+    let local = loti_core::discovery::find_project_config(start)
+        .map(|path| resource::local_roots(&path))
+        .transpose()?
+        .unwrap_or_default();
+    Ok(AgentRoots {
+        workflows: Roots {
+            local: local.workflows,
+            global: resource::global_workflow_root(),
+        },
+        profiles: Roots {
+            local: local.agents,
+            global: resource::global_agent_root(),
+        },
+    })
+}
+
 /// Discover the values an agent-picker surface needs from `start`, which is the
 /// directory the browser was opened from. Configuration and resource directories
 /// are read here — at the requested action — never while editing hints are drawn.
@@ -494,42 +523,57 @@ pub fn agent_picker(
         }
     };
 
-    // A project config is optional. When it is present, its resource roots are
-    // validated by core rather than treated as an empty local catalog.
-    let local = loti_core::discovery::find_project_config(start)
-        .map(|path| resource::local_roots(&path))
-        .transpose()?
-        .unwrap_or_default();
-    let workflows = resource::list_workflows(&Roots {
-        local: local.workflows,
-        global: resource::global_workflow_root(),
-    })?
-    .into_iter()
-    .filter(|effective| effective.is_valid())
-    .map(|effective| AgentChoice {
-        id: ResourceId::parse(&effective.id)
-            .expect("a valid effective resource always has a valid resource id"),
-        origin: effective.origin,
-    })
-    .collect();
-    let profiles = resource::list_profiles(&Roots {
-        local: local.agents,
-        global: resource::global_agent_root(),
-    })?
-    .into_iter()
-    .filter(|effective| effective.is_valid())
-    .map(|effective| AgentChoice {
-        id: ResourceId::parse(&effective.id)
-            .expect("a valid effective resource always has a valid resource id"),
-        origin: effective.origin,
-    })
-    .collect();
+    let roots = agent_roots(start)?;
+    let workflows = resource::list_workflows(&roots.workflows)?
+        .into_iter()
+        .filter(|effective| effective.is_valid())
+        .map(|effective| AgentChoice {
+            id: ResourceId::parse(&effective.id)
+                .expect("a valid effective resource always has a valid resource id"),
+            origin: effective.origin,
+        })
+        .collect();
+    let profiles = resource::list_profiles(&roots.profiles)?
+        .into_iter()
+        .filter(|effective| effective.is_valid())
+        .map(|effective| AgentChoice {
+            id: ResourceId::parse(&effective.id)
+                .expect("a valid effective resource always has a valid resource id"),
+            origin: effective.origin,
+        })
+        .collect();
 
     Ok(AgentPicker {
         target,
         workflows,
         profiles,
     })
+}
+
+/// Resolve the currently effective selections and prepare their direct launch
+/// without changing the tracker. The picker only carried ids, so resolving here
+/// detects a resource that disappeared or became invalid while it was open.
+pub fn prepare_agent_launch(
+    start: &std::path::Path,
+    target: &launch::Target,
+    workflow: &ResourceId,
+    profile: &ResourceId,
+    caller: &launch::CallerContext,
+) -> Result<launch::LaunchPlan> {
+    let roots = agent_roots(start)?;
+    let profile = resource::resolve_profile(&roots.profiles, profile.as_str())?
+        .ok_or_else(|| anyhow::anyhow!("agent profile '{profile}' does not exist"))?
+        .value
+        .ok_or_else(|| anyhow::anyhow!("agent profile '{profile}' is invalid"))?;
+    let resolved_workflow = resource::resolve_workflow(&roots.workflows, workflow.as_str())?
+        .ok_or_else(|| anyhow::anyhow!("workflow '{workflow}' does not exist"))?;
+    if resolved_workflow.value.is_none() {
+        anyhow::bail!("workflow '{workflow}' is invalid");
+    }
+
+    // The workflow body is intentionally opaque; successful resolution says its
+    // selected id remains usable, which is all shared preparation needs.
+    launch::prepare(target, &profile, workflow, caller).map_err(Into::into)
 }
 
 /// The rows of one level, in the order every other loti surface lists them:
@@ -2237,6 +2281,7 @@ fn asset_document(store: &Store, container: &Container, name: &str) -> Result<St
 pub(crate) mod fixture {
     use loti_core::meta::{self, Meta};
     use loti_core::ops::{self, NewEpic, NewNode, Target};
+    use loti_core::read;
     use loti_core::Actor;
 
     use super::*;
@@ -2345,6 +2390,66 @@ pub(crate) mod fixture {
                 subnode,
                 blocker,
             }
+        }
+
+        /// A byte-level view of every document and indexed asset in the store.
+        ///
+        /// The roster is rediscovered on each call, so the snapshot distinguishes a
+        /// write to an existing entity from one that creates a new entity. Asset
+        /// bytes travel beside their index because replacing bytes is a tracker
+        /// change even when an asset keeps its name and description.
+        pub(crate) fn tracker_state(&self) -> Vec<(String, Vec<u8>)> {
+            let ids: Vec<String> = read::list_epics(&self.store)
+                .expect("the fixture roster can be read")
+                .into_iter()
+                .map(|entry| match entry {
+                    read::RosterEntry::Readable(epic) => epic.id,
+                    read::RosterEntry::Unreadable { id, .. } => {
+                        panic!("fixture epic {id} became unreadable")
+                    }
+                })
+                .collect();
+            let mut state = Vec::new();
+
+            for id in ids {
+                let epic = ops::read_epic(&self.store, &id).expect("the fixture epic can be read");
+                state.push((
+                    format!("epic {id}"),
+                    epic.to_text()
+                        .expect("the fixture epic can be encoded")
+                        .into_bytes(),
+                ));
+                for asset in epic.frontmatter.assets {
+                    state.push((
+                        format!("epic {id} asset {}", asset.name),
+                        ops::read_asset(&self.store, &Target::Epic(id.clone()), &asset.name)
+                            .expect("the fixture epic asset can be read"),
+                    ));
+                }
+
+                for node in
+                    ops::load_epic_nodes(&self.store, &id).expect("the fixture nodes can be read")
+                {
+                    let number = node.frontmatter.number;
+                    let target = Target::Node(NodeRef::new(id.clone(), number));
+                    state.push((
+                        format!("node {id}/{number}"),
+                        node.to_text()
+                            .expect("the fixture node can be encoded")
+                            .into_bytes(),
+                    ));
+                    for asset in node.frontmatter.assets {
+                        state.push((
+                            format!("node {id}/{number} asset {}", asset.name),
+                            ops::read_asset(&self.store, &target, &asset.name)
+                                .expect("the fixture node asset can be read"),
+                        ));
+                    }
+                }
+            }
+
+            state.sort_by(|left, right| left.0.cmp(&right.0));
+            state
         }
 
         /// The epic as a selection, which is how a surface addresses it.

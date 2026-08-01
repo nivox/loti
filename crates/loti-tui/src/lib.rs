@@ -39,12 +39,13 @@ pub mod nav;
 pub mod theme;
 pub mod ui;
 
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::panic;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -139,31 +140,33 @@ enum Hold {
     MouseCapture(bool),
 }
 
-/// Everything let go of before an external editor runs: the alternate screen, raw
-/// mode **and mouse capture**, none of which an editor can work around.
-const RELEASED_FOR_THE_EDITOR: &[Hold] = &[
+/// Everything let go of before an external process runs: the alternate screen,
+/// raw mode **and mouse capture**, none of which an inherited-stdio child can
+/// work around.
+const RELEASED_FOR_EXTERNAL_PROCESS: &[Hold] = &[
     Hold::MouseCapture(false),
     Hold::AlternateScreen(false),
     Hold::RawMode(false),
 ];
 
-/// Everything taken back once the editor has exited, in the order the browser
-/// takes it at startup.
+/// Everything taken back once an external process has exited, in the order the
+/// browser takes it at startup.
 ///
-/// Invariant: exactly what [`RELEASED_FOR_THE_EDITOR`] gave up, so a round-trip
-/// cannot leave the browser running with less of the terminal than it began with.
-const RECLAIMED_AFTER_THE_EDITOR: &[Hold] = &[
+/// Invariant: exactly what [`RELEASED_FOR_EXTERNAL_PROCESS`] gave up, so a
+/// round-trip cannot leave the browser running with less of the terminal than it
+/// began with.
+const RECLAIMED_AFTER_EXTERNAL_PROCESS: &[Hold] = &[
     Hold::RawMode(true),
     Hold::AlternateScreen(true),
     Hold::MouseCapture(true),
 ];
 
-/// The terminal work an external-editor round-trip has done on its behalf.
+/// The terminal work an external-process handoff has done on its behalf.
 ///
-/// A seam rather than direct calls, so what the round-trip performs — and in which
+/// A seam rather than direct calls, so what the handoff performs — and in which
 /// order — can be read off and checked: the browser's implementation drives the
 /// real terminal, and a test's records what it was asked for.
-trait Handoff {
+trait TerminalHandoff {
     /// Let go of, or take back, one part of the terminal.
     fn hold(&mut self, step: Hold) -> Result<()>;
 
@@ -179,7 +182,7 @@ trait Handoff {
 /// can be gutted while a seam's own tests stay green.
 struct Screen<'t, B: Backend, W: Write>(&'t mut Terminal<B>, W);
 
-impl<B: Backend, W: Write> Handoff for Screen<'_, B, W> {
+impl<B: Backend, W: Write> TerminalHandoff for Screen<'_, B, W> {
     fn hold(&mut self, step: Hold) -> Result<()> {
         hold_step(step, &mut self.1)
     }
@@ -208,27 +211,109 @@ fn hold_step(step: Hold, out: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
-/// Give the terminal away, run `editor`, and take the terminal back.
+/// Give the terminal away, run one inherited-stdio process, and take it back.
 ///
-/// Invariant: every part named by [`RELEASED_FOR_THE_EDITOR`] is let go of before
-/// the editor runs, one step per part, and every part named by
-/// [`RECLAIMED_AFTER_THE_EDITOR`] is taken back afterwards **whatever the editor
-/// did** — which is why the editor's outcome is carried past the reclaim rather
+/// Invariant: every part named by [`RELEASED_FOR_EXTERNAL_PROCESS`] is let go of
+/// before the process runs, one step per part, and every part named by
+/// [`RECLAIMED_AFTER_EXTERNAL_PROCESS`] is taken back afterwards **whatever the
+/// process did** — which is why its outcome is carried past the reclaim rather
 /// than propagated at once: a failure that returned early would leave the browser
 /// drawing with raw mode off onto a screen it no longer owns.
-fn around_the_editor<T>(
-    handoff: &mut impl Handoff,
-    editor: impl FnOnce() -> Result<T>,
+fn around_external_process<T>(
+    handoff: &mut impl TerminalHandoff,
+    process: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    for step in RELEASED_FOR_THE_EDITOR {
+    for step in RELEASED_FOR_EXTERNAL_PROCESS {
         handoff.hold(*step)?;
     }
-    let outcome = editor();
-    for step in RECLAIMED_AFTER_THE_EDITOR {
+    let outcome = process();
+    for step in RECLAIMED_AFTER_EXTERNAL_PROCESS {
         handoff.hold(*step)?;
     }
     handoff.repaint()?;
     outcome
+}
+
+/// The normalized outcome of a prepared foreground child. A child status is kept
+/// as the operating system describes it, which also names a signal termination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChildOutcome {
+    ZeroExit,
+    NonZeroExit(String),
+    SpawnError(String),
+}
+
+/// The child-running half of the external-process seam. The production runner
+/// executes the prepared direct plan; a recorder can prove the exact plan passed
+/// across the terminal handoff without starting a real process.
+trait ChildRunner {
+    fn run(&mut self, plan: &loti_core::launch::LaunchPlan) -> ChildOutcome;
+}
+
+/// The production direct child runner. `status` inherits stdin, stdout and stderr
+/// explicitly: an interactive agent receives the terminal the browser released.
+struct DirectChild;
+
+impl ChildRunner for DirectChild {
+    fn run(&mut self, plan: &loti_core::launch::LaunchPlan) -> ChildOutcome {
+        match Command::new(&plan.program)
+            .args(&plan.args)
+            .current_dir(&plan.cwd)
+            .env_clear()
+            .envs(&plan.env)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+        {
+            Ok(status) if status.success() => ChildOutcome::ZeroExit,
+            Ok(status) => ChildOutcome::NonZeroExit(status.to_string()),
+            Err(error) => ChildOutcome::SpawnError(error.to_string()),
+        }
+    }
+}
+
+/// Run one validated agent plan through the shared terminal lifecycle.
+fn handoff_agent(
+    handoff: &mut impl TerminalHandoff,
+    runner: &mut impl ChildRunner,
+    plan: &loti_core::launch::LaunchPlan,
+) -> Result<ChildOutcome> {
+    around_external_process(handoff, || Ok(runner.run(plan)))
+}
+
+/// Prepare a queued selection before terminal release, then run it through the
+/// shared handoff. Preparation refusals leave the picker open and cause no
+/// terminal or child effect; all child outcomes are reported only after reclaim.
+fn launch_queued_agent(
+    app: &mut App,
+    environment: BTreeMap<String, String>,
+    handoff: &mut impl TerminalHandoff,
+    runner: &mut impl ChildRunner,
+) -> Result<bool> {
+    let Some(request) = app.take_launch_request() else {
+        return Ok(false);
+    };
+    let profile = request.profile.clone();
+    let plan = match app.prepare_agent_launch(&request, environment) {
+        Ok(plan) => plan,
+        Err(error) => {
+            app.agent_launch_refused(failure_and_causes(&error));
+            return Ok(true);
+        }
+    };
+
+    app.agent_launch_prepared();
+    match handoff_agent(handoff, runner, &plan)? {
+        ChildOutcome::ZeroExit => {}
+        ChildOutcome::NonZeroExit(status) => {
+            app.agent_launch_failed(format!("agent profile '{profile}' exited with {status}"))
+        }
+        ChildOutcome::SpawnError(error) => app.agent_launch_failed(format!(
+            "agent profile '{profile}' could not start: {error}"
+        )),
+    }
+    Ok(true)
 }
 
 /// Hand `text` to the reader's editor and bring back what they saved, or `None`
@@ -238,7 +323,7 @@ fn edit_externally(terminal: &mut Tui, text: &str) -> Result<Option<String>> {
     // Looked up before anything is given away: a setting that is not there is not
     // worth blanking the reader's screen for.
     let editor = editor_setting(env::var("VISUAL").ok(), env::var("EDITOR").ok())?;
-    around_the_editor(&mut Screen(terminal, io::stdout()), || {
+    around_external_process(&mut Screen(terminal, io::stdout()), || {
         run_editor(&editor, text)
     })
 }
@@ -461,6 +546,20 @@ fn event_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
             captured = true;
             app.request_redraw();
         }
+
+        // The loop alone owns terminal capability, so it is also the sole
+        // consumer of a selected launch. An absent request is a no-op.
+        if launch_queued_agent(
+            &mut app,
+            env::vars().collect(),
+            &mut Screen(terminal, io::stdout()),
+            &mut DirectChild,
+        )? {
+            // A successful plan always crossed the terminal handoff; reclaim resets
+            // mouse capture and clears the frame regardless of the child's outcome.
+            captured = true;
+            app.request_redraw();
+        }
     }
 }
 
@@ -495,29 +594,35 @@ mod tests {
     }
 
     #[test]
-    fn an_external_editor_is_given_the_whole_terminal_and_handed_it_all_back() {
-        // Mouse capture is the one a reader would blame on their editor rather than
-        // on the browser: an editor that inherits it reads the terminal's mouse
-        // reports as typed input. So it is named here beside the other two.
+    fn an_external_process_is_given_the_whole_terminal_and_handed_it_all_back() {
+        // Mouse capture is the one a reader would blame on their child rather than
+        // on the browser: an inherited-stdio process reads its reports as input.
         for released in [
             Hold::MouseCapture(false),
             Hold::AlternateScreen(false),
             Hold::RawMode(false),
         ] {
             assert!(
-                RELEASED_FOR_THE_EDITOR.contains(&released),
-                "{released:?} is still held while the editor runs"
+                RELEASED_FOR_EXTERNAL_PROCESS.contains(&released),
+                "{released:?} is still held while the child runs"
             );
         }
         // A release list that held something, or a reclaim list that released
         // something, would be a handover in name only.
-        assert!(RELEASED_FOR_THE_EDITOR.iter().copied().all(|h| !held(h)));
-        assert!(RECLAIMED_AFTER_THE_EDITOR.iter().copied().all(held));
+        assert!(RELEASED_FOR_EXTERNAL_PROCESS
+            .iter()
+            .copied()
+            .all(|h| !held(h)));
+        assert!(RECLAIMED_AFTER_EXTERNAL_PROCESS.iter().copied().all(held));
 
         // The same parts both ways: a round-trip cannot leave the browser running
         // with less of the terminal than it began with.
-        let mut released: Vec<&str> = RELEASED_FOR_THE_EDITOR.iter().copied().map(part).collect();
-        let mut reclaimed: Vec<&str> = RECLAIMED_AFTER_THE_EDITOR
+        let mut released: Vec<&str> = RELEASED_FOR_EXTERNAL_PROCESS
+            .iter()
+            .copied()
+            .map(part)
+            .collect();
+        let mut reclaimed: Vec<&str> = RECLAIMED_AFTER_EXTERNAL_PROCESS
             .iter()
             .copied()
             .map(part)
@@ -528,7 +633,7 @@ mod tests {
         // And no part named twice, so neither list can cover a missing part by
         // repeating another one.
         released.dedup();
-        assert_eq!(released.len(), RELEASED_FOR_THE_EDITOR.len());
+        assert_eq!(released.len(), RELEASED_FOR_EXTERNAL_PROCESS.len());
     }
 
     /// One thing a round-trip asked of the terminal, or of the editor.
@@ -536,6 +641,7 @@ mod tests {
     enum Asked {
         Hold(Hold),
         Editor,
+        Agent(loti_core::launch::LaunchPlan),
         Repaint,
     }
 
@@ -561,7 +667,7 @@ mod tests {
         }
     }
 
-    impl Handoff for Recorder {
+    impl TerminalHandoff for Recorder {
         fn hold(&mut self, step: Hold) -> Result<()> {
             self.note(Asked::Hold(step));
             Ok(())
@@ -573,9 +679,23 @@ mod tests {
         }
     }
 
-    /// Everything taken back after the editor, ending in the repaint.
+    /// A child boundary that records the validated payload it received instead of
+    /// starting a process. It is the same production handoff seam uses at runtime.
+    struct FakeChild {
+        recorder: Recorder,
+        outcome: ChildOutcome,
+    }
+
+    impl ChildRunner for FakeChild {
+        fn run(&mut self, plan: &loti_core::launch::LaunchPlan) -> ChildOutcome {
+            self.recorder.note(Asked::Agent(plan.clone()));
+            self.outcome.clone()
+        }
+    }
+
+    /// Everything taken back after a process, ending in the repaint.
     fn reclaiming() -> Vec<Asked> {
-        RECLAIMED_AFTER_THE_EDITOR
+        RECLAIMED_AFTER_EXTERNAL_PROCESS
             .iter()
             .copied()
             .map(Asked::Hold)
@@ -587,7 +707,7 @@ mod tests {
     fn the_editor_runs_with_none_of_the_terminal_held_and_every_part_comes_back() {
         let terminal = Recorder::default();
         let editor = terminal.clone();
-        let saved = around_the_editor(&mut terminal.clone(), || {
+        let saved = around_external_process(&mut terminal.clone(), || {
             editor.note(Asked::Editor);
             Ok("saved")
         })
@@ -599,14 +719,14 @@ mod tests {
         // inherited mouse capture is read as typed characters, and an editor drawing
         // inside the alternate screen with raw mode on is the corruption the
         // round-trip exists to avoid.
-        for step in RELEASED_FOR_THE_EDITOR {
+        for step in RELEASED_FOR_EXTERNAL_PROCESS {
             assert!(
                 terminal.at(&Asked::Hold(*step)) < ran,
                 "{step:?} was still held while the editor ran"
             );
         }
         // And nothing is taken back while the editor is still using it.
-        for step in RECLAIMED_AFTER_THE_EDITOR {
+        for step in RECLAIMED_AFTER_EXTERNAL_PROCESS {
             assert!(
                 terminal.at(&Asked::Hold(*step)) > ran,
                 "{step:?} was taken back before the editor was done with it"
@@ -620,7 +740,7 @@ mod tests {
 
         // One step per part, and no step twice: a part released twice would hide a
         // part never released at all.
-        let expected: Vec<Asked> = RELEASED_FOR_THE_EDITOR
+        let expected: Vec<Asked> = RELEASED_FOR_EXTERNAL_PROCESS
             .iter()
             .copied()
             .map(Asked::Hold)
@@ -634,7 +754,7 @@ mod tests {
     fn an_editor_that_could_not_run_still_gets_the_whole_terminal_handed_back() {
         let terminal = Recorder::default();
         let editor = terminal.clone();
-        let failure = around_the_editor(&mut terminal.clone(), || {
+        let failure = around_external_process(&mut terminal.clone(), || {
             editor.note(Asked::Editor);
             Err::<(), _>(anyhow!("no editor is set"))
         })
@@ -651,6 +771,244 @@ mod tests {
         let asked = terminal.asked();
         let ran = terminal.at(&Asked::Editor);
         assert_eq!(asked[ran + 1..], reclaiming()[..]);
+    }
+
+    /// A selected agent picker backed by a local, direct profile. The directory
+    /// stays alive because preparation resolves the resources again at acceptance.
+    fn queued_agent() -> (data::fixture::Fixture, tempfile::TempDir, App) {
+        let fixture = data::fixture::Fixture::build();
+        let resources = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(resources.path().join("workflows")).unwrap();
+        std::fs::create_dir_all(resources.path().join("agents")).unwrap();
+        std::fs::write(
+            resources.path().join(".loti.conf"),
+            "workflow-root = \"workflows\"\nagent-root = \"agents\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            resources.path().join("workflows").join("review.md"),
+            "# Review\n",
+        )
+        .unwrap();
+        std::fs::write(
+            resources.path().join("agents").join("agent.toml"),
+            "command = \"agent\"\nargs = [\"{{ loti_prompt }}\"]\n",
+        )
+        .unwrap();
+        let mut app = App::at_working_directory(
+            fixture.store.clone(),
+            Theme::with_color(false),
+            resources.path(),
+        )
+        .unwrap();
+        app.apply(Action::EnterEditing).unwrap();
+        app.apply(Action::RunAgent).unwrap();
+        app.apply(Action::Accept).unwrap();
+        (fixture, resources, app)
+    }
+
+    fn agent_events(plan: loti_core::launch::LaunchPlan) -> Vec<Asked> {
+        RELEASED_FOR_EXTERNAL_PROCESS
+            .iter()
+            .copied()
+            .map(Asked::Hold)
+            .chain([Asked::Agent(plan)])
+            .chain(reclaiming())
+            .collect()
+    }
+
+    fn drawn_text(app: &mut App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn launch_preparation_refuses_before_the_terminal_or_child_runs() {
+        let (fixture, resources, mut app) = queued_agent();
+        // The picker read this profile before it was selected. Re-resolving now
+        // catches the changed value and core rejects it before the screen is lost.
+        std::fs::write(
+            resources.path().join("agents").join("agent.toml"),
+            "command = \"\"\nargs = [\"{{ loti_prompt }}\"]\n",
+        )
+        .unwrap();
+        let before = fixture.tracker_state();
+        let recorder = Recorder::default();
+        let mut child = FakeChild {
+            recorder: recorder.clone(),
+            outcome: ChildOutcome::ZeroExit,
+        };
+
+        assert!(
+            launch_queued_agent(&mut app, BTreeMap::new(), &mut recorder.clone(), &mut child)
+                .unwrap()
+        );
+        assert!(recorder.asked().is_empty(), "{:#?}", recorder.asked());
+        assert!(app.surface().is_some(), "preparation closed the picker");
+        assert!(app.editing_target().is_some(), "preparation ended editing");
+        let Some(Modal::Dialog(dialog)) = app.modal() else {
+            panic!("the preparation refusal opened no dialog")
+        };
+        assert!(dialog
+            .message()
+            .contains("profile command must not be empty"));
+        assert!(drawn_text(&mut app).contains("profile command must not be empty"));
+        assert_eq!(
+            fixture.tracker_state(),
+            before,
+            "launch preparation changed tracker data"
+        );
+    }
+
+    #[test]
+    fn an_invalid_selected_workflow_is_refused_before_the_terminal_or_child_runs() {
+        let (fixture, resources, mut app) = queued_agent();
+        // A local resource keeps shadowing a global resource with the same id, so
+        // invalidating it proves acceptance re-resolves the picker selection.
+        std::fs::write(resources.path().join("workflows").join("review.md"), [0xff]).unwrap();
+        let before = fixture.tracker_state();
+        let recorder = Recorder::default();
+        let mut child = FakeChild {
+            recorder: recorder.clone(),
+            outcome: ChildOutcome::ZeroExit,
+        };
+
+        assert!(
+            launch_queued_agent(&mut app, BTreeMap::new(), &mut recorder.clone(), &mut child)
+                .unwrap()
+        );
+        assert!(recorder.asked().is_empty(), "{:#?}", recorder.asked());
+        assert!(app.surface().is_some(), "preparation closed the picker");
+        assert!(app.editing_target().is_some(), "preparation ended editing");
+        let Some(Modal::Dialog(dialog)) = app.modal() else {
+            panic!("the preparation refusal opened no dialog")
+        };
+        assert_eq!(dialog.message(), "workflow 'review' is invalid");
+        assert!(drawn_text(&mut app).contains("workflow 'review' is invalid"));
+        assert_eq!(
+            fixture.tracker_state(),
+            before,
+            "launch preparation changed tracker data"
+        );
+    }
+
+    #[test]
+    fn a_zero_exit_runs_the_prepared_payload_and_restores_the_browser_silently() {
+        let (fixture, _resources, mut app) = queued_agent();
+        let before = fixture.tracker_state();
+        let recorder = Recorder::default();
+        let mut child = FakeChild {
+            recorder: recorder.clone(),
+            outcome: ChildOutcome::ZeroExit,
+        };
+
+        launch_queued_agent(&mut app, BTreeMap::new(), &mut recorder.clone(), &mut child).unwrap();
+        let plan = recorder
+            .asked()
+            .into_iter()
+            .find_map(|asked| match asked {
+                Asked::Agent(plan) => Some(plan),
+                Asked::Hold(_) | Asked::Editor | Asked::Repaint => None,
+            })
+            .expect("the child was not run");
+        assert_eq!(plan.program, "agent");
+        assert_eq!(plan.cwd, fixture.store.root());
+        assert_eq!(
+            plan.env.get(loti_core::launch::SESSION_ENV_VAR),
+            Some(&fixture.epic)
+        );
+        assert_eq!(
+            plan.env.get(loti_core::launch::WORKFLOW_ENV_VAR),
+            Some(&"review".to_string())
+        );
+        assert!(
+            plan.args[0].contains("workflow \"review\""),
+            "{:?}",
+            plan.args
+        );
+        assert_eq!(recorder.asked(), agent_events(plan));
+        assert!(app.modal().is_none(), "a zero exit raised a report");
+        assert!(app.surface().is_none());
+        assert!(app.editing_target().is_none());
+        assert_eq!(
+            fixture.tracker_state(),
+            before,
+            "a successful agent exit changed tracker data"
+        );
+    }
+
+    #[test]
+    fn a_nonzero_agent_exit_is_reported_after_reclaiming_the_terminal() {
+        let (fixture, _resources, mut app) = queued_agent();
+        let before = fixture.tracker_state();
+        let recorder = Recorder::default();
+        let mut child = FakeChild {
+            recorder: recorder.clone(),
+            outcome: ChildOutcome::NonZeroExit("exit status: 7".to_string()),
+        };
+
+        launch_queued_agent(&mut app, BTreeMap::new(), &mut recorder.clone(), &mut child).unwrap();
+        let asked = recorder.asked();
+        assert!(matches!(asked.last(), Some(Asked::Repaint)), "{asked:?}");
+        let run = asked
+            .iter()
+            .position(|event| matches!(event, Asked::Agent(_)))
+            .unwrap();
+        let reclaim = asked
+            .iter()
+            .position(|event| *event == Asked::Hold(Hold::RawMode(true)))
+            .unwrap();
+        assert!(run < reclaim, "{asked:?}");
+        let Some(Modal::Dialog(dialog)) = app.modal() else {
+            panic!("a non-zero child raised no report")
+        };
+        assert_eq!(
+            dialog.message(),
+            "agent profile 'agent' exited with exit status: 7"
+        );
+        assert!(drawn_text(&mut app).contains("exit status: 7"));
+        assert_eq!(
+            fixture.tracker_state(),
+            before,
+            "a failed agent exit changed tracker data"
+        );
+    }
+
+    #[test]
+    fn a_spawn_failure_is_reported_after_reclaiming_the_terminal() {
+        let (fixture, _resources, mut app) = queued_agent();
+        let before = fixture.tracker_state();
+        let recorder = Recorder::default();
+        let mut child = FakeChild {
+            recorder: recorder.clone(),
+            outcome: ChildOutcome::SpawnError("missing executable".to_string()),
+        };
+
+        launch_queued_agent(&mut app, BTreeMap::new(), &mut recorder.clone(), &mut child).unwrap();
+        let asked = recorder.asked();
+        assert!(matches!(asked.last(), Some(Asked::Repaint)), "{asked:?}");
+        let Some(Modal::Dialog(dialog)) = app.modal() else {
+            panic!("a spawn failure raised no report")
+        };
+        assert_eq!(
+            dialog.message(),
+            "agent profile 'agent' could not start: missing executable"
+        );
+        let frame = drawn_text(&mut app);
+        assert!(frame.contains("missing"), "{frame:?}");
+        assert!(frame.contains("executable"), "{frame:?}");
+        assert_eq!(
+            fixture.tracker_state(),
+            before,
+            "a spawn failure changed tracker data"
+        );
     }
 
     #[test]
