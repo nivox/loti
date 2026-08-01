@@ -53,7 +53,9 @@ skill/help system — is specified in [`cli-spec.md`](cli-spec.md).
     non-blocked/non-closed node carries the respective reason).
 - **Claim (single-holder).** A node MAY carry a **claim**: a single **freeform
   identifier** (an email or a name) recording who holds it, plus a timestamp
-  `loti` maintains autonomously. It is **node-only** and **actor-agnostic** —
+  `loti` maintains autonomously. The identifier MUST be non-empty both when a
+  claim is written and when stored data is read; a blank holder is malformed.
+  It is **node-only** and **actor-agnostic** —
   the identifier is deliberately decoupled from the attribution actor (it is not
   `-u`/`-a`) — and **independent of status** (claiming never changes state and a
   state change never touches the claim). A node has **at most one** holder, so
@@ -107,7 +109,10 @@ skill/help system — is specified in [`cli-spec.md`](cli-spec.md).
   MUST use **probe-forward atomic exclusive-create** (`O_CREAT|O_EXCL`) of the
   complete node file, followed by a **best-effort** counter bump. Correctness
   comes from the exclusive create; the counter is a hint (stale-low self-heals by
-  probing forward). This pre-resolves the node-creation race.
+  probing forward). This pre-resolves the node-creation race. Epic creation MUST
+  likewise acquire the target's exclusive-create lock before deciding whether its
+  id is available, so concurrent attempts yield one creation and one duplicate
+  refusal rather than a successful creation being overwritten.
 - **Comment ids.** Per node, `max(existing)+1`. No stored counter — safe via
   soft-delete (comments are never hard-deleted) plus single-file
   read-modify-write; ids are stable and monotonic.
@@ -174,7 +179,25 @@ policy.
   Concurrent raw-editor writes during a live `loti` mutation are **last-write-
   wins** (stated, not prevented).
 - **Reads are lock-free.** Single-file reads are atomic old-or-new; multi-file
-  reads/aggregates are **not** a consistent global snapshot.
+  reads/aggregates are **not** a consistent global snapshot. A roster reader MAY
+  report readable epics alongside per-epic read failures; failure to enumerate
+  the roster itself remains a failure, not an empty or partial roster.
+- **Mutability query.** The core MUST expose a public check that answers whether
+  the store may be mutated, using the same format-version and migration rules as
+  a mutation but making no change. Its result is a snapshot, not a licence: a
+  later mutation still checks under its lock. A surface uses it to avoid offering
+  writes it already knows the store must refuse.
+- **Whole-field write precondition.** A replacement of an epic or node name,
+  summary, or body, or of a comment's text, MAY name the target entity's
+  `updated` timestamp as a precondition. The timestamp MUST be compared after
+  acquiring the target lock and reading the current file; a mismatch MUST return
+  a distinct conflict refusal and publish nothing. The guard is per entity, not
+  per field, so any intervening write to that entity makes it stale. Omitting the
+  precondition preserves last-write-wins behaviour. Appends, merges, and state
+  picks do not need this guard because they have their own concurrent outcome.
+- **Conditional publish.** A mutation that leaves its target byte-identical MUST
+  publish nothing and MUST NOT advance `updated` merely because the operation was
+  attempted.
 - **Tunables.** The algorithm + invariant are mandated
   (`interval` ≪ `threshold`; `threshold` > healthy hold time); values are
   implementation-defined (recommended: threshold **1s**, retry interval

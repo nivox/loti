@@ -1,112 +1,110 @@
-# `loti tui` — the full-screen browser
+# `loti tui` — browser guide
 
-`loti tui` browses a store the way a file manager browses a directory tree.
-Epics are the top level; entering one lists its tickets, entering a ticket lists
-its subtickets, to any depth. It is a **reading** surface: it never writes to the
-store, so it can be left open while agents work.
-
-It needs an interactive terminal. Piped or redirected, it refuses rather than
-emitting anything.
+`loti tui` is the interactive browser for a store. It lets a human read epics and
+tickets, make the supported edits, and launch a configured workflow without
+leaving the terminal.
 
 ```
 loti tui              # browse the store for the current directory
 loti tui --root DIR   # browse the store at DIR
 ```
 
-## The screen
+It requires an interactive terminal. For the full behaviour contract, see the
+[TUI specification](specs/tui-spec.md).
 
-```
- epics › my-feature › 3 Wire the store lock into ops
-┌ navigation ─────────────────┐┌ my-feature/8 ──────────────────────────────┐
-│◐ 3  (4)  Wire the store lo… ││  … the markdown `loti ticket show` prints  │
-│○ 7       Add --cascade to … ││                                            │
-│◐ 8  (2)  Rework the read l… ││                                            │
-└─────────────────────────────┘└────────────────────────────────────────────┘
- j/k move · Enter open · Esc back · … · ? keys · q quit
-```
+## Reading the screen
 
-- **The breadcrumb** (top line) names the path to the level on screen, outermost
-  first. On a narrow terminal it is shortened from the left, so the level you are
-  in always survives.
-- **The navigation pane** lists exactly one level: the children of the last
-  breadcrumb entry. Each row is a status glyph, the identifier (an epic id, or a
-  bare ticket number — the epic is already in the breadcrumb), the number of
-  direct children, a claim marker, and the name. The marker is a dim `@` on a
-  ticket someone holds a claim on; its column is there only while something on
-  the level is claimed, and who holds it is in the preview.
-- **The preview pane** shows the same document `loti epic show` /
-  `loti ticket show` print, rendered as markdown — including tables, code blocks
-  and mermaid diagrams in a ticket body. Its title is the reference it shows.
-- **The preview follows the cursor**, not the level: moving the highlight changes
-  what is previewed.
+The left pane is the navigation tree and the right pane is the selected item's
+preview. The breadcrumb at the top tells you where you are. A right-hand message
+shows either `EDITING` or a read-only migration warning.
 
-### Status glyphs
+Within an epic or ticket, the first rows are its collections:
 
-| Glyph | Node | Epic |
-|---|---|---|
-| `○` | to-do | open |
-| `◐` | in-progress | — |
-| `⊘` | blocked | — |
-| `✓` | done | completed |
-| `✗` | closed | closed |
+- `labels`
+- `comments`
+- `blockedBy` (tickets only)
+- `assets`
 
-Colours match what `loti ticket list` and `loti epic list` print. With `NO_COLOR`
-set, the glyphs alone carry the state.
+They remain visible even when empty, so you can enter them and add the first
+label, comment, or dependency. Work rows follow the divider. A number in
+parentheses is the direct subticket count; an absent count does not stop you
+from entering an epic or ticket. Collection members are leaves, and opening one
+that has nothing below reports that fact.
 
-### The child count
+A dim `@` before a work item's name means somebody holds its claim. Move to the
+row to see the holder in the preview. Comments, labels, dependencies, and assets
+have their own useful previews; labels retain the containing item's preview.
 
-The `(n)` beside a row is how many **direct children** it has — an epic's
-top-level tickets, or a ticket's subtickets. A row with no count is a leaf, and
-**entering a leaf does nothing**: the count is what tells you, before you press
-a key, whether there is a level below.
-
-## Keys
+## Browse
 
 | Key | Action |
 |---|---|
-| `j` / `k` / `↓` / `↑` | move the cursor (scroll the preview while zoomed) |
+| `j` / `k` / arrows | move between rows |
 | `g` / `G` | first / last row |
-| `Enter` / `l` / `→` | open the highlighted row; nothing if it is a leaf |
-| `Backspace` / `Esc` / `h` / `←` | leave the level, back to the row you entered from |
-| `Ctrl-D` / `Ctrl-U` | scroll the preview half a screen |
-| `PgDn` / `PgUp` / `Space` | scroll the preview a screen |
+| `Enter` / `l` / `→` | open the highlighted row |
+| `Backspace` / `Esc` / `h` / `←` | go back one level |
+| `Ctrl-D` / `Ctrl-U` | scroll preview half a screen |
+| `PgDn` / `PgUp` / `Space` | scroll preview a screen |
 | `Home` / `End` | preview start / end |
-| `<` / `>` | narrow / widen the navigation pane by 5% |
-| `=` | restore the default 30/70 split |
-| `z` | zoom: the preview fills the width |
-| `r` | re-read the store |
-| `?` | the key overlay |
+| `<` / `>` | change pane split |
+| `=` | restore the default split |
+| `z` | preview-only zoom |
+| `r` | reload from the store |
+| `?` / `F1` | key help |
 | `q` / `Ctrl-C` | quit |
 
-`Esc` leaves a *level*, never the browser — `q` is the only way out. Neither pane
-takes focus from the other: the cursor keys always drive the navigation pane and
-the paging keys always drive the preview, so there is no mode to switch.
+Zoom fills the terminal with the preview and lets the terminal handle ordinary
+mouse text selection. Press `z` again to restore the tree. Drag the divider to
+adjust the split; it lasts for this session only.
 
-## Resizing, the mouse, and copying text
+## Edit
 
-The divider can be dragged with the mouse, which requires the browser to capture
-mouse events — and while it does, the terminal's own click-drag text selection
-does not work.
+Press `e` on a row to enter editing mode. The selected row stays fixed while you
+choose one action and finish it. The footer lists only actions available for that
+row, including:
 
-**`z` is the way out of that.** Zooming gives the preview the whole width and
-releases the mouse, so you can select and copy from a ticket the usual way; `z`
-again restores the split and the divider. While zoomed there is no visible
-cursor, so `j`/`k` scroll the preview and entering or leaving a level is
-disabled.
+| Key | Action |
+|---|---|
+| `a` | add a ticket, subticket, label, dependency, or comment |
+| `d` | remove a label or dependency, or delete a comment or asset |
+| `n` / `S` / `b` | edit name / summary / body or comment text |
+| `s` | change open/closed state or ticket status |
+| `c` / `C` | take or release a claim |
+| `w` | choose a workflow and agent profile to run on an epic or ticket |
 
-The split is per-session: it is not saved between runs.
+`N` creates an epic from the top-level roster. Asset uploads and replacements
+remain CLI operations.
 
-## Freshness
+Use `Esc` to leave editing mode before opening an action. Once a form is open:
 
-The browser reads the store when you move, enter or leave a level — and **only
-then**. If an agent changes a ticket while you are looking at it, press `r` to
-re-read. A reload keeps each level's cursor on the same ticket even if siblings
-were added or removed around it, and if a level has disappeared entirely it drops
-you at the deepest one that still exists.
+- `Ctrl-S` saves.
+- `Tab` and `Shift-Tab` move between fields.
+- `Enter` adds a line in a body or comment; it does not save.
+- `Ctrl-C` acts like `Esc`.
+- `F1` opens help.
+- `Ctrl-G` opens the field in `$VISUAL`, or `$EDITOR` when `VISUAL` is unset.
 
-One read is not on that list: opening an editing buffer on text the store already
-holds re-reads that one entity at that moment, so you start from the current text
-rather than from a preview that may be minutes old. The save then applies only
-while the entity has not changed since that read; if it has, the browser asks
-whether to overwrite the change or go back to your text, and writes nothing until
-you answer.
+A body or comment edits in the preview pane. Short fields and multi-field forms
+open as centred dialogs. A save returns you to browsing and confirms what changed.
+If you cancel changed text, the browser asks first; destructive confirmations use
+`d`, never `Enter`.
+
+## Read-only stores and concurrent changes
+
+A store that needs migration is browseable but read-only. The banner says why,
+and write keys are unavailable. Reload with `r` after a migration completes.
+
+The browser does not block agents while it is open or while you type. Before it
+opens a whole-field editor, it refreshes that item. If someone changes the same
+item before you save, the browser keeps your text and lets you either overwrite
+deliberately or return to the editor. Reload whenever the preview looks stale.
+
+## Help and recovery
+
+The footer shows confirmations and short explanations for unavailable editing
+actions. Problems that need a decision appear in a dialog and preserve text where
+possible. Store errors are shown in the store's own words.
+
+Use the built-in `?` or `F1` key list for the exact keys available in the current
+context. The normative [TUI specification](specs/tui-spec.md) records the complete
+behaviour and edge cases.

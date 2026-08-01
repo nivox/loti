@@ -149,7 +149,8 @@ loti tui                # full-screen browser for epics and tickets; requires an
   narrowed them and marked done when all are terminal — plain text only),
   `--json` (**flat array** with `parent` pointers, never nested; `--ndjson` to
   stream one object per line), and `--raw` (flat, tab-separated). **No
-  `--markdown`** — `list` never *presents*.
+  `--markdown`** — `list` never *presents*. `epic list` is all-or-nothing: a
+  malformed epic refuses the command rather than emitting a partial roster.
 - **`--fields`** takes **dotted leaf paths** (e.g. `comments.author`), in all
   three modes. Epic and ticket `list` are restricted to **summary/listable fields**
   (`ref|number|name|status|parent|labels|blocked-by`; epics
@@ -319,5 +320,6 @@ loti tui                # full-screen browser for epics and tickets; requires an
 - **The preview shows a `show` document.** What the preview renders for an epic
   or a node is the markdown `show` produces for it, so the browser presents no
   document shape of its own.
-- **The key bindings are not normative** — they are documented in
-  [`../tui.md`](../tui.md) and listed by the browser's own help overlay.
+- **The end-user key guide** is [`../tui.md`](../tui.md), and the browser's own
+  help overlay lists the keys available in its current context. The normative
+  browser behaviour and bindings are specified in [tui-spec.md](tui-spec.md).
