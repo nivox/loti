@@ -1,0 +1,3 @@
+# OpenCode's interactive TUI receives its initial instruction through --prompt.
+command = "opencode"
+args = ["--prompt", "{{ loti_prompt }}"]

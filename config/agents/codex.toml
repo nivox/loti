@@ -1,0 +1,3 @@
+# Codex accepts an initial instruction as its interactive positional argument.
+command = "codex"
+args = ["{{ loti_prompt }}"]

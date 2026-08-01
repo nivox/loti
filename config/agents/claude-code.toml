@@ -1,0 +1,3 @@
+# Claude Code accepts an initial instruction as its interactive positional argument.
+command = "claude"
+args = ["{{ loti_prompt }}"]
