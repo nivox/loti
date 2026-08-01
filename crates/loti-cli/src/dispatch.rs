@@ -11,13 +11,20 @@
 //! read layer and renders it with `loti_core::render`; the structured filter
 //! families for `list` are a later layer.
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(unix)]
+use std::process::Command as ProcessCommand;
 
 use anyhow::{anyhow, bail, Context, Result};
 
 use loti_core::domain::NodeRef;
 use loti_core::filter::{self, FilterInput, StructuredFilters};
+use loti_core::launch::{self, CallerContext, LaunchPlan};
 use loti_core::matcher::{self, MatcherRegistry};
 use loti_core::ops::{
     self, CommentView, EpicEdits, NewEpic, NewNode, NodeEdits, NodeStatusChange, Target,
@@ -30,20 +37,75 @@ use loti_core::store::{self, Store};
 use loti_core::Actor;
 
 use crate::cli::{
-    ActorArg, AgentCommand, AgentShowArgs, AssetCommand, Cli, Command, CommentCommand, EpicCommand,
-    FieldSel, InitArgs, LabelCommand, ListFilterArgs, ListFormat, MigrateStoreArgs, ResourceIdArg,
-    ShowArgs, ShowFormat, TicketCommand, WorkflowCommand,
+    ActorArg, AgentCommand, AgentRunArgs, AgentShowArgs, AssetCommand, Cli, Command,
+    CommentCommand, EpicCommand, FieldSel, InitArgs, LabelCommand, ListFilterArgs, ListFormat,
+    MigrateStoreArgs, ResourceIdArg, ShowArgs, ShowFormat, TicketCommand, WorkflowCommand,
 };
 use crate::content_input;
 
-/// Run one parsed command. `stdin`/`stdin_is_tty` feed the content-input
-/// helper; `out`/`err` are the success and diagnostic sinks. Errors propagate
-/// to the caller, which maps them to a non-zero exit.
+/// The terminal capability observed at the outer runtime boundary. A launch
+/// needs all three streams to be terminals because it replaces this process
+/// and hands those same streams to the foreground child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalState {
+    pub stdin: bool,
+    pub stdout: bool,
+    pub stderr: bool,
+}
+
+impl TerminalState {
+    fn all_interactive(self) -> bool {
+        self.stdin && self.stdout && self.stderr
+    }
+}
+
+/// Process facts captured once before command dispatch. The launch plan must
+/// inherit one stable environment snapshot rather than observing variables as
+/// different preflight steps happen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeContext {
+    terminals: TerminalState,
+    environment: BTreeMap<String, String>,
+    current_directory: PathBuf,
+}
+
+impl RuntimeContext {
+    /// Capture the current process facts used by normal CLI dispatch.
+    pub fn capture(terminals: TerminalState) -> Result<Self> {
+        Ok(Self::from_parts(
+            terminals,
+            std::env::vars().collect(),
+            std::env::current_dir().context("determining the current directory")?,
+        ))
+    }
+
+    /// Construct dispatch facts already observed by another runtime boundary.
+    /// This keeps embedded callers and direct dispatch tests on the same path.
+    pub fn from_parts(
+        terminals: TerminalState,
+        environment: BTreeMap<String, String>,
+        current_directory: PathBuf,
+    ) -> Self {
+        Self {
+            terminals,
+            environment,
+            current_directory,
+        }
+    }
+
+    fn session_policy(&self) -> SessionPolicy {
+        SessionPolicy::from_env(&self.environment)
+    }
+}
+
+/// Run one parsed command. `stdin` feeds the content-input helper; `runtime`
+/// carries the process facts observed by the normal CLI boundary; `out`/`err`
+/// are the success and diagnostic sinks. Errors propagate to the caller, which
+/// maps them to a non-zero exit.
 pub fn run<R: Read, O: Write, E: Write>(
     cli: &Cli,
     stdin: &mut R,
-    stdin_is_tty: bool,
-    stdout_is_tty: bool,
+    runtime: &RuntimeContext,
     out: &mut O,
     err: &mut E,
 ) -> Result<()> {
@@ -64,8 +126,8 @@ pub fn run<R: Read, O: Write, E: Write>(
             cli,
             &epic.command,
             stdin,
-            stdin_is_tty,
-            stdout_is_tty,
+            runtime.terminals.stdin,
+            runtime.terminals.stdout,
             out,
             err,
         ),
@@ -73,24 +135,17 @@ pub fn run<R: Read, O: Write, E: Write>(
             cli,
             &ticket.command,
             stdin,
-            stdin_is_tty,
-            stdout_is_tty,
+            runtime.terminals.stdin,
+            runtime.terminals.stdout,
             out,
             err,
         ),
-        Command::Agent(agent) => run_agent(
-            cli,
-            &agent.command,
-            &session_policy_from_environment(),
-            stdout_is_tty,
-            out,
-            err,
-        ),
+        Command::Agent(agent) => run_agent(cli, &agent.command, runtime, out, err),
         Command::Workflow(workflow) => run_workflow(
             cli,
             &workflow.command,
-            &session_policy_from_environment(),
-            stdout_is_tty,
+            &runtime.session_policy(),
+            runtime.terminals.stdout,
             out,
             err,
         ),
@@ -1157,23 +1212,18 @@ fn parse_list_scope(scope: &str, shallow: bool) -> Result<ListScope> {
 // agent / workflow (the effective-resource read surface)
 // ---------------------------------------------------------------------------
 
-/// Capture the process environment once at the CLI boundary, then keep the
-/// cooperative visibility decision independent of environment access.
-fn session_policy_from_environment() -> SessionPolicy {
-    SessionPolicy::from_env(&std::env::vars().collect())
-}
-
 fn run_agent<O: Write, E: Write>(
     cli: &Cli,
     cmd: &AgentCommand,
-    session: &SessionPolicy,
-    stdout_is_tty: bool,
+    runtime: &RuntimeContext,
     out: &mut O,
     err: &mut E,
 ) -> Result<()> {
-    // A launched agent must not inspect operator-facing profiles or begin a
-    // nested agent session. This is cooperative visibility, not access control.
-    if !session.agent_namespace_available() {
+    // A launched agent must not inspect operator-facing profiles. Launch has
+    // its own core session refusal so it can preserve the shared preparation
+    // error and still run that guard before any resource lookup.
+    if !matches!(cmd, AgentCommand::Run(_)) && !runtime.session_policy().agent_namespace_available()
+    {
         bail!(
             "agent commands are unavailable in a cooperative agent session; \
              follow the selected workflow instead"
@@ -1181,6 +1231,7 @@ fn run_agent<O: Write, E: Write>(
     }
 
     match cmd {
+        AgentCommand::Run(a) => run_agent_launch(cli, a, runtime, err),
         AgentCommand::List(a) => {
             let store = open_store(cli, err)?;
             let effective = resource::list_profiles(&agent_roots(&store)?)?;
@@ -1188,7 +1239,7 @@ fn run_agent<O: Write, E: Write>(
                 &effective,
                 &a.fields,
                 &a.format,
-                color_for(stdout_is_tty),
+                color_for(runtime.terminals.stdout),
                 out,
             )
         }
@@ -1197,6 +1248,106 @@ fn run_agent<O: Write, E: Write>(
             show_agent(&store, a, out)
         }
     }
+}
+
+/// Resolve every launch input without changing the tracker, then replace this
+/// Unix process with the prepared direct child. The session check deliberately
+/// comes before store/resource access, matching the cooperative visibility
+/// boundary that keeps nested sessions out of the operator-facing namespace.
+fn run_agent_launch<E: Write>(
+    cli: &Cli,
+    args: &AgentRunArgs,
+    runtime: &RuntimeContext,
+    err: &mut E,
+) -> Result<()> {
+    if launch::session_active(&runtime.environment) {
+        return Err(launch::LaunchError::SessionActive.into());
+    }
+    if !runtime.terminals.all_interactive() {
+        bail!("agent launch requires stdin, stdout, and stderr to be terminals");
+    }
+
+    let store = open_store(cli, err)?;
+    let target = resolve_launch_target(&store, &args.target)?;
+    let profile = resolve_launch_profile(&store, &args.agent)?;
+    let workflow = resolve_launch_workflow(&store, &args.workflow)?;
+    let caller = CallerContext {
+        project_root: store.root().to_path_buf(),
+        current_directory: runtime.current_directory.clone(),
+        env: runtime.environment.clone(),
+    };
+    let plan = launch::prepare(&target, &profile, &workflow, &caller)?;
+    replace_with_launch(plan)
+}
+
+/// A slash makes the target a ticket-shaped reference. Anything else remains
+/// an epic id, so both accepted target forms use the store's read boundary to
+/// obtain the name needed by the shared bootstrap renderer.
+fn resolve_launch_target(store: &Store, raw: &str) -> Result<launch::Target> {
+    if raw.contains('/') {
+        let reference = NodeRef::parse(raw).context("parsing ticket target")?;
+        let node = ops::read_node(store, &reference)?;
+        Ok(launch::Target::Ticket {
+            reference,
+            name: node.frontmatter.name,
+        })
+    } else {
+        let epic = ops::read_epic(store, raw)?;
+        Ok(launch::Target::Epic {
+            id: raw.to_string(),
+            name: epic.frontmatter.name,
+        })
+    }
+}
+
+/// Resolve one effective profile and preserve the same missing-versus-invalid
+/// diagnostics offered by `agent show` before launch preparation renders it.
+fn resolve_launch_profile(store: &Store, id: &str) -> Result<resource::Profile> {
+    let effective = resource::resolve_profile(&agent_roots(store)?, id)?
+        .ok_or_else(|| anyhow!("agent profile '{id}' does not exist"))?;
+    effective.value.ok_or_else(|| {
+        anyhow!(
+            "agent profile '{id}' is invalid: {}",
+            join_diagnostics(&effective.diagnostics)
+        )
+    })
+}
+
+/// A workflow's content is intentionally opaque to launch preparation, but it
+/// must still resolve to a usable effective resource before it can scope a
+/// foreground session.
+fn resolve_launch_workflow(store: &Store, id: &str) -> Result<resource::ResourceId> {
+    let effective = resource::resolve_workflow(&workflow_roots(store)?, id)?
+        .ok_or_else(|| workflow_not_found(id))?;
+    if effective.value.is_none() {
+        bail!(
+            "workflow '{id}' is invalid: {}",
+            join_diagnostics(&effective.diagnostics)
+        );
+    }
+    Ok(resource::ResourceId::parse(id).expect("the CLI parser already validated the workflow id"))
+}
+
+/// Execute the validated plan directly. `exec` preserves the terminal streams
+/// and makes the child's exit status the CLI's exit status; only a failed exec
+/// returns to the normal error renderer.
+#[cfg(unix)]
+fn replace_with_launch(plan: LaunchPlan) -> Result<()> {
+    let error = ProcessCommand::new(&plan.program)
+        .args(&plan.args)
+        .current_dir(&plan.cwd)
+        .env_clear()
+        .envs(&plan.env)
+        .exec();
+    Err(error).with_context(|| format!("launching agent '{}'", plan.program))
+}
+
+/// Process replacement is the Unix foreground-launch contract. Other targets
+/// refuse before spawning rather than pretending a wrapped child preserves the
+/// same signal and exit semantics.
+#[cfg(not(unix))]
+fn replace_with_launch(_plan: LaunchPlan) -> Result<()> {
+    bail!("agent launch requires Unix process replacement")
 }
 
 fn run_workflow<O: Write, E: Write>(
@@ -1415,7 +1566,16 @@ mod tests {
         let mut input = Cursor::new(stdin.to_vec());
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let result = run(cli, &mut input, false, false, &mut out, &mut err);
+        let runtime = RuntimeContext::from_parts(
+            TerminalState {
+                stdin: false,
+                stdout: false,
+                stderr: false,
+            },
+            BTreeMap::new(),
+            std::env::current_dir().unwrap(),
+        );
+        let result = run(cli, &mut input, &runtime, &mut out, &mut err);
         (
             String::from_utf8(out).unwrap(),
             String::from_utf8(err).unwrap(),
@@ -1430,6 +1590,91 @@ mod tests {
         // Write metadata so the version gate sees a current store.
         loti_core::meta::write(&root, &loti_core::meta::Meta::current()).unwrap();
         (dir, root)
+    }
+
+    #[test]
+    fn launch_preflight_uses_the_runtime_terminal_state_before_store_access() {
+        let root = tempfile::tempdir().unwrap();
+        let cli = cli_with_root(
+            root.path(),
+            &[
+                "agent",
+                "run",
+                "epic",
+                "--agent",
+                "profile",
+                "--workflow",
+                "review",
+            ],
+        );
+
+        for terminals in [
+            TerminalState {
+                stdin: false,
+                stdout: true,
+                stderr: true,
+            },
+            TerminalState {
+                stdin: true,
+                stdout: false,
+                stderr: true,
+            },
+            TerminalState {
+                stdin: true,
+                stdout: true,
+                stderr: false,
+            },
+        ] {
+            let runtime =
+                RuntimeContext::from_parts(terminals, BTreeMap::new(), root.path().to_path_buf());
+            let mut input = Cursor::new(Vec::new());
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let failure = run(&cli, &mut input, &runtime, &mut out, &mut err).unwrap_err();
+            assert!(
+                failure
+                    .to_string()
+                    .contains("stdin, stdout, and stderr to be terminals"),
+                "terminal state {terminals:?}: {failure:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn launch_preflight_uses_the_runtime_environment_before_store_access() {
+        let root = tempfile::tempdir().unwrap();
+        let cli = cli_with_root(
+            root.path(),
+            &[
+                "agent",
+                "run",
+                "epic",
+                "--agent",
+                "profile",
+                "--workflow",
+                "review",
+            ],
+        );
+        let runtime = RuntimeContext::from_parts(
+            TerminalState {
+                stdin: true,
+                stdout: true,
+                stderr: true,
+            },
+            BTreeMap::from([(launch::SESSION_ENV_VAR.to_string(), "epic".to_string())]),
+            root.path().to_path_buf(),
+        );
+        let mut input = Cursor::new(Vec::new());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let failure = run(&cli, &mut input, &runtime, &mut out, &mut err).unwrap_err();
+        assert!(
+            matches!(
+                failure.downcast_ref::<launch::LaunchError>(),
+                Some(launch::LaunchError::SessionActive)
+            ),
+            "unexpected failure: {failure:#}"
+        );
     }
 
     #[test]

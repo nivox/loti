@@ -34,22 +34,28 @@ fn main() -> ExitCode {
 
     let cli = Cli::parse();
     let stdin = io::stdin();
-    let stdin_is_tty = stdin.is_terminal();
+    // Terminal capability is sampled once at the process boundary. Dispatch
+    // receives these facts as data, so launch preflight never has a hidden
+    // terminal probe or a test-only path.
+    let terminals = dispatch::TerminalState {
+        stdin: stdin.is_terminal(),
+        stdout: io::stdout().is_terminal(),
+        stderr: io::stderr().is_terminal(),
+    };
     // Colour is only ever emitted to an interactive terminal; piped/redirected
     // output stays plain. The AutoStream wrapper strips any stray escape codes
     // when the destination is not a terminal, as a second line of defence.
-    let stdout_is_tty = io::stdout().is_terminal();
+    let runtime = match dispatch::RuntimeContext::capture(terminals) {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "loti: {e:#}");
+            return ExitCode::FAILURE;
+        }
+    };
     let mut out = anstream::AutoStream::auto(io::stdout());
     let mut err = io::stderr();
 
-    match dispatch::run(
-        &cli,
-        &mut stdin.lock(),
-        stdin_is_tty,
-        stdout_is_tty,
-        &mut out,
-        &mut err,
-    ) {
+    match dispatch::run(&cli, &mut stdin.lock(), &runtime, &mut out, &mut err) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             // A failed operation prints a plain message to stderr and exits

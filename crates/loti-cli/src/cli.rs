@@ -63,8 +63,8 @@ pub enum Command {
     Ticket(TicketArgs),
 
     /// Effective agent harness profiles — configured local/global `.toml`
-    /// files, local shadowing global by id. This is the operator-facing read
-    /// surface only; launching an agent is a separate concern.
+    /// files, local shadowing global by id. Profiles can also launch one
+    /// foreground agent against an explicit epic or ticket target.
     Agent(AgentArgs),
 
     /// Effective agent workflows — configured local/global `.md` files, local
@@ -456,12 +456,32 @@ pub struct AgentArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum AgentCommand {
+    /// Launch a selected profile in the foreground for an epic or ticket.
+    /// All standard streams must be terminals; the prepared child replaces
+    /// this process directly.
+    Run(AgentRunArgs),
     /// List effective agent profiles: local/global, with origin and any
     /// diagnostics. An invalid profile is listed too, never dropped.
     List(ResourceListArgs),
     /// Show one effective agent profile's parsed shape (the sole
     /// projectable reader for profiles).
     Show(AgentShowArgs),
+}
+
+/// The explicit launch selection: a target plus one effective profile and
+/// workflow. Both resource IDs use the parser shared by their read commands,
+/// so an invalid selection is refused before store/resource discovery.
+#[derive(Debug, Args)]
+pub struct AgentRunArgs {
+    /// Epic id or ticket reference `<epic-id>/<n>`.
+    #[arg(value_name = "TARGET")]
+    pub target: String,
+    /// Agent profile id — required (inline).
+    #[arg(long, value_name = "ID", value_parser = parse_resource_id)]
+    pub agent: String,
+    /// Workflow id — required (inline).
+    #[arg(long, value_name = "ID", value_parser = parse_resource_id)]
+    pub workflow: String,
 }
 
 #[derive(Debug, Args)]

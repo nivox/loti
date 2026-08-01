@@ -19,7 +19,13 @@
 //!   * a configured local root that does not resolve is a hard error, not a
 //!     silently empty local catalog.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::process::{Command, Output};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use super::harness::Store;
 
@@ -75,6 +81,22 @@ fn write_profile(dir: &Path, id: &str, command: &str) {
         format!("command = \"{command}\"\nargs = [\"{{{{ loti_prompt }}}}\"]\n"),
     )
     .expect("write profile");
+}
+
+fn write_launch_profile(dir: &Path, id: &str, command: &Path, args: &str) {
+    std::fs::write(
+        dir.join(format!("{id}.toml")),
+        format!(
+            "command = {}\nargs = {args}\ncwd = \"{{{{ project_root }}}}\"\n\
+             [env]\nRENDERED = \"rendered {{{{ loti_ref_name }}}}\"\n",
+            toml_string(command.to_str().expect("UTF-8 fixture path")),
+        ),
+    )
+    .expect("write launch profile");
+}
+
+fn toml_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\""))
 }
 
 fn write_invalid_profile(dir: &Path, id: &str) {
@@ -610,4 +632,372 @@ fn a_malformed_id_argument_is_rejected_without_a_store_lookup() {
         err.contains("invalid value") || err.contains("ASCII"),
         "got: {err}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// foreground agent launch
+// ---------------------------------------------------------------------------
+
+#[test]
+fn agent_run_requires_both_resource_selections_before_store_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    for (args, missing) in [
+        (
+            ["agent", "run", "epic", "--agent", "profile"].as_slice(),
+            "--workflow",
+        ),
+        (
+            ["agent", "run", "epic", "--workflow", "review"].as_slice(),
+            "--agent",
+        ),
+    ] {
+        let out = assert_cmd::Command::cargo_bin("loti")
+            .unwrap()
+            .current_dir(dir.path())
+            .args(args)
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "arguments {args:?} unexpectedly passed"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(missing),
+            "missing selection {missing} was not diagnosed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[cfg(unix)]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+/// Run the shipping binary in a pseudo-terminal. The launch preflight requires
+/// real terminal streams, so this wrapper is the normal subprocess boundary,
+/// not a bypass of terminal detection.
+#[cfg(unix)]
+fn pty_run(s: &Store, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let loti = assert_cmd::cargo::cargo_bin("loti");
+    let mut words = vec![loti.to_string_lossy().into_owned(), "--root".to_string()];
+    words.push(s.root().display().to_string());
+    words.extend(args.iter().map(|arg| (*arg).to_string()));
+    let direct_command = words
+        .iter()
+        .map(|word| shell_quote(word))
+        .collect::<Vec<_>>()
+        .join(" ");
+    // The shell's PID becomes loti's PID. The fixture records it alongside its
+    // own, so equality proves loti replaced itself rather than wrapping a child.
+    let command = format!("export LOTI_TEST_EXPECTED_PID=$$; exec {direct_command}");
+    let mut script = Command::new("script");
+    script.args(["-qefc", &command, "/dev/null"]);
+    script.env("NO_COLOR", "1");
+    for (key, value) in env {
+        script.env(key, value);
+    }
+    script.output().expect("run loti in a pseudo-terminal")
+}
+
+#[cfg(unix)]
+fn output_text(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+#[cfg(unix)]
+fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn visit(root: &Path, path: &Path, snapshot: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in std::fs::read_dir(path).expect("read fixture directory") {
+            let entry = entry.expect("read fixture entry");
+            let path = entry.path();
+            if path.is_dir() {
+                visit(root, &path, snapshot);
+            } else {
+                snapshot.insert(
+                    path.strip_prefix(root)
+                        .expect("fixture-relative path")
+                        .to_path_buf(),
+                    std::fs::read(&path).expect("read fixture file"),
+                );
+            }
+        }
+    }
+
+    let mut snapshot = BTreeMap::new();
+    visit(root, root, &mut snapshot);
+    snapshot
+}
+
+#[cfg(unix)]
+fn launch_fixture(dir: &Path) -> PathBuf {
+    let path = dir.join("agent-fixture");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\n\
+printf '%s\\0' \"$#\" \"$PWD\" \"$@\" \"$INHERITED\" \"$RENDERED\" \\\n\"$LOTI_AGENT_SESSION\" \"$LOTI_AGENT_WORKFLOW\" > \"$LOTI_TEST_RECORD\"\n\
+for fd in 0 1 2; do\n\
+  if [ -t \"$fd\" ]; then printf '%s\\0' yes >> \"$LOTI_TEST_RECORD\"; else printf '%s\\0' no >> \"$LOTI_TEST_RECORD\"; fi\n\
+done\n\
+printf '%s\\0' \"$$\" \"$LOTI_TEST_EXPECTED_PID\" >> \"$LOTI_TEST_RECORD\"\n\
+exit \"${LOTI_TEST_EXIT:-0}\"\n",
+    )
+    .expect("write fixture executable");
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&path, permissions).expect("make fixture executable");
+    path
+}
+
+#[cfg(unix)]
+fn nul_fields(path: &Path) -> Vec<String> {
+    let mut fields = std::fs::read(path)
+        .expect("read fixture record")
+        .split(|byte| *byte == 0)
+        .map(|field| String::from_utf8(field.to_vec()).expect("UTF-8 fixture field"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        fields.pop().as_deref(),
+        Some(""),
+        "fixture record terminator"
+    );
+    fields
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_run_replaces_itself_with_the_direct_ticket_child_and_preserves_its_payload() {
+    let s = Store::new();
+    s.epic("epic");
+    let ticket = s.ticket("epic", "ticket target");
+    let (agents, workflows) = local_roots(&s);
+    let fixture_dir = tempfile::tempdir().unwrap();
+    let fixture = launch_fixture(fixture_dir.path());
+    write_launch_profile(
+        &agents,
+        "profile",
+        &fixture,
+        "[\"--fixed\", \"{{ loti_prompt }}\", \"{{ loti_ref }}\"]",
+    );
+    write_workflow(&workflows, "review", "follow this workflow");
+    let record = fixture_dir.path().join("record");
+
+    let output = pty_run(
+        &s,
+        &[
+            "agent",
+            "run",
+            &ticket,
+            "--agent",
+            "profile",
+            "--workflow",
+            "review",
+        ],
+        &[
+            ("INHERITED", "kept"),
+            ("LOTI_TEST_RECORD", record.to_str().unwrap()),
+            ("LOTI_TEST_EXIT", "23"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(23), "{}", output_text(&output));
+
+    let fields = nul_fields(&record);
+    assert_eq!(fields[0], "3", "fixture record: {fields:?}");
+    assert_eq!(fields[1], s.root().display().to_string());
+    assert_eq!(fields[2], "--fixed");
+    assert!(
+        fields[3].contains(&format!("ticket \"{ticket}\" (ticket target)")),
+        "bootstrap was not passed as one direct argument: {fields:?}"
+    );
+    assert_eq!(fields[4], ticket);
+    assert_eq!(fields[5], "kept");
+    assert_eq!(fields[6], "rendered ticket target");
+    assert_eq!(fields[7], "epic/1");
+    assert_eq!(fields[8], "review");
+    assert_eq!(&fields[9..12], ["yes", "yes", "yes"]);
+    assert_eq!(fields[12], fields[13], "loti did not replace itself");
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_run_resolves_an_epic_target_for_the_shared_bootstrap() {
+    let s = Store::new();
+    s.epic("epic");
+    let (agents, workflows) = local_roots(&s);
+    let fixture_dir = tempfile::tempdir().unwrap();
+    let fixture = launch_fixture(fixture_dir.path());
+    write_launch_profile(&agents, "profile", &fixture, "[\"{{ loti_prompt }}\"]");
+    write_workflow(&workflows, "review", "follow this workflow");
+    let record = fixture_dir.path().join("record");
+
+    let output = pty_run(
+        &s,
+        &[
+            "agent",
+            "run",
+            "epic",
+            "--agent",
+            "profile",
+            "--workflow",
+            "review",
+        ],
+        &[("LOTI_TEST_RECORD", record.to_str().unwrap())],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    let fields = nul_fields(&record);
+    assert!(
+        fields[2].contains("epic \"epic\" (epic)"),
+        "bootstrap did not identify the epic target: {fields:?}"
+    );
+    assert_eq!(fields[5], "epic");
+}
+
+#[cfg(unix)]
+#[test]
+fn every_agent_run_preflight_refusal_leaves_the_store_byte_for_byte_unchanged() {
+    let s = Store::new();
+    s.epic("epic");
+    let (agents, workflows) = local_roots(&s);
+    let fixture_dir = tempfile::tempdir().unwrap();
+    let fixture = launch_fixture(fixture_dir.path());
+    write_launch_profile(&agents, "profile", &fixture, "[\"{{ loti_prompt }}\"]");
+    write_launch_profile(&agents, "bad-plan", &fixture, "[\"--missing-prompt\"]");
+    write_invalid_profile(&agents, "invalid-profile");
+    write_workflow(&workflows, "review", "follow this workflow");
+    write_invalid_workflow(&workflows);
+
+    let before = snapshot_tree(s.root());
+    let terminal = s
+        .cmd(&[
+            "agent",
+            "run",
+            "epic",
+            "--agent",
+            "profile",
+            "--workflow",
+            "review",
+        ])
+        .output()
+        .unwrap();
+    assert!(!terminal.status.success());
+    assert!(String::from_utf8_lossy(&terminal.stderr).contains("stdin, stdout, and stderr"));
+    assert_eq!(
+        snapshot_tree(s.root()),
+        before,
+        "terminal refusal wrote to the store"
+    );
+
+    type Refusal<'a> = (&'a [&'a str], &'a [(&'a str, &'a str)], &'a str);
+    let refusals: &[Refusal<'_>] = &[
+        (
+            &[
+                "agent",
+                "run",
+                "epic",
+                "--agent",
+                "profile",
+                "--workflow",
+                "review",
+            ],
+            &[("LOTI_AGENT_SESSION", "epic")],
+            "cooperative agent session",
+        ),
+        (
+            &[
+                "agent",
+                "run",
+                "missing",
+                "--agent",
+                "profile",
+                "--workflow",
+                "review",
+            ],
+            &[],
+            "does not exist",
+        ),
+        (
+            &[
+                "agent",
+                "run",
+                "epic",
+                "--agent",
+                "missing",
+                "--workflow",
+                "review",
+            ],
+            &[],
+            "agent profile 'missing' does not exist",
+        ),
+        (
+            &[
+                "agent",
+                "run",
+                "epic",
+                "--agent",
+                "invalid-profile",
+                "--workflow",
+                "review",
+            ],
+            &[],
+            "invalid",
+        ),
+        (
+            &[
+                "agent",
+                "run",
+                "epic",
+                "--agent",
+                "profile",
+                "--workflow",
+                "missing",
+            ],
+            &[],
+            "workflow 'missing' does not exist",
+        ),
+        (
+            &[
+                "agent",
+                "run",
+                "epic",
+                "--agent",
+                "profile",
+                "--workflow",
+                "bad",
+            ],
+            &[],
+            "workflow 'bad' is invalid",
+        ),
+        (
+            &[
+                "agent",
+                "run",
+                "epic",
+                "--agent",
+                "bad-plan",
+                "--workflow",
+                "review",
+            ],
+            &[],
+            "loti_prompt",
+        ),
+    ];
+    for (args, env, expected) in refusals {
+        let output = pty_run(&s, args, env);
+        assert!(!output.status.success(), "{args:?} unexpectedly launched");
+        assert!(
+            output_text(&output).contains(expected),
+            "{args:?} did not report {expected:?}: {}",
+            output_text(&output)
+        );
+        assert_eq!(
+            snapshot_tree(s.root()),
+            before,
+            "{args:?} changed the store during preflight"
+        );
+    }
 }
