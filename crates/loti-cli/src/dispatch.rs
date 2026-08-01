@@ -24,13 +24,14 @@ use loti_core::ops::{
 };
 use loti_core::read::{self, ListScope, MatchRequest};
 use loti_core::render::{self, Color, Projection};
+use loti_core::resource;
 use loti_core::store::{self, Store};
 use loti_core::Actor;
 
 use crate::cli::{
-    ActorArg, AssetCommand, Cli, Command, CommentCommand, EpicCommand, FieldSel, InitArgs,
-    LabelCommand, ListFilterArgs, ListFormat, MigrateStoreArgs, ShowArgs, ShowFormat,
-    TicketCommand,
+    ActorArg, AgentCommand, AgentShowArgs, AssetCommand, Cli, Command, CommentCommand, EpicCommand,
+    FieldSel, InitArgs, LabelCommand, ListFilterArgs, ListFormat, MigrateStoreArgs, ResourceIdArg,
+    ShowArgs, ShowFormat, TicketCommand, WorkflowCommand,
 };
 use crate::content_input;
 
@@ -76,6 +77,10 @@ pub fn run<R: Read, O: Write, E: Write>(
             out,
             err,
         ),
+        Command::Agent(agent) => run_agent(cli, &agent.command, stdout_is_tty, out, err),
+        Command::Workflow(workflow) => {
+            run_workflow(cli, &workflow.command, stdout_is_tty, out, err)
+        }
     }
 }
 
@@ -902,18 +907,32 @@ fn render_show(
     children: &[render::ChildRow],
     comments: &[render::CommentLine],
 ) -> Result<String> {
+    render_show_with(value, format, fields, || {
+        render::show_markdown(value, children, comments)
+    })
+}
+
+/// The one decision point behind every `show`-family command's mode dispatch:
+/// JSON, then raw, then — with no projection — the caller's own whole-value
+/// markdown. A projection narrows the default to JSON of the selected leaves
+/// too, since markdown is a whole-entity view and a field selection is served
+/// as its canonical value rather than a partial document. `epic`/`ticket show`
+/// and `agent show` differ only in what their whole-value markdown looks like,
+/// which is why that alone is passed in rather than duplicated here.
+fn render_show_with(
+    value: &serde_json::Value,
+    format: &ShowFormat,
+    fields: &FieldSel,
+    markdown: impl FnOnce() -> String,
+) -> Result<String> {
     let projection = projection_of(fields);
     if format.json {
         Ok(render::show_json(value, &projection)?)
     } else if format.raw {
         Ok(render::show_raw(value, &projection)?)
     } else {
-        // Markdown is the default. A projection narrows markdown to JSON of the
-        // selected leaves — markdown is the whole-entity view, so a field
-        // selection is served as its canonical value rather than a partial
-        // document.
         match projection {
-            Projection::Whole => Ok(render::show_markdown(value, children, comments)),
+            Projection::Whole => Ok(markdown()),
             _ => Ok(render::show_json(value, &projection)?),
         }
     }
@@ -1119,6 +1138,182 @@ fn parse_list_scope(scope: &str, shallow: bool) -> Result<ListScope> {
             shallow,
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// agent / workflow (the effective-resource read surface)
+// ---------------------------------------------------------------------------
+
+fn run_agent<O: Write, E: Write>(
+    cli: &Cli,
+    cmd: &AgentCommand,
+    stdout_is_tty: bool,
+    out: &mut O,
+    err: &mut E,
+) -> Result<()> {
+    match cmd {
+        AgentCommand::List(a) => {
+            let store = open_store(cli, err)?;
+            let effective = resource::list_profiles(&agent_roots(&store)?)?;
+            list_resources(
+                &effective,
+                &a.fields,
+                &a.format,
+                color_for(stdout_is_tty),
+                out,
+            )
+        }
+        AgentCommand::Show(a) => {
+            let store = open_store(cli, err)?;
+            show_agent(&store, a, out)
+        }
+    }
+}
+
+fn run_workflow<O: Write, E: Write>(
+    cli: &Cli,
+    cmd: &WorkflowCommand,
+    stdout_is_tty: bool,
+    out: &mut O,
+    err: &mut E,
+) -> Result<()> {
+    match cmd {
+        WorkflowCommand::List(a) => {
+            let store = open_store(cli, err)?;
+            let effective = resource::list_workflows(&workflow_roots(&store)?)?;
+            list_resources(
+                &effective,
+                &a.fields,
+                &a.format,
+                color_for(stdout_is_tty),
+                out,
+            )
+        }
+        WorkflowCommand::Show(a) => {
+            let store = open_store(cli, err)?;
+            show_workflow(&store, a, out)
+        }
+    }
+}
+
+/// The project's local resource roots (`agent-root`/`workflow-root` from the
+/// nearest `.loti.conf` walking up from the store), or the defaults (no local
+/// root for either kind) when no project config is found at all. A config
+/// file that exists but is malformed, or names a root that does not resolve to
+/// an existing directory, is a hard error rather than a silently empty local
+/// catalog — core's own rule (see `resource::local_roots`), just invoked from
+/// here.
+fn local_resource_roots(store: &Store) -> Result<resource::LocalRoots> {
+    Ok(loti_core::discovery::find_project_config(store.root())
+        .map(|path| resource::local_roots(&path))
+        .transpose()?
+        .unwrap_or_default())
+}
+
+/// The effective roots `agent list`/`agent show` search: the project's
+/// configured local root (if any) shadowing the user-global XDG root.
+fn agent_roots(store: &Store) -> Result<resource::Roots> {
+    let local = local_resource_roots(store)?;
+    Ok(resource::Roots {
+        local: local.agents,
+        global: resource::global_agent_root(),
+    })
+}
+
+/// The effective roots `workflow list`/`workflow show` search: the project's
+/// configured local root (if any) shadowing the user-global XDG root.
+fn workflow_roots(store: &Store) -> Result<resource::Roots> {
+    let local = local_resource_roots(store)?;
+    Ok(resource::Roots {
+        local: local.workflows,
+        global: resource::global_workflow_root(),
+    })
+}
+
+/// Render `agent list` / `workflow list` in the chosen mode. Both share one
+/// row model (id/origin/diagnostics — see [`render::ListResource`]), so this
+/// one function serves either roster; only which roster the caller already
+/// resolved differs.
+fn list_resources<T, O: Write>(
+    effective: &[resource::Effective<T>],
+    fields: &FieldSel,
+    format: &ListFormat,
+    color: Color,
+    out: &mut O,
+) -> Result<()> {
+    let selected = list_field_paths(fields);
+    if !selected.is_empty() {
+        render::validate_list_fields(&selected, render::LISTABLE_RESOURCE_FIELDS)?;
+    }
+    let rows: Vec<render::ListResource> =
+        effective.iter().map(render::ListResource::from).collect();
+    let text = if !selected.is_empty() && (format.raw || is_plain(format)) {
+        render::list_resources_fields_raw(&rows, &selected)
+    } else if format.json {
+        render::list_resources_json(&rows)
+    } else if format.ndjson {
+        render::list_resources_ndjson(&rows)
+    } else if format.raw {
+        render::list_resources_raw(&rows)
+    } else {
+        render::list_resources_plain(&rows, color)
+    };
+    write!(out, "{text}")?;
+    Ok(())
+}
+
+/// Render `agent show <id>` in the requested mode. Reports the stored
+/// diagnostic for an invalid selected profile, and "does not exist" for an id
+/// absent from the roster entirely.
+fn show_agent<O: Write>(store: &Store, a: &AgentShowArgs, out: &mut O) -> Result<()> {
+    let effective = resource::resolve_profile(&agent_roots(store)?, &a.id)?
+        .ok_or_else(|| anyhow!("agent profile '{}' does not exist", a.id))?;
+    let profile = effective.value.as_ref().ok_or_else(|| {
+        anyhow!(
+            "agent profile '{}' is invalid: {}",
+            a.id,
+            join_diagnostics(&effective.diagnostics)
+        )
+    })?;
+    let value = render::profile_to_json(
+        &effective.id,
+        effective.origin,
+        profile,
+        &effective.diagnostics,
+    );
+    let text = render_show_with(&value, &a.format, &a.fields, || {
+        render::show_agent_markdown(&value)
+    })?;
+    writeln!(out, "{text}")?;
+    Ok(())
+}
+
+/// Write `workflow show <id>`'s selected Markdown to stdout exactly as loaded:
+/// no wrapper, no formatting mode, no trailing bytes added. Reports the stored
+/// diagnostic for an invalid selected workflow, and "does not exist" for an id
+/// absent from the roster entirely.
+fn show_workflow<O: Write>(store: &Store, a: &ResourceIdArg, out: &mut O) -> Result<()> {
+    let effective = resource::resolve_workflow(&workflow_roots(store)?, &a.id)?
+        .ok_or_else(|| anyhow!("workflow '{}' does not exist", a.id))?;
+    let text = effective.value.ok_or_else(|| {
+        anyhow!(
+            "workflow '{}' is invalid: {}",
+            a.id,
+            join_diagnostics(&effective.diagnostics)
+        )
+    })?;
+    out.write_all(text.as_bytes())?;
+    Ok(())
+}
+
+/// Join a resource's diagnostics into one line for an error message; each
+/// already states its own severity via `Display`.
+fn join_diagnostics(diagnostics: &[resource::Diagnostic]) -> String {
+    diagnostics
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 // ---------------------------------------------------------------------------

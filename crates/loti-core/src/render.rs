@@ -20,6 +20,7 @@ use serde_json::{json, Map, Value};
 
 use crate::domain::{epic_status, NodeStatus};
 use crate::model::{Asset, Claim, Comment, EpicFile, NodeFile};
+use crate::resource::{Diagnostic, Origin, Profile};
 
 /// Why a read/projection could not be rendered as asked.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -1065,6 +1066,210 @@ pub fn list_nodes_fields_raw(nodes: &[ListNode], fields: &[String]) -> String {
 }
 
 // ===========================================================================
+// agent profiles & workflows (effective resources)
+// ===========================================================================
+
+/// Build the canonical JSON value for `agent show`: an effective profile's row
+/// metadata (`id`/`origin`/`diagnostics` — the same three fields `agent list`
+/// carries) plus its parsed shape. Only called for a *valid* effective
+/// profile — an invalid one carries no [`Profile`] to render and is reported
+/// through its diagnostic instead, never through this canonical form.
+pub fn profile_to_json(
+    id: &str,
+    origin: Origin,
+    profile: &Profile,
+    diagnostics: &[Diagnostic],
+) -> Value {
+    json!({
+        "id": id,
+        "origin": origin.wire_name(),
+        "command": profile.command,
+        "args": profile.args,
+        "cwd": profile.cwd,
+        "env": profile.env,
+        "diagnostics": diagnostics.iter().map(ToString::to_string).collect::<Vec<_>>(),
+    })
+}
+
+/// Render `agent show --markdown` (the default): the profile's canonical value
+/// as a small viewer-friendly document — a metadata table, its arguments in
+/// invocation order, its environment additions, and any tolerated
+/// diagnostics (empty exactly when the recognized schema had nothing to warn
+/// about).
+pub fn show_agent_markdown(value: &Value) -> String {
+    let mut s = String::new();
+
+    s.push_str("| field | value |\n|---|---|\n");
+    for key in ["id", "origin", "command", "cwd"] {
+        if let Some(v) = value.get(key) {
+            let _ = writeln!(s, "| {} | {} |", key, meta_cell(v));
+        }
+    }
+
+    let _ = write!(s, "\n## Args\n");
+    let args = value
+        .get("args")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if args.is_empty() {
+        s.push_str("\n_(none)_\n");
+    } else {
+        for (i, a) in args.iter().enumerate() {
+            let _ = writeln!(s, "{}. {}", i + 1, a.as_str().unwrap_or_default());
+        }
+    }
+
+    let _ = write!(s, "\n## Env\n");
+    match value.get("env").and_then(Value::as_object) {
+        Some(map) if !map.is_empty() => {
+            s.push_str("\n| key | value |\n|---|---|\n");
+            for (k, v) in map {
+                let _ = writeln!(s, "| {k} | {} |", meta_cell(v));
+            }
+        }
+        _ => s.push_str("\n_(none)_\n"),
+    }
+
+    let _ = write!(s, "\n## Diagnostics\n");
+    let diagnostics = value
+        .get("diagnostics")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if diagnostics.is_empty() {
+        s.push_str("\n_(none)_\n");
+    } else {
+        for d in &diagnostics {
+            let _ = writeln!(s, "- {}", d.as_str().unwrap_or_default());
+        }
+    }
+
+    s
+}
+
+/// A list roster entry for an effective agent profile or workflow (the
+/// `agent list` / `workflow list` roster). Carries resource metadata only —
+/// no profile configuration and no separate `valid` flag: a [`Diagnostic`]
+/// already states its own severity in its rendered text, so an empty list
+/// here is the only signal a resource needs to say it is fully valid.
+#[derive(Debug, Clone)]
+pub struct ListResource {
+    /// The resource id (the candidate file's raw stem).
+    pub id: String,
+    /// Where its definition came from.
+    pub origin: Origin,
+    /// Its diagnostics, already rendered via [`Diagnostic`]'s own `Display` —
+    /// so a tolerated warning and a blocking error can never disagree in one
+    /// place about which they are.
+    pub diagnostics: Vec<String>,
+}
+
+/// Every effective resource, of either kind, becomes a roster row the same
+/// way: this is the one place that mapping happens, so `agent list` and
+/// `workflow list` cannot drift on what a row carries.
+impl<T> From<&crate::resource::Effective<T>> for ListResource {
+    fn from(e: &crate::resource::Effective<T>) -> Self {
+        ListResource {
+            id: e.id.clone(),
+            origin: e.origin,
+            diagnostics: e.diagnostics.iter().map(ToString::to_string).collect(),
+        }
+    }
+}
+
+/// Render the plain-text `agent list` / `workflow list` roster: one line per
+/// resource with its origin, plus any diagnostics as a trailing tag — the only
+/// way plain text distinguishes an invalid resource, since there is no
+/// separate valid/invalid column. Reuses the same attention-drawing tag style
+/// as a node's `[blocked-by: …]` tag: both flag something a reader should not
+/// skim past.
+pub fn list_resources_plain(resources: &[ListResource], color: Color) -> String {
+    let mut out = String::new();
+    for r in resources {
+        let id = paint(&r.id, dim(), color);
+        let origin = format!("({})", r.origin.wire_name());
+        let mut line = format!("{id} {origin}");
+        if !r.diagnostics.is_empty() {
+            let tag = format!("[{}]", r.diagnostics.join("; "));
+            let _ = write!(line, " {}", paint(&tag, blocked_style(), color));
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Render `agent list --json` / `workflow list --json`: a flat array of
+/// resource roster objects.
+pub fn list_resources_json(resources: &[ListResource]) -> String {
+    to_json_string(&Value::Array(
+        resources.iter().map(list_resource_value).collect(),
+    ))
+}
+
+/// Render `agent list --ndjson` / `workflow list --ndjson`: one resource
+/// roster object per line.
+pub fn list_resources_ndjson(resources: &[ListResource]) -> String {
+    let mut out = String::new();
+    for r in resources {
+        out.push_str(&to_json_line(&list_resource_value(r)));
+        out.push('\n');
+    }
+    out
+}
+
+/// Render `agent list --raw` / `workflow list --raw`: tab-separated
+/// `id  origin  diagnostics`. The diagnostics column joins every diagnostic
+/// with `;`.
+pub fn list_resources_raw(resources: &[ListResource]) -> String {
+    let mut out = String::new();
+    for r in resources {
+        let _ = writeln!(
+            out,
+            "{}\t{}\t{}",
+            r.id,
+            r.origin.wire_name(),
+            r.diagnostics.join(";")
+        );
+    }
+    out
+}
+
+fn list_resource_value(r: &ListResource) -> Value {
+    json!({
+        "id": r.id,
+        "origin": r.origin.wire_name(),
+        "diagnostics": r.diagnostics,
+    })
+}
+
+/// The resource-roster fields `agent list` / `workflow list` may serve via
+/// `--fields`.
+pub const LISTABLE_RESOURCE_FIELDS: &[&str] = &["id", "origin", "diagnostics"];
+
+/// Render a `list --raw`/tab projection over listable resource fields: one
+/// tab-separated row per resource, columns in the requested field order.
+pub fn list_resources_fields_raw(resources: &[ListResource], fields: &[String]) -> String {
+    let mut out = String::new();
+    for r in resources {
+        let value = list_resource_value(r);
+        let cols: Vec<String> = fields
+            .iter()
+            .map(|f| {
+                let vals = project_path(&value, f);
+                vals.iter()
+                    .map(|v| leaf_to_raw(v).unwrap_or_else(|| to_json_line(v)))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .collect();
+        let _ = writeln!(out, "{}", cols.join("\t"));
+    }
+    out
+}
+
+// ===========================================================================
 // colour helpers (used only by the plain-text list)
 // ===========================================================================
 
@@ -1487,5 +1692,212 @@ mod tests {
         let node = NodeFile::parse(text).unwrap();
         let v = node_to_json("e", &node);
         assert_eq!(v["future-key"], "kept");
+    }
+
+    // -- agent profiles & workflows (effective resources) ------------------
+
+    use crate::resource::{Effective, Severity};
+
+    fn warning(message: &str) -> Diagnostic {
+        Diagnostic {
+            severity: Severity::Warning,
+            message: message.to_string(),
+        }
+    }
+
+    fn minimal_profile() -> Profile {
+        Profile {
+            command: "pi".into(),
+            args: vec!["{{ loti_prompt }}".into()],
+            cwd: None,
+            env: None,
+        }
+    }
+
+    #[test]
+    fn profile_to_json_carries_row_metadata_and_shape() {
+        let profile = minimal_profile();
+        let v = profile_to_json(
+            "reviewer",
+            Origin::Local,
+            &profile,
+            &[warning("ignoring 'x'")],
+        );
+        assert_eq!(v["id"], "reviewer");
+        assert_eq!(v["origin"], "local");
+        assert_eq!(v["command"], "pi");
+        assert_eq!(v["args"], json!(["{{ loti_prompt }}"]));
+        // Absent cwd/env render as null, not an omitted key.
+        assert_eq!(v["cwd"], Value::Null);
+        assert_eq!(v["env"], Value::Null);
+        // The diagnostic's own Display already states its severity.
+        assert_eq!(v["diagnostics"], json!(["warning: ignoring 'x'"]));
+    }
+
+    #[test]
+    fn profile_to_json_renders_cwd_and_env_when_present() {
+        let profile = Profile {
+            command: "pi".into(),
+            args: vec![],
+            cwd: Some("{{ project_root }}".into()),
+            env: Some(std::collections::BTreeMap::from([(
+                "FOO".to_string(),
+                "bar".to_string(),
+            )])),
+        };
+        let v = profile_to_json("x", Origin::Global, &profile, &[]);
+        assert_eq!(v["origin"], "global");
+        assert_eq!(v["cwd"], "{{ project_root }}");
+        assert_eq!(v["env"]["FOO"], "bar");
+        assert_eq!(v["diagnostics"], json!([]));
+    }
+
+    #[test]
+    fn agent_markdown_orders_sections_and_marks_empty_ones() {
+        let profile = minimal_profile();
+        let v = profile_to_json("reviewer", Origin::Local, &profile, &[]);
+        let md = show_agent_markdown(&v);
+        let order = ["| field | value |", "## Args", "## Env", "## Diagnostics"];
+        let mut last = 0;
+        for marker in order {
+            let at = md
+                .find(marker)
+                .unwrap_or_else(|| panic!("missing {marker} in:\n{md}"));
+            assert!(at >= last, "section out of order: {marker}");
+            last = at;
+        }
+        // One arg, no env, no diagnostics.
+        assert!(md.contains("1. {{ loti_prompt }}"));
+        // Empty sections say so rather than rendering an empty table.
+        assert_eq!(
+            md.matches("_(none)_").count(),
+            2,
+            "env and diagnostics are both empty:\n{md}"
+        );
+    }
+
+    #[test]
+    fn agent_markdown_renders_env_table_and_diagnostics_list_when_present() {
+        let profile = Profile {
+            command: "pi".into(),
+            args: vec![],
+            cwd: None,
+            env: Some(std::collections::BTreeMap::from([(
+                "FOO".to_string(),
+                "bar".to_string(),
+            )])),
+        };
+        let v = profile_to_json("x", Origin::Local, &profile, &[warning("ignoring 'z'")]);
+        let md = show_agent_markdown(&v);
+        assert!(md.contains("| FOO | bar |"), "env table row missing:\n{md}");
+        assert!(
+            md.contains("- warning: ignoring 'z'"),
+            "diagnostic bullet missing:\n{md}"
+        );
+        // Args is empty here, so it alone still says so.
+        assert!(md.contains("## Args\n\n_(none)_"));
+    }
+
+    fn effective_profile(
+        id: &str,
+        origin: Origin,
+        diagnostics: Vec<Diagnostic>,
+    ) -> Effective<Profile> {
+        Effective {
+            id: id.to_string(),
+            origin,
+            value: Some(minimal_profile()),
+            diagnostics,
+        }
+    }
+
+    #[test]
+    fn list_resource_row_carries_no_valid_flag() {
+        let row = ListResource::from(&effective_profile("a", Origin::Local, vec![warning("w")]));
+        assert_eq!(row.id, "a");
+        assert_eq!(row.origin, Origin::Local);
+        assert_eq!(row.diagnostics, vec!["warning: w".to_string()]);
+        // The row's own JSON has exactly these three keys — no `valid` flag
+        // alongside the diagnostics that already state severity.
+        let value = list_resource_value(&row);
+        let mut keys: Vec<&String> = value.as_object().unwrap().keys().collect();
+        keys.sort();
+        assert_eq!(keys, vec!["diagnostics", "id", "origin"]);
+    }
+
+    #[test]
+    fn list_resources_plain_tags_diagnostics_and_leaves_a_clean_row_bare() {
+        let rows = vec![
+            ListResource::from(&effective_profile(
+                "broken",
+                Origin::Local,
+                vec![warning("oops")],
+            )),
+            ListResource::from(&effective_profile("clean", Origin::Global, vec![])),
+        ];
+        let out = list_resources_plain(&rows, Color::None);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "broken (local) [warning: oops]");
+        assert_eq!(lines[1], "clean (global)");
+    }
+
+    #[test]
+    fn list_resources_json_and_ndjson_carry_the_same_three_fields() {
+        let rows = vec![ListResource::from(&effective_profile(
+            "a",
+            Origin::Local,
+            vec![warning("w")],
+        ))];
+        let json_out = list_resources_json(&rows);
+        let v: Value = serde_json::from_str(&json_out).unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], "a");
+        assert_eq!(arr[0]["origin"], "local");
+        assert_eq!(arr[0]["diagnostics"], json!(["warning: w"]));
+
+        let ndjson_out = list_resources_ndjson(&rows);
+        let lines: Vec<&str> = ndjson_out.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1);
+        let line_v: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(line_v, arr[0]);
+    }
+
+    #[test]
+    fn list_resources_raw_is_tab_separated_id_origin_diagnostics() {
+        let rows = vec![ListResource::from(&effective_profile(
+            "a",
+            Origin::Local,
+            vec![warning("one"), warning("two")],
+        ))];
+        let out = list_resources_raw(&rows);
+        assert_eq!(out.trim_end(), "a\tlocal\twarning: one;warning: two");
+    }
+
+    #[test]
+    fn list_resources_fields_raw_projects_selected_columns_in_order() {
+        let rows = vec![ListResource::from(&effective_profile(
+            "a",
+            Origin::Global,
+            vec![],
+        ))];
+        let out = list_resources_fields_raw(&rows, &["origin".to_string(), "id".to_string()]);
+        assert_eq!(out.trim_end(), "global\ta");
+    }
+
+    #[test]
+    fn listable_resource_fields_accepts_the_row_and_rejects_unknown() {
+        assert!(validate_list_fields(
+            &["id".into(), "origin".into(), "diagnostics".into()],
+            LISTABLE_RESOURCE_FIELDS
+        )
+        .is_ok());
+        // `command` is a real profile field, but it is show-only for agent
+        // profiles — not a heavy field shared with epics/tickets, so it is an
+        // unknown field here rather than a "shown by show" hint.
+        assert!(matches!(
+            validate_list_fields(&["command".into()], LISTABLE_RESOURCE_FIELDS),
+            Err(RenderError::UnknownField(_))
+        ));
     }
 }

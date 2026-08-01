@@ -22,4 +22,5 @@ mod conformance {
     mod spec_07_skill_help;
     mod spec_08_concurrency;
     mod spec_09_versioning;
+    mod spec_10_agent_workflow_resources;
 }

@@ -62,6 +62,16 @@ pub enum Command {
     /// `ticket create <epic-id> --parent <ref>`.
     Ticket(TicketArgs),
 
+    /// Effective agent harness profiles — configured local/global `.toml`
+    /// files, local shadowing global by id. This is the operator-facing read
+    /// surface only; launching an agent is a separate concern.
+    Agent(AgentArgs),
+
+    /// Effective agent workflows — configured local/global `.md` files, local
+    /// shadowing global by id. A workflow's Markdown is opaque; `show` writes
+    /// it back exactly as loaded.
+    Workflow(WorkflowArgs),
+
     /// Print the static, hand-authored SKILL.md verbatim.
     Skill,
 
@@ -431,6 +441,89 @@ pub struct ListFilterArgs {
     /// other names must be configured. Only meaningful with `--match`.
     #[arg(long, value_name = "IMPL", requires = "match_query")]
     pub match_impl: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// agent / workflow  (effective-resource read surface)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Args)]
+#[command(disable_help_subcommand = true)]
+pub struct AgentArgs {
+    #[command(subcommand)]
+    pub command: AgentCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AgentCommand {
+    /// List effective agent profiles: local/global, with origin and any
+    /// diagnostics. An invalid profile is listed too, never dropped.
+    List(ResourceListArgs),
+    /// Show one effective agent profile's parsed shape (the sole
+    /// projectable reader for profiles).
+    Show(AgentShowArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(disable_help_subcommand = true)]
+pub struct WorkflowArgs {
+    #[command(subcommand)]
+    pub command: WorkflowCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorkflowCommand {
+    /// List effective workflows: local/global, with origin and any
+    /// diagnostics. An invalid workflow is listed too, never dropped.
+    List(ResourceListArgs),
+    /// Write one effective workflow's Markdown to stdout — verbatim, with no
+    /// wrapper or formatting mode.
+    Show(ResourceIdArg),
+}
+
+/// `agent list` / `workflow list`: the established full list-format surface
+/// (a projection plus plain/json/ndjson/raw), shared by both since their
+/// roster row carries the same three fields (id/origin/diagnostics).
+#[derive(Debug, Args)]
+pub struct ResourceListArgs {
+    /// Restrict output to these roster fields (dotted leaf paths).
+    #[command(flatten)]
+    pub fields: FieldSel,
+    #[command(flatten)]
+    pub format: ListFormat,
+}
+
+/// A bare resource id — an agent-profile or workflow id — for a reader that
+/// serves the resource with no format flags (`workflow show`). Validated by
+/// the parser itself, so a malformed id is rejected before dispatch rather
+/// than surfacing as a runtime "not found".
+#[derive(Debug, Args)]
+pub struct ResourceIdArg {
+    /// Resource id — the effective `.toml`/`.md` file's filename stem.
+    #[arg(value_name = "ID", value_parser = parse_resource_id)]
+    pub id: String,
+}
+
+/// `agent show` — a validated resource id plus the established `show`
+/// field/format surface.
+#[derive(Debug, Args)]
+pub struct AgentShowArgs {
+    /// Resource id — the effective `.toml` file's filename stem.
+    #[arg(value_name = "ID", value_parser = parse_resource_id)]
+    pub id: String,
+    #[command(flatten)]
+    pub fields: FieldSel,
+    #[command(flatten)]
+    pub format: ShowFormat,
+}
+
+/// Validate a resource id at parse time, using the same rule core applies to
+/// a discovered filename stem, so a malformed `agent`/`workflow` argument is
+/// rejected by the grammar itself.
+fn parse_resource_id(raw: &str) -> Result<String, String> {
+    loti_core::resource::ResourceId::parse(raw)
+        .map(|id| id.as_str().to_string())
+        .map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -844,6 +937,31 @@ mod tests {
             "to-do"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn agent_and_workflow_list_and_show_parse() {
+        assert!(Cli::try_parse_from(["loti", "agent", "list"]).is_ok());
+        assert!(Cli::try_parse_from(["loti", "agent", "show", "reviewer"]).is_ok());
+        assert!(Cli::try_parse_from(["loti", "workflow", "list"]).is_ok());
+        assert!(Cli::try_parse_from(["loti", "workflow", "show", "review"]).is_ok());
+        // Both lists carry the established list-format surface.
+        assert!(Cli::try_parse_from(["loti", "agent", "list", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["loti", "workflow", "list", "--ndjson"]).is_ok());
+        // `agent show` carries the established show field/format surface;
+        // `workflow show` does not (it writes Markdown back verbatim).
+        assert!(Cli::try_parse_from(["loti", "agent", "show", "reviewer", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["loti", "workflow", "show", "review", "--json"]).is_err());
+    }
+
+    #[test]
+    fn agent_and_workflow_show_reject_a_malformed_id_before_dispatch() {
+        // The parser applies the same id rule core uses for a discovered
+        // filename stem, so a malformed id never reaches the store lookup.
+        assert!(Cli::try_parse_from(["loti", "agent", "show", "bad id"]).is_err());
+        assert!(Cli::try_parse_from(["loti", "agent", "show", ""]).is_err());
+        assert!(Cli::try_parse_from(["loti", "workflow", "show", "bad id"]).is_err());
+        assert!(Cli::try_parse_from(["loti", "agent", "show", "good-id_9"]).is_ok());
     }
 
     #[test]

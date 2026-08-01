@@ -42,6 +42,22 @@ pub enum Origin {
     Global,
 }
 
+impl Origin {
+    /// The lower-case name used in output.
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Origin::Local => "local",
+            Origin::Global => "global",
+        }
+    }
+}
+
+impl fmt::Display for Origin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.wire_name())
+    }
+}
+
 /// A candidate or requested resource identifier: a non-empty string of ASCII
 /// letters, digits, hyphens, and underscores. Comparison is case-sensitive —
 /// IDs that differ only by letter case are distinct (if non-portable across
@@ -628,6 +644,12 @@ mod tests {
 
     fn valid_profile(command: &str) -> String {
         format!("command = \"{command}\"\nargs = [\"a\"]\n")
+    }
+
+    #[test]
+    fn origin_display_matches_wire_name() {
+        assert_eq!(Origin::Local.to_string(), "local");
+        assert_eq!(Origin::Global.to_string(), "global");
     }
 
     // -- ID validation ------------------------------------------------------

@@ -152,6 +152,45 @@ impl Store {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
+    /// A fresh binary invocation against this store, with extra environment
+    /// variables layered over the default (colour-suppressed) invocation.
+    /// Used by checks that must isolate `XDG_CONFIG_HOME` per invocation
+    /// (an effective global resource root) rather than the test process's own
+    /// environment.
+    pub fn cmd_env(&self, args: &[&str], envs: &[(&str, &str)]) -> Command {
+        let mut cmd = self.cmd(args);
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        cmd
+    }
+
+    /// Run a command with extra environment variables, expected to succeed;
+    /// returns stdout.
+    pub fn ok_env(&self, args: &[&str], envs: &[(&str, &str)]) -> String {
+        let out = self.cmd_env(args, envs).output().expect("spawn loti");
+        assert!(
+            out.status.success(),
+            "expected success for {args:?}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Run a command with extra environment variables, expected to fail
+    /// (non-zero exit); returns stderr.
+    pub fn fail_env(&self, args: &[&str], envs: &[(&str, &str)]) -> String {
+        let out = self.cmd_env(args, envs).output().expect("spawn loti");
+        assert!(
+            !out.status.success(),
+            "expected failure for {args:?}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+
     /// Run a command expected to fail (non-zero exit); returns its stderr.
     pub fn fail(&self, args: &[&str]) -> String {
         let out = self.cmd(args).output().expect("spawn loti");

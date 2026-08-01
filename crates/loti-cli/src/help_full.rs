@@ -59,7 +59,15 @@ pub fn render(root: &mut Command) -> String {
 /// commands. Any command present in the model but not named here is appended
 /// afterwards so nothing is ever silently dropped.
 fn workflow_order(root: &Command) -> Vec<String> {
-    let preferred = ["init", "epic", "ticket", "skill", "migrate-store"];
+    let preferred = [
+        "init",
+        "epic",
+        "ticket",
+        "agent",
+        "workflow",
+        "skill",
+        "migrate-store",
+    ];
     let present: Vec<String> = root
         .get_subcommands()
         .map(|c| c.get_name().to_string())
@@ -142,6 +150,8 @@ mod tests {
             "loti init",
             "loti epic",
             "loti ticket",
+            "loti agent",
+            "loti workflow",
             "loti skill",
             "loti migrate-store",
         ] {
@@ -154,6 +164,8 @@ mod tests {
             "loti ticket create",
             "loti ticket status",
             "loti ticket list",
+            "loti agent show",
+            "loti workflow show",
         ] {
             assert!(text.contains(anchor), "missing verb heading: {anchor}");
         }

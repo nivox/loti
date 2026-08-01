@@ -71,6 +71,8 @@ fn help_full_covers_the_whole_surface() {
         "asset",
         "list",
         "init",
+        "agent",
+        "workflow",
         "skill",
         "tui",
         "migrate-store",
