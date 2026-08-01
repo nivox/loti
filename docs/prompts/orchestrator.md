@@ -44,6 +44,29 @@ descendant is terminal. If it is a leaf it is your only candidate. If it has
 subtickets, they are the work and the root is what you close at the end — never
 start on the root while anything under it is open.
 
+## Progress updates are not endpoints
+
+Keep the human oriented with short progress updates at meaningful boundaries:
+choosing a ticket, starting implementation, starting review, reporting review
+findings, beginning remediation, and closing a ticket.
+
+A progress update does not end the orchestration run. After sending one, continue
+the current cycle unless the human replies with new direction or an explicit stop
+condition below applies.
+
+Model context pressure, token-budget estimates, elapsed work, and the number of
+completed tickets are implementation details of the orchestrator. They are never
+reasons to end the run, leave a ticket claimed, or report that work is complete.
+
+Before sending a final response, verify all of the following:
+
+- no in-scope ticket is `in-progress`;
+- no `ticket/*` branch remains;
+- the working tree is clean on the recorded target branch; and
+- one of the explicit **Stop** conditions below applies.
+
+If no stop condition applies, send a progress update if useful, then continue.
+
 ## The cycle
 
 Repeat until a stop condition below is met.
@@ -234,7 +257,11 @@ condition, not something to resolve creatively.
 End every cycle back on the target branch with a clean tree, so the next cycle's
 first check passes for the right reason.
 
-## Stop
+## Stop — the only endpoints
+
+You may end the orchestration run only for one of the conditions in this section.
+When doing so, name the condition and the ticket evidence that satisfies it.
+Internal runtime signals are not additional stop conditions.
 
 Stop and report when any of these holds.
 
