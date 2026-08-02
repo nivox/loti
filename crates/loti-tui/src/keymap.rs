@@ -126,7 +126,7 @@ enum HelpBinding {
     PreviewPaging,
     PreviewEnds,
     Layout,
-    StartWriting,
+    Start,
     AddDelete,
     EditFields,
     StateClaim,
@@ -228,9 +228,10 @@ fn action_for_binding(binding: HelpBinding, key: KeyEvent, mode: Mode) -> Option
             (KeyCode::Char('z'), false) => Some(Action::ToggleZoom),
             _ => None,
         },
-        HelpBinding::StartWriting if browsing => match (key.code, ctrl) {
+        HelpBinding::Start if browsing => match (key.code, ctrl) {
             (KeyCode::Char('e'), false) => Some(Action::EnterEditing),
             (KeyCode::Char('N'), false) => Some(Action::New),
+            (KeyCode::Char('w'), false) => Some(Action::RunAgent),
             _ => None,
         },
         HelpBinding::AddDelete if matches!(mode, Mode::Editing) => match (key.code, ctrl) {
@@ -248,7 +249,6 @@ fn action_for_binding(binding: HelpBinding, key: KeyEvent, mode: Mode) -> Option
             (KeyCode::Char('s'), false) => Some(Action::SetState),
             (KeyCode::Char('c'), false) => Some(Action::TakeClaim),
             (KeyCode::Char('C'), false) => Some(Action::ReleaseClaim),
-            (KeyCode::Char('w'), false) => Some(Action::RunAgent),
             _ => None,
         },
         HelpBinding::Save
@@ -370,10 +370,13 @@ pub const HELP: &[HelpEntry] = &[
         binding: HelpBinding::Layout,
     },
     HelpEntry {
-        keys: "e / N",
-        description: "edit a row / new at this level",
+        keys: "e / N / w",
+        // Shorter than "new at this level" elsewhere in this file: the overlay
+        // is sized from its widest row, and this row is that row on an
+        // eighty-column terminal, the narrowest this help text promises to fit.
+        description: "edit a row / new here / run a workflow",
         requires_write: true,
-        binding: HelpBinding::StartWriting,
+        binding: HelpBinding::Start,
     },
     HelpEntry {
         keys: "a / d",
@@ -390,8 +393,8 @@ pub const HELP: &[HelpEntry] = &[
         binding: HelpBinding::EditFields,
     },
     HelpEntry {
-        keys: "s / c / C / w",
-        description: "edit: state / take / release / workflow",
+        keys: "s / c / C",
+        description: "edit: state / take / release",
         requires_write: true,
         binding: HelpBinding::StateClaim,
     },
@@ -465,6 +468,14 @@ pub const FOOTER_HINTS: &[&str] = &[
 /// essential pair still wins at widths that cannot hold them.
 const FOOTER_HINT_ENTER_EDITING: &str = "e edit";
 
+/// The third browse-mode entry, and the first that depends on the cursor rather
+/// than the level: choosing a workflow acts on the row under the cursor, so the
+/// hint is shown only where that row is a launch target. Placed after the edit
+/// and new hints, leading position being reserved for what a reader cannot
+/// otherwise discover — this key opens onto resources that live outside the
+/// store entirely.
+const FOOTER_HINT_RUN_AGENT: &str = "w run workflow";
+
 /// The words for the browse-mode new action at each navigation level.
 ///
 /// The navigation model decides the action's target; this table names its one
@@ -490,13 +501,17 @@ fn new_hint(target: &NewTarget) -> Option<&'static str> {
 pub fn footer_hints_browse(
     can_enter_editing: bool,
     new_target: Option<&NewTarget>,
+    can_run_workflow: bool,
 ) -> Vec<&'static str> {
-    let mut hints = Vec::with_capacity(FOOTER_HINTS.len() + 2);
+    let mut hints = Vec::with_capacity(FOOTER_HINTS.len() + 3);
     if can_enter_editing {
         hints.push(FOOTER_HINT_ENTER_EDITING);
     }
     if let Some(hint) = new_target.and_then(new_hint) {
         hints.push(hint);
+    }
+    if can_run_workflow {
+        hints.push(FOOTER_HINT_RUN_AGENT);
     }
     hints.extend_from_slice(FOOTER_HINTS);
     hints
@@ -529,7 +544,6 @@ pub const FOOTER_HINTS_EDITING: &[(EditingAction, &str)] = &[
     (EditingAction::SetState, "s state"),
     (EditingAction::TakeClaim, "c claim"),
     (EditingAction::ReleaseClaim, "C release"),
-    (EditingAction::RunAgent, "w workflow"),
 ];
 
 /// The droppable hints of an open surface, ranked rather than in key order: they
@@ -819,7 +833,7 @@ mod tests {
             ),
         ];
         for (target, expected_new) in cases {
-            let hints = footer_hints_browse(true, Some(&target));
+            let hints = footer_hints_browse(true, Some(&target), false);
             for hint in [
                 "N new epic",
                 "N new ticket",
@@ -835,7 +849,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(footer_hints_browse(false, None), FOOTER_HINTS);
+        assert_eq!(footer_hints_browse(false, None, false), FOOTER_HINTS);
         assert_eq!(
             action_for(key_named("e"), Mode::Browse),
             Some(Action::EnterEditing)
@@ -844,11 +858,31 @@ mod tests {
     }
 
     #[test]
+    fn the_workflow_hint_names_the_row_dependent_key_and_nothing_else_does() {
+        // The only browse hint gated on the row rather than the level or the
+        // store's writability: proven here in isolation from both of those, which
+        // is what the eligibility walk in `app` then drives from the state
+        // machine's own judgement of the row.
+        assert!(footer_hints_browse(true, None, true).contains(&"w run workflow"));
+        assert!(!footer_hints_browse(true, None, false).contains(&"w run workflow"));
+        // Placed after the edit and new hints, which is why it lands third when
+        // both of those are also shown.
+        assert_eq!(
+            footer_hints_browse(true, Some(&NewTarget::Epic), true)[..3],
+            [FOOTER_HINT_ENTER_EDITING, "N new epic", "w run workflow"]
+        );
+        assert_eq!(
+            action_for(key_named("w"), Mode::Browse),
+            Some(Action::RunAgent)
+        );
+    }
+
+    #[test]
     fn the_key_list_hides_every_write_binding_on_a_read_only_store() {
         let writable: Vec<_> = help(true).collect();
         let read_only: Vec<_> = help(false).collect();
         assert!(
-            writable.iter().any(|entry| entry.keys == "e / N"),
+            writable.iter().any(|entry| entry.keys == "e / N / w"),
             "the writable list lost the way into writing"
         );
         for entry in &read_only {
@@ -1461,15 +1495,38 @@ mod tests {
     }
 
     #[test]
-    fn workflow_is_an_editing_action_bound_and_hinted_by_w() {
-        // The offer table decides whether this action is available on a frozen
-        // row; this layer pins only the intent and the words teaching its key.
-        assert_eq!(
-            action_for(plain(KeyCode::Char('w')), Mode::Editing),
-            Some(Action::RunAgent)
+    fn workflow_launch_carries_its_intent_while_browsing_and_is_a_character_in_a_field() {
+        // The action moved out of editing mode entirely: the state machine's own
+        // row judgement decides whether it does anything, but this layer pins the
+        // intent and where the key reaches it. `N` is the browser's precedent for a
+        // context-free key that also reaches into editing mode, where the mode's
+        // own fallback explains a letter no frozen row offers — `w` now follows it.
+        for mode in [Mode::Browse, Mode::Editing] {
+            let key = plain(KeyCode::Char('w'));
+            assert_eq!(action_for(key, mode), Some(Action::RunAgent), "{mode:?}");
+        }
+        for mode in surface_modes() {
+            assert_eq!(
+                action_for(plain(KeyCode::Char('w')), mode),
+                Some(Action::Insert('w')),
+                "{mode:?}"
+            );
+        }
+        for mode in dialog_modes() {
+            assert_eq!(
+                action_for(plain(KeyCode::Char('w')), mode),
+                None,
+                "{mode:?}"
+            );
+        }
+        // And it no longer has an editing hint: the strip that lists what a frozen
+        // row offers must not still teach a letter no row answers any more.
+        assert!(
+            !FOOTER_HINTS_EDITING
+                .iter()
+                .any(|(_, hint)| hint.starts_with('w')),
+            "{FOOTER_HINTS_EDITING:?} still teaches w as an editing action"
         );
-        assert_eq!(action_for(plain(KeyCode::Char('w')), Mode::Browse), None);
-        assert!(FOOTER_HINTS_EDITING.contains(&(EditingAction::RunAgent, "w workflow")));
     }
 
     #[test]

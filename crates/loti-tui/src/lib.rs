@@ -1174,9 +1174,10 @@ mod tests {
         )
         .unwrap();
         match target {
-            QueuedTarget::Epic => {
-                app.apply(Action::EnterEditing).unwrap();
-            }
+            // The cursor already stands on the epic's own row at the roster, and
+            // the launch is row-resolved from the cursor directly: no mode needs
+            // entering first.
+            QueuedTarget::Epic => {}
             QueuedTarget::Ticket => {
                 app.apply(Action::Descend).unwrap();
                 let ticket = app
@@ -1189,7 +1190,6 @@ mod tests {
                 for _ in 0..ticket {
                     app.apply(Action::CursorDown).unwrap();
                 }
-                app.apply(Action::EnterEditing).unwrap();
             }
         }
         app.apply(Action::RunAgent).unwrap();
@@ -1257,7 +1257,11 @@ mod tests {
         );
         assert!(recorder.asked().is_empty(), "{:#?}", recorder.asked());
         assert!(app.surface().is_some(), "preparation closed the picker");
-        assert!(app.editing_target().is_some(), "preparation ended editing");
+        assert_eq!(
+            app.nav().frame().current().map(|row| &row.selection),
+            Some(&data::Selection::Epic(fixture.epic.clone())),
+            "preparation moved the cursor off its row"
+        );
         let Some(Modal::Dialog(dialog)) = app.modal() else {
             panic!("the preparation refusal opened no dialog")
         };
@@ -1297,7 +1301,11 @@ mod tests {
         );
         assert!(recorder.asked().is_empty(), "{:#?}", recorder.asked());
         assert!(app.surface().is_some(), "preparation closed the picker");
-        assert!(app.editing_target().is_some(), "preparation ended editing");
+        assert_eq!(
+            app.nav().frame().current().map(|row| &row.selection),
+            Some(&data::Selection::Epic(fixture.epic.clone())),
+            "preparation moved the cursor off its row"
+        );
         let Some(Modal::Dialog(dialog)) = app.modal() else {
             panic!("the preparation refusal opened no dialog")
         };

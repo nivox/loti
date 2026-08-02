@@ -248,6 +248,18 @@ impl Selection {
             other => other.clone(),
         }
     }
+
+    /// Whether a workflow may be launched against this row: an epic or a node
+    /// only, the same rule [`agent_picker`] enforces at the store seam.
+    ///
+    /// A blocker names a ticket but is a mention of it in another ticket's
+    /// dependency list — it shows none of that ticket's own state — so it is not
+    /// launchable, for the same reason a claim action belongs only to the work
+    /// item's own row. Comments, labels, assets and the collection rows carry no
+    /// state of their own either, so none of them is a launch target.
+    pub fn is_workflow_target(&self) -> bool {
+        matches!(self, Selection::Epic(_) | Selection::Node(_))
+    }
 }
 
 /// What a row stands for, which is what decides how it reads.

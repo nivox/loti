@@ -692,18 +692,26 @@ fn footer(app: &App, width: u16) -> Span<'static> {
                     keymap::FOOTER_ESSENTIAL_SURFACE,
                 ),
                 (None, true) => (app.editing_hints(), keymap::FOOTER_ESSENTIAL_EDITING),
-                (None, false) => (
-                    keymap::footer_hints_browse(
-                        app.read_only().is_none()
-                            && !app.zoomed()
-                            && app.nav().frame().current().is_some(),
-                        app.read_only()
-                            .is_none()
-                            .then(|| app.nav().new_target())
-                            .as_ref(),
-                    ),
-                    keymap::FOOTER_ESSENTIAL,
-                ),
+                (None, false) => {
+                    // `e` and `w` both act on the row under the cursor and are
+                    // refused identically on a read-only store or a hidden
+                    // navigation pane; `w` additionally depends on that row being
+                    // a launch target, which only the row itself can say.
+                    let can_act_on_row = app.read_only().is_none() && !app.zoomed();
+                    let current = app.nav().frame().current();
+                    (
+                        keymap::footer_hints_browse(
+                            can_act_on_row && current.is_some(),
+                            app.read_only()
+                                .is_none()
+                                .then(|| app.nav().new_target())
+                                .as_ref(),
+                            can_act_on_row
+                                && current.is_some_and(|row| row.selection.is_workflow_target()),
+                        ),
+                        keymap::FOOTER_ESSENTIAL,
+                    )
+                }
             };
             Span::styled(
                 format!(" {}", hint_strip(columns, &hints, essential)),
@@ -1545,11 +1553,11 @@ mod tests {
     fn strips() -> Vec<(Vec<&'static str>, &'static [&'static str])> {
         let mut strips = vec![
             (
-                keymap::footer_hints_browse(true, Some(&crate::nav::NewTarget::Epic)),
+                keymap::footer_hints_browse(true, Some(&crate::nav::NewTarget::Epic), true),
                 keymap::FOOTER_ESSENTIAL,
             ),
             (
-                keymap::footer_hints_browse(false, None),
+                keymap::footer_hints_browse(false, None, false),
                 keymap::FOOTER_ESSENTIAL,
             ),
             (

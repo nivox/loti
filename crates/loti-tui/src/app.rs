@@ -50,6 +50,23 @@ const NOT_AN_EDITING_ACTION: &str = "not an editing action — Esc to leave";
 /// pane back. The refusal never un-zooms by itself — the screen is the reader's.
 const EDITING_NEEDS_THE_NAV_PANE: &str = "editing needs the navigation pane — z brings it back";
 
+/// What choosing a workflow says while the preview fills the width. Gated exactly
+/// as [`EDITING_NEEDS_THE_NAV_PANE`], and for the same reason: the picker names
+/// its target only after the key is pressed, and nothing about that target is on
+/// screen without the navigation pane.
+const WORKFLOW_NEEDS_THE_NAV_PANE: &str =
+    "choosing a workflow needs the navigation pane — z brings it back";
+
+/// What the workflow key says on a row that is not a unit of work. A blocker, a
+/// comment, a label, an asset and a collection all fail [`Selection::is_workflow_target`]
+/// for the one reason this names: only an epic or a ticket's own row carries the
+/// state a launch acts on.
+const NOT_A_WORKFLOW_TARGET: &str = "only an epic or a ticket can be handed to a workflow";
+
+/// What the workflow key says on the one screen with no row at all.
+const NOTHING_TO_HAND_TO_A_WORKFLOW: &str =
+    "nothing to hand to a workflow: this store has no epics";
+
 /// What a reload that finds the store may no longer be written says, on the one
 /// reload that finds it.
 ///
@@ -281,10 +298,6 @@ enum Composed {
     /// descendants are still open — the state to mark, and what a cascade would have
     /// to close.
     State,
-    /// The valid effective workflows and profiles available from the browser's
-    /// working directory. Discovery is deferred because the hint strip asks the
-    /// offer table every frame.
-    RunAgent,
 }
 
 /// A dialog: what it says, how it may be answered, what its answers are called,
@@ -1001,9 +1014,12 @@ fn byte_at(value: &str, cursor: usize) -> usize {
 /// An open editing surface: the fields the reader fills in, and what accepting it
 /// writes.
 ///
-/// Invariant: a surface is open only while editing mode is on, and a dialog about
-/// it is laid over it rather than replacing it — so answering or dismissing one
-/// lands back in the buffer it was raised about, with the text intact.
+/// Invariant: a dialog about an open surface is laid over it rather than
+/// replacing it, so answering or dismissing one lands back in the buffer it was
+/// raised about, with the text intact. A surface opens either directly from
+/// browsing — creating an epic, or choosing a workflow — or from editing mode
+/// acting on its frozen row; which one opened it decides nothing else about how
+/// it behaves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Surface {
     /// What the surface is titled: the action and the row it acts on, since a
@@ -1851,8 +1867,9 @@ pub struct App {
     /// on instead of a list being browsed. A reload that leaves the two apart
     /// ends the mode rather than letting them drift.
     editing: Option<Selection>,
-    /// The open editing surface, if any. Only ever open while editing mode is on:
-    /// it is filled in for the frozen row, and a successful save closes both.
+    /// The open surface, if any: filled in for a frozen row from editing mode, or
+    /// opened directly from browsing — creating an epic, or choosing a workflow.
+    /// A successful save, or an accepted picker, closes it.
     surface: Option<Surface>,
     /// The text an external editor has been asked to take, until the loop that
     /// owns the terminal takes it.
@@ -2266,12 +2283,6 @@ impl App {
                 }
                 _ => None,
             },
-            // The picker may only be asked for a frozen epic or ticket. Discovery
-            // does not happen here: this table also feeds hints on every frame.
-            EditingAction::RunAgent => match target {
-                Selection::Epic(_) | Selection::Node(_) => Some(Offer::Compose(Composed::RunAgent)),
-                _ => None,
-            },
             EditingAction::Delete => match target {
                 // A label set has no rename, so a label is only ever removed.
                 Selection::Label(_, label) => Some(Offer::Ask(Dialog::confirm(
@@ -2400,6 +2411,11 @@ impl App {
             // that exist without the navigation pane. The screen is the reader's
             // choice, so the refusal leaves it as it is rather than un-zooming.
             Action::EnterEditing if self.zoomed => self.flash(EDITING_NEEDS_THE_NAV_PANE),
+            // Mirrors the rule above rather than the rule the human overruled for
+            // it: a picker whose target is not on screen yet could in principle be
+            // filled in blind, but naming that target is exactly what the reader
+            // needs to trust a launch this expensive and this hard to undo.
+            Action::RunAgent if self.zoomed => self.flash(WORKFLOW_NEEDS_THE_NAV_PANE),
 
             Action::CursorDown => self.nav.cursor_down(),
             Action::CursorUp => self.nav.cursor_up(),
@@ -2428,7 +2444,6 @@ impl App {
             | Action::SetState
             | Action::TakeClaim
             | Action::ReleaseClaim
-            | Action::RunAgent
             | Action::Overwrite
             | Action::Accept
             | Action::ExternalEditor
@@ -2487,6 +2502,24 @@ impl App {
                     // The roster of an empty store is the browser's one screen
                     // with no selection, and the mode acts on a row.
                     None => self.flash("nothing to edit: this store has no epics"),
+                },
+            },
+
+            // Row-resolved like `EnterEditing` rather than level-resolved like
+            // `New`: a launch has a subject rather than a container, and the
+            // subject a reader means is the row under the cursor. Gated exactly as
+            // `EnterEditing` is — the unconditional read-only refusal, checked
+            // before the row is even looked at — because a launch that can record
+            // nothing must fail here rather than after the terminal is gone.
+            Action::RunAgent => match self.read_only {
+                Some(reason) => self.flash(reason.refusal()),
+                None => match self.nav.frame().current() {
+                    Some(row) if row.selection.is_workflow_target() => {
+                        let target = row.selection.clone();
+                        self.run_agent(target);
+                    }
+                    Some(_) => self.flash(NOT_A_WORKFLOW_TARGET),
+                    None => self.flash(NOTHING_TO_HAND_TO_A_WORKFLOW),
                 },
             },
 
@@ -2903,7 +2936,6 @@ impl App {
         let Some(target) = self.editing.clone() else {
             return;
         };
-        let agent_picker = matches!(composed, Composed::RunAgent);
         let opened = match composed {
             Composed::Field(field) => data::edit_target(&self.store, &target).map(|read| {
                 Surface::replace(
@@ -2922,23 +2954,37 @@ impl App {
                 )
             }),
             Composed::State => data::state_target(&self.store, &target).map(Surface::set_state),
-            Composed::RunAgent => data::agent_picker(&self.store, &target, &self.working_directory)
-                .and_then(|picker| {
-                    if picker.is_selectable() {
-                        Ok(Surface::run_agent(picker))
-                    } else {
-                        anyhow::bail!(picker.unavailable_reason())
-                    }
-                }),
         };
+        match opened {
+            Ok(surface) => self.surface = Some(surface),
+            Err(e) => self.store_unreadable(e.to_string()),
+        }
+    }
+
+    /// Open the workflow picker for `target`, the row the cursor stood on when
+    /// the key was pressed.
+    ///
+    /// Taken as a value rather than re-read from the cursor, so the picker's
+    /// target and the row a reader saw highlighted when they pressed the key can
+    /// never drift apart — the check that the row is a launch target, and the
+    /// resolution of which row that is, both happen once, at the call site, before
+    /// this runs.
+    fn run_agent(&mut self, target: Selection) {
+        let opened =
+            data::agent_picker(&self.store, &target, &self.working_directory).and_then(|picker| {
+                if picker.is_selectable() {
+                    Ok(Surface::run_agent(picker))
+                } else {
+                    anyhow::bail!(picker.unavailable_reason())
+                }
+            });
         match opened {
             Ok(surface) => self.surface = Some(surface),
             // A resource catalog is unavailable for the same reader-facing reason
             // whether it contains no valid choices or configuration could not be
             // read: report it over the preserved browser rather than open an empty
-            // picker. Other composed surfaces are store reads and retain their
-            // existing unreadable-store report.
-            Err(e) if agent_picker => {
+            // picker.
+            Err(e) => {
                 self.modal = Some(Modal::Dialog(Box::new(Dialog::report(
                     AGENT_PICKER_TITLE,
                     e.to_string(),
@@ -2948,7 +2994,6 @@ impl App {
                     },
                 ))));
             }
-            Err(e) => self.store_unreadable(e.to_string()),
         }
     }
 
@@ -3211,13 +3256,19 @@ mod tests {
 
     /// Build the browser from a damaged store rather than inserting a row into
     /// navigation, so the eligibility walk reaches the same fallback selection a
-    /// reader can reach from persisted malformed data.
-    fn app_with_unremovable_blocker() -> (Fixture, Selection, App) {
+    /// reader can reach from persisted malformed data. Carries a working local
+    /// agent catalog so the same walk can also prove every eligible ancestor's
+    /// picker opens, not merely that the damaged row itself is refused.
+    fn app_with_unremovable_blocker() -> (Fixture, AgentResourceFixture, Selection, App) {
         let fx = Fixture::build();
         let entry = fx.add_unparseable_blocker_entry();
         let blocker = Selection::UnremovableBlocker(Container::Node(fx.node.clone()), entry);
-        let app = App::new(fx.store.clone(), Theme::with_color(false)).unwrap();
-        (fx, blocker, app)
+        let resources = AgentResourceFixture::new();
+        resources.add_local_resources(true, true);
+        let app =
+            App::at_working_directory(fx.store.clone(), Theme::with_color(false), resources.path())
+                .unwrap();
+        (fx, resources, blocker, app)
     }
 
     // Resource discovery reads this process-global setting. Hold it from setup
@@ -3557,8 +3608,37 @@ mod tests {
         app.apply(Action::EnterEditing).unwrap();
     }
 
-    /// Walk each reachable row and prove the workflow hint belongs only to units
-    /// of work, both in the state machine and in the frame the reader sees.
+    /// Stand on the epic's own row, on the roster, without entering editing
+    /// mode: the browse-mode launch is row-resolved from the cursor directly.
+    fn stand_on_the_epics_row(app: &mut App) {
+        to_the_roster(app);
+        app.apply(Action::CursorFirst).unwrap();
+    }
+
+    /// Stand on the ticket nested inside the epic, without entering editing mode.
+    fn stand_on_a_ticket_row(app: &mut App) {
+        to_the_roster(app);
+        app.apply(Action::Descend).unwrap(); // into the epic
+        to_work_row(app);
+    }
+
+    /// The row the cursor stands on, so a test can name what it expects a
+    /// browse-mode action to have acted on without freezing anything.
+    fn current_selection(app: &App) -> Selection {
+        app.nav()
+            .frame()
+            .current()
+            .expect("the cursor stands on a row")
+            .selection
+            .clone()
+    }
+
+    /// Walk each reachable row and prove the workflow key belongs only to units
+    /// of work, both in the state machine and in the frame the reader sees: the
+    /// hint, the drawn footer, and the key itself must all agree with the row's
+    /// eligibility, and an eligible row must open a picker naming that row's own
+    /// reference — the check that catches an off-by-one between the highlighted
+    /// row and the launched target.
     fn assert_workflow_eligibility(app: &mut App, required_row: Option<&Selection>) -> bool {
         let depth = app.nav().crumbs().len();
         let mut reached_required_row = false;
@@ -3568,26 +3648,51 @@ mod tests {
                 app.apply(Action::CursorDown).unwrap();
             }
             app.clear_flash();
-            app.apply(Action::EnterEditing).unwrap();
-            let target = app.editing_target().expect("editing froze no row").clone();
-            let eligible = matches!(target, Selection::Epic(_) | Selection::Node(_));
-            let hinted = app
-                .editing_hints()
-                .contains(&hint_for(EditingAction::RunAgent));
-            assert_eq!(hinted, eligible, "{target:?}");
+            let target = current_selection(app);
+            let eligible = target.is_workflow_target();
 
             // A bound action that never reaches the footer is not offered to a
-            // reader. This width leaves room for every editing hint, so omission
+            // reader. This width leaves room for every browse hint, so omission
             // here is eligibility rather than responsive truncation.
             let frame = frame_lines(app, 160, 24);
             assert_eq!(
-                frame[23].contains("w workflow"),
+                frame[23].contains("w run workflow"),
                 eligible,
                 "{target:?}: {frame:#?}"
             );
+
+            app.apply(Action::RunAgent).unwrap();
+            match (eligible, app.surface()) {
+                (true, Some(surface)) => {
+                    assert!(
+                        surface.title().contains(&target.reference()),
+                        "the picker named the wrong target: wanted {target:?}, opened {:?}",
+                        surface.title()
+                    );
+                    app.apply(Action::Unwind).unwrap();
+                    assert!(
+                        app.surface().is_none(),
+                        "cancelling the picker left it open"
+                    );
+                }
+                (true, None) => panic!(
+                    "an eligible row opened no picker: {target:?}, flash {:?}",
+                    app.flash_message()
+                ),
+                (false, None) => {
+                    assert_eq!(
+                        app.flash_message(),
+                        Some(NOT_A_WORKFLOW_TARGET),
+                        "{target:?}"
+                    );
+                }
+                (false, Some(surface)) => panic!(
+                    "an ineligible row opened a picker: {target:?}, titled {:?}",
+                    surface.title()
+                ),
+            }
             reached_required_row |= required_row.is_some_and(|required| target == *required);
 
-            app.apply(Action::Unwind).unwrap();
             app.apply(Action::Descend).unwrap();
             if app.nav().crumbs().len() > depth {
                 reached_required_row |= assert_workflow_eligibility(app, required_row);
@@ -3599,13 +3704,13 @@ mod tests {
 
     #[test]
     fn a_workflow_picker_is_offered_only_on_epics_and_tickets() {
-        let (_fx, mut app) = app();
+        let (_fx, _resources, mut app) = app_with_agent_resources();
         assert_workflow_eligibility(&mut app, None);
     }
 
     #[test]
     fn a_malformed_blocker_offers_no_workflow_hint_or_footer_action() {
-        let (_fx, blocker, mut app) = app_with_unremovable_blocker();
+        let (_fx, _resources, blocker, mut app) = app_with_unremovable_blocker();
         assert!(matches!(blocker, Selection::UnremovableBlocker(..)));
         assert!(
             assert_workflow_eligibility(&mut app, Some(&blocker)),
@@ -3616,7 +3721,7 @@ mod tests {
     #[test]
     fn a_workflow_picker_shows_global_resource_options_and_origins() {
         let (_fx, _resources, mut app) = app_with_global_agent_resources();
-        freeze_the_epics_row(&mut app);
+        stand_on_the_epics_row(&mut app);
         app.apply(Action::RunAgent).unwrap();
 
         let surface = app.surface().expect("the workflow key opened no picker");
@@ -3640,11 +3745,11 @@ mod tests {
         );
     }
 
-    /// Press `w` on a frozen target and verify that a partial catalog reports
+    /// Press `w` on the epic's row and verify that a partial catalog reports
     /// its missing half instead of constructing a picker without both values.
     fn assert_partial_catalog_is_refused(app: &mut App, expected_reason: &str) {
-        freeze_the_epics_row(app);
-        let target = app.editing_target().cloned().expect("the epic row froze");
+        stand_on_the_epics_row(app);
+        let target = current_selection(app);
         app.apply(Action::RunAgent).unwrap();
 
         let Some(Modal::Dialog(dialog)) = app.modal() else {
@@ -3657,9 +3762,9 @@ mod tests {
             "a partial catalog opened an empty picker"
         );
         assert_eq!(
-            app.editing_target(),
-            Some(&target),
-            "the unavailable dialog discarded the frozen target"
+            current_selection(app),
+            target,
+            "the unavailable dialog moved the cursor"
         );
     }
 
@@ -3678,8 +3783,8 @@ mod tests {
     #[test]
     fn a_workflow_picker_keeps_dynamic_origins_and_the_frozen_target_on_screen() {
         let (_fx, _resources, mut app) = app_with_agent_resources();
-        freeze_a_ticket_row(&mut app);
-        let frozen = app.editing_target().unwrap().reference();
+        stand_on_a_ticket_row(&mut app);
+        let frozen = current_selection(&app).reference();
         app.apply(Action::RunAgent).unwrap();
 
         let surface = app.surface().expect("the workflow key opened no picker");
@@ -3736,7 +3841,11 @@ mod tests {
         app.apply(Action::Unwind).unwrap();
         app.apply(Action::Delete).unwrap();
         assert!(app.surface().is_none(), "discard did not cancel the picker");
-        assert!(app.editing_target().is_some(), "cancel left editing mode");
+        assert_eq!(
+            app.mode(),
+            Mode::Browse,
+            "cancel left a phantom mode behind"
+        );
     }
 
     #[test]
@@ -3751,7 +3860,8 @@ mod tests {
         let mut app =
             App::at_working_directory(fx.store.clone(), Theme::with_color(false), resources.path())
                 .unwrap();
-        freeze_the_epics_row(&mut app);
+        stand_on_the_epics_row(&mut app);
+        let target = current_selection(&app);
 
         app.apply(Action::RunAgent).unwrap();
         let Some(Modal::Dialog(dialog)) = app.modal() else {
@@ -3762,21 +3872,23 @@ mod tests {
             app.surface().is_none(),
             "an unavailable catalog opened a picker"
         );
-        assert!(
-            app.editing_target().is_some(),
-            "the report discarded the frozen row"
+        assert_eq!(
+            current_selection(&app),
+            target,
+            "the report moved the cursor off the row it was raised over"
         );
         app.apply(Action::Unwind).unwrap();
-        assert!(
-            app.editing_target().is_some(),
-            "dismissing the report left editing"
+        assert_eq!(
+            current_selection(&app),
+            target,
+            "dismissing the report moved the cursor"
         );
     }
 
     #[test]
     fn accepting_a_workflow_picker_only_queues_a_launch_request() {
         let (fx, _resources, mut app) = app_with_agent_resources();
-        freeze_the_epics_row(&mut app);
+        stand_on_the_epics_row(&mut app);
         app.apply(Action::RunAgent).unwrap();
         app.apply(Action::Accept).unwrap();
 
@@ -3787,7 +3899,6 @@ mod tests {
         // Selection alone preserves the picker; the terminal-owning handoff later
         // prepares it and either reports a refusal here or closes it for the child.
         assert!(app.surface().is_some());
-        assert!(app.editing_target().is_some());
     }
 
     #[test]
@@ -3809,7 +3920,7 @@ mod tests {
         )
         .unwrap();
 
-        freeze_the_epics_row(&mut app);
+        stand_on_the_epics_row(&mut app);
         app.apply(Action::RunAgent).unwrap();
         app.apply(Action::Accept).unwrap();
         let request = app.take_launch_request().expect("accept queued no request");
@@ -4967,6 +5078,44 @@ mod tests {
     }
 
     #[test]
+    fn a_store_that_may_not_be_written_refuses_a_workflow_launch_for_every_reason() {
+        // Gated exactly as `EnterEditing` is: the unconditional refusal, in the
+        // store's own words, for every reason the store can be read-only — not
+        // argued case by case, the way the release chose to mirror editing mode
+        // rather than reason about which refusals a launch could still survive.
+        for state in ReadOnly::ALL.iter().copied() {
+            let fx = Fixture::build();
+            assert!(crate::data::fixture::turn_read_only(&fx.store, state));
+            let mut app = App::new(fx.store.clone(), Theme::with_color(false)).unwrap();
+            assert_eq!(app.read_only(), Some(state));
+
+            app.apply(Action::RunAgent).unwrap();
+            assert!(app.surface().is_none(), "{state:?} opened a picker");
+            assert_eq!(
+                app.flash_message(),
+                Some(state.refusal().as_str()),
+                "{state:?}"
+            );
+
+            // And the store is answered for before the row is: a reader standing
+            // on a row no launch could ever act on is still told the store is the
+            // reason, because the remedy is the store's and a message about the
+            // row would send them looking for a better row to stand on.
+            to_the_labels_row(&mut app);
+            app.apply(Action::RunAgent).unwrap();
+            assert!(
+                app.surface().is_none(),
+                "{state:?} opened a picker on a collection row"
+            );
+            assert_eq!(
+                app.flash_message(),
+                Some(state.refusal().as_str()),
+                "{state:?} answered for the row instead of for the store"
+            );
+        }
+    }
+
+    #[test]
     fn the_store_is_asked_again_on_every_reload_and_the_mode_ends_where_it_says_no() {
         let (fx, mut app) = app();
         assert_eq!(app.read_only(), None, "the fixture store is writable");
@@ -5109,6 +5258,29 @@ mod tests {
     }
 
     #[test]
+    fn choosing_a_workflow_is_refused_while_the_preview_fills_the_width() {
+        let (_fx, _resources, mut app) = app_with_agent_resources();
+        app.apply(Action::ToggleZoom).unwrap();
+
+        // The picker names its target only after the key is pressed, and none of
+        // that is on screen without the navigation pane — the release chose this
+        // refusal over letting the picker work blind, mirroring editing mode's own.
+        app.apply(Action::RunAgent).unwrap();
+        assert!(app.surface().is_none());
+        assert_eq!(app.flash_message(), Some(WORKFLOW_NEEDS_THE_NAV_PANE));
+        // And refused, not worked around: the screen is the reader's choice.
+        assert!(app.zoomed(), "the refusal must not un-zoom the screen");
+
+        // Once the row list is back, so is the key.
+        app.apply(Action::ToggleZoom).unwrap();
+        app.apply(Action::RunAgent).unwrap();
+        assert!(
+            app.surface().is_some(),
+            "the key works once the pane is back"
+        );
+    }
+
+    #[test]
     fn the_roster_of_an_empty_store_has_nothing_to_edit() {
         let (_dir, store) = crate::data::fixture::empty_store();
         let mut app = App::new(store, Theme::with_color(false)).unwrap();
@@ -5119,6 +5291,19 @@ mod tests {
         // cannot be entered, and saying nothing would look like a broken key.
         assert_eq!(app.editing_target(), None);
         assert!(app.flash_message().is_some());
+    }
+
+    #[test]
+    fn the_roster_of_an_empty_store_has_nothing_to_hand_to_a_workflow() {
+        let (_dir, store) = crate::data::fixture::empty_store();
+        let mut app = App::new(store, Theme::with_color(false)).unwrap();
+        assert!(app.nav().frame().current().is_none());
+
+        app.apply(Action::RunAgent).unwrap();
+        // The one screen with no row to launch from at all: an empty roster says
+        // there is nothing to hand over rather than naming a rule no row broke.
+        assert!(app.surface().is_none());
+        assert_eq!(app.flash_message(), Some(NOTHING_TO_HAND_TO_A_WORKFLOW));
     }
 
     #[test]
@@ -7851,6 +8036,22 @@ mod tests {
         assert!(
             app.surface().is_none(),
             "new opened a surface while editing"
+        );
+        assert_eq!(app.flash_message(), Some(NOT_AN_EDITING_ACTION));
+    }
+
+    #[test]
+    fn the_workflow_key_is_refused_as_not_an_editing_action() {
+        // The key moved out of the mode, so inside one it is a key the browser
+        // binds and the mode cannot carry — which is the case the mode's fallback
+        // exists for. A reader whose fingers still press `e` first is told the way
+        // out rather than met with silence.
+        let (_fx, mut app) = app();
+        freeze_the_epics_row(&mut app);
+        app.apply(Action::RunAgent).unwrap();
+        assert!(
+            app.surface().is_none(),
+            "the workflow key opened a picker while editing"
         );
         assert_eq!(app.flash_message(), Some(NOT_AN_EDITING_ACTION));
     }

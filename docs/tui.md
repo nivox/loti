@@ -75,7 +75,6 @@ row, including:
 | `n` / `S` / `b` | edit name / summary / body or comment text |
 | `s` | change open/closed state or ticket status |
 | `c` / `C` | take or release a claim |
-| `w` | choose a workflow and agent profile to run on an epic or ticket |
 
 `N` creates an epic from the top-level roster. Asset uploads and replacements
 remain CLI operations.
@@ -96,11 +95,10 @@ If you cancel changed text, the browser asks first; destructive confirmations us
 
 ## Launch an agent
 
-The `w` action is available only while editing an epic or ticket. It opens a
-centred picker for the frozen target, with `workflow` first and `agent` second.
-Choices identify whether their configured resource is local or global. Choose
-both values and accept the form to launch immediately; there is no second
-confirmation.
+Press `w` while browsing, on the highlighted epic or ticket, to open a centred
+picker for that row, with `workflow` first and `agent` second. Choices identify
+whether their configured resource is local or global. Choose both values and
+accept the form to launch immediately; there is no second confirmation.
 
 Loti validates the selected target, resources, and launch configuration before
 it gives up the terminal. A validation failure leaves the picker open and shows

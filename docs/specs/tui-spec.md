@@ -82,6 +82,19 @@ open, because the split is reader-owned furniture. It MUST be refused while a
 dialog is open: no input may move content beneath a question. Wheel movement is
 silent while editing.
 
+`w` chooses a workflow and agent profile to launch against the row under the
+cursor. It is row-resolved rather than level-resolved: unlike `N`, the
+highlighted row is the target, not the level containing it. It MUST be offered
+only on an epic or a node; a blocker row names a ticket without showing that
+ticket's own state, so it does not qualify, nor do comments, labels, assets, or
+a collection row. It MUST be refused, in the store's own words, on a read-only
+store, and refused with its own notice while the navigation pane is hidden,
+naming `z` as the way to restore it. On an ineligible row it MUST state the
+rule instead of opening anything, and on the one screen with no row at all it
+MUST say there is nothing to hand over. Opening the picker MUST select valid
+effective resources, hand the terminal to the selected agent, and restore the
+browser after the agent exits.
+
 ## 4. Editing mode and actions
 
 `e` enters editing mode only on a selected row. The selected row and level MUST
@@ -97,16 +110,12 @@ a key never bound in that context MAY remain silent.
 
 The actions are `a` to add a member to the selected container, `d` to remove a
 selected member, `n` for name, `S` for summary, `b` for body or comment text,
-`s` for state, `c` to take or reassign a claim, `C` to release a held claim, and
-`w` to select a workflow and agent profile for an epic or node. The browser MUST
-offer only actions valid for the current selection. `N` creates an epic at the
-roster without entering editing mode. The browser writes comments as the human;
-it MUST NOT request an agent identity. Asset addition and replacement are CLI
-operations.
-
-A workflow action MUST be offered only on an epic or node, select valid effective
-resources, hand the terminal to the selected agent, and restore the browser after
-the agent exits.
+`s` for state, `c` to take or reassign a claim, and `C` to release a held claim.
+The browser MUST offer only actions valid for the current selection. `N` creates
+an epic at the roster without entering editing mode, and `w` launches a workflow
+against the row under the cursor; neither enters editing mode, and neither is
+offered by it. The browser writes comments as the human; it MUST NOT request an
+agent identity. Asset addition and replacement are CLI operations.
 
 A single many-line body or comment field MUST render in the preview pane. Short
 fields, pickers, and multi-field forms MUST render as centred floats. A float
@@ -166,8 +175,8 @@ before showing the refusal dialog and MUST NOT also show a success notice.
 
 At startup and every reload, the browser MUST ask the store whether it is
 mutable. An older store major or a migration sentinel leaves the browser
-read-only; the state slot MUST name the reason, and `e` and `N` MUST not be
-offered. A newer incompatible major MUST refuse before terminal takeover. A
+read-only; the state slot MUST name the reason, and `e`, `N`, and `w` MUST not
+be offered. A newer incompatible major MUST refuse before terminal takeover. A
 reload MAY change read-only state when another actor migrates the store.
 
 Reads are lock-free and MUST NOT be represented as a global snapshot. The browser

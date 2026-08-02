@@ -280,8 +280,6 @@ pub enum EditingAction {
     /// Offered only while a claim is held: the pair's two halves are the same
     /// noun, and there is nothing to give up on a row nobody is on.
     ReleaseClaim,
-    /// Choose a workflow and agent profile for a frozen unit of work.
-    RunAgent,
 }
 
 impl EditingAction {
@@ -300,7 +298,6 @@ impl EditingAction {
         EditingAction::SetState,
         EditingAction::TakeClaim,
         EditingAction::ReleaseClaim,
-        EditingAction::RunAgent,
     ];
 
     /// The intent a key carries for this action. The state machine reads an
@@ -313,7 +310,6 @@ impl EditingAction {
             EditingAction::SetState => Action::SetState,
             EditingAction::TakeClaim => Action::TakeClaim,
             EditingAction::ReleaseClaim => Action::ReleaseClaim,
-            EditingAction::RunAgent => Action::RunAgent,
         }
     }
 
@@ -419,9 +415,16 @@ pub enum Action {
     /// nothing is asked: the row carries the claim, so the write is what the key
     /// performs.
     ReleaseClaim,
-    /// Choose a workflow and agent profile for the frozen epic or ticket.
+    /// Choose a workflow and agent profile for the epic or ticket under the
+    /// cursor while browsing.
     ///
-    /// Discovery is deferred until this intent is applied: rendering an editing
+    /// Row-resolved like [`Action::EnterEditing`] rather than level-resolved like
+    /// [`Action::New`]: a launch has a subject, and the subject a reader means is
+    /// the row they are looking at, not the level containing it. It is not an
+    /// [`EditingAction`]: launching writes nothing through the tracker, so it has
+    /// no frozen row to act on.
+    ///
+    /// Discovery is deferred until this intent is applied: rendering the browse
     /// hint must never read configuration or resource directories.
     RunAgent,
     /// Write anyway, over a change that landed under the open buffer. The
@@ -514,8 +517,7 @@ mod tests {
                 | EditingAction::Delete
                 | EditingAction::SetState
                 | EditingAction::TakeClaim
-                | EditingAction::ReleaseClaim
-                | EditingAction::RunAgent => {}
+                | EditingAction::ReleaseClaim => {}
                 // Every replaceable field is an action of its own, so a field
                 // added without a key and a hint fails here rather than being an
                 // action no reader can reach.
@@ -524,7 +526,7 @@ mod tests {
                 },
             }
         }
-        assert_eq!(EditingAction::ALL.len(), 6 + FreeForm::ALL.len());
+        assert_eq!(EditingAction::ALL.len(), 5 + FreeForm::ALL.len());
         for field in FreeForm::ALL {
             assert!(
                 EditingAction::ALL.contains(&EditingAction::Edit(*field)),
@@ -622,6 +624,10 @@ mod tests {
         assert_eq!(EditingAction::for_intent(Action::MoveUp), None);
         assert_eq!(EditingAction::for_intent(Action::MoveDown), None);
         assert_eq!(EditingAction::for_intent(Action::Overwrite), None);
+        // Launching moved out of editing mode entirely: it is row-resolved while
+        // browsing and offers no frozen-row action at all, so no editing action
+        // asks for it any more.
+        assert_eq!(EditingAction::for_intent(Action::RunAgent), None);
         // And a state pick is one action rather than one per state: which state is
         // picked is the surface's business, so no key carries it.
         assert_eq!(
