@@ -579,11 +579,16 @@ fn dispatch_event(app: &mut App, event: Event, width: u16) -> bool {
     }
 }
 
+/// Whether the browser must receive mouse reports in this layout state.
+///
+/// Zoom hides the divider but does not release capture: a wheel report remains
+/// preview input. Capture is released only by the external-process handoff,
+/// whose inherited input cannot consume terminal mouse reports.
+fn browser_captures_mouse(_zoomed: bool) -> bool {
+    true
+}
+
 fn event_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
-    // Mouse capture is what makes the divider draggable, but it also takes
-    // click-drag text selection away from the terminal. Zoom is the way out:
-    // while zoomed there is no divider to drag, so capture is released and
-    // selecting text from the preview works again.
     let mut captured = true;
     loop {
         // Every pass, not only the passes where the wait below timed out: that
@@ -596,7 +601,7 @@ fn event_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
             terminal.draw(|f| ui::draw(f, &mut app))?;
         }
 
-        let wanted = !app.zoomed();
+        let wanted = browser_captures_mouse(app.zoomed());
         if wanted != captured {
             let mut stdout = io::stdout();
             if wanted {
@@ -623,8 +628,8 @@ fn event_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
         // Only the loop owns the terminal, so an editor can only be run from here.
         if let Some(text) = app.take_editor_handoff() {
             editor_outcome(&mut app, edit_externally(terminal, &text));
-            // The terminal was handed back with everything reclaimed, whatever the
-            // divider state was before, and the whole screen has to be repainted.
+            // The terminal was handed back with everything reclaimed, whatever
+            // its layout, and the whole screen has to be repainted.
             captured = true;
             app.request_redraw();
         }
@@ -787,6 +792,15 @@ mod tests {
         match hold {
             Hold::AlternateScreen(held) | Hold::RawMode(held) | Hold::MouseCapture(held) => held,
         }
+    }
+
+    #[test]
+    fn zoom_keeps_mouse_capture_so_wheel_reports_reach_the_preview() {
+        // This is the event loop's layout-to-terminal decision. The browser's
+        // initial terminal state and an external-process reclaim both start with
+        // capture held; zoom must not introduce a third state that loses wheels.
+        assert!(browser_captures_mouse(false));
+        assert!(browser_captures_mouse(true));
     }
 
     #[test]

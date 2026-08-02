@@ -4306,10 +4306,27 @@ mod tests {
         assert_ne!(lower, top, "wheel-down did not scroll the zoomed preview");
         assert_preview_scrolled_down_one_line(&top, &lower);
 
+        // Drive the viewport below the first line before asking it to rise: an
+        // over-large wheel-up cannot pass here merely by clamping back to top.
+        app.apply(Action::WheelDown).unwrap();
+        let lower_again = preview_lines(&mut app, width, height);
+        assert_preview_scrolled_down_one_line(&lower, &lower_again);
+
         app.apply(Action::WheelUp).unwrap();
         let raised = preview_lines(&mut app, width, height);
-        assert_preview_scrolled_up_one_line(&lower, &raised);
-        assert_eq!(raised, top, "wheel-up did not restore the zoomed preview");
+        assert_preview_scrolled_up_one_line(&lower_again, &raised);
+        assert_eq!(
+            raised, lower,
+            "wheel-up did not reach the one-line-down frame"
+        );
+
+        app.apply(Action::WheelUp).unwrap();
+        let returned_top = preview_lines(&mut app, width, height);
+        assert_preview_scrolled_up_one_line(&raised, &returned_top);
+        assert_eq!(
+            returned_top, top,
+            "wheel-up did not return the zoomed preview to top"
+        );
         assert_eq!(
             app.nav().cursor(),
             cursor,

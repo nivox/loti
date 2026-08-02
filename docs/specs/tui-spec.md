@@ -72,9 +72,10 @@ previous view; a one-line preview advances by one line because overlap is
 impossible. `<`/`>` change the split by 5%, `=` restores it, and `z` zooms the
 preview.
 
-Zoom MUST fill the width with the preview, release mouse capture, hide the
-navigation cursor, and disable entering or leaving a level. In that state,
-`j`/`k` scroll the preview. The split is per-session and MUST NOT persist.
+Zoom MUST fill the width with the preview, retain mouse capture so wheel reports
+continue to reach it, hide the navigation cursor, and disable entering or leaving
+a level. In that state, `j`/`k` scroll the preview. The split is per-session and
+MUST NOT persist.
 
 Dragging the divider MAY resize the panes while editing mode or a surface is
 open, because the split is reader-owned furniture. It MUST be refused while a

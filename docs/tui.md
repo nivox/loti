@@ -58,10 +58,9 @@ Half-screen preview movement retains at least one line from the previous view
 when the preview can show more than one line. A one-line preview advances one
 line because no overlap is possible.
 
-Zoom fills the terminal with the preview and lets the terminal handle ordinary
-mouse text selection. The mouse wheel keeps scrolling the preview. Press `z`
-again to restore the tree. Drag the divider to adjust the split; it lasts for
-this session only.
+Zoom fills the terminal with the preview and keeps mouse capture enabled, so the
+mouse wheel keeps scrolling the preview. Press `z` again to restore the tree.
+Drag the divider to adjust the split; it lasts for this session only.
 
 ## Edit
 
