@@ -20,7 +20,7 @@ use crate::action::{
 };
 use crate::data::{self, Collection, Container, Level, ReadOnly, Selection};
 use crate::keymap;
-use crate::nav::Nav;
+use crate::nav::{Nav, NewTarget};
 use crate::theme::Theme;
 
 /// The default share of the width given to the navigation pane.
@@ -59,12 +59,6 @@ const EDITING_NEEDS_THE_NAV_PANE: &str = "editing needs the navigation pane — 
 /// saying. No way out is named because there is nothing left to get out of — the
 /// editing session ended with the store's writability.
 const EDITING_STOPPED_READ_ONLY: &str = "the store can no longer be written — editing stopped";
-
-/// What the key that creates an epic says where an epic is not created from. It
-/// names where it is, because the key is the browser's own rather than a letter a
-/// row offers, and silence would read as a broken key.
-const EPICS_ARE_MADE_FROM_THE_EPICS_LIST: &str =
-    "a new epic is made from the epics list, not from inside one";
 
 /// What the key that ends a browsing session says while a buffer holds text the
 /// store has never been given.
@@ -184,6 +178,19 @@ fn reported(done: String, effect: data::Effect) -> String {
         // ticket theirs became rather than merely that there is one.
         data::Effect::Created(reference) => format!("{done} as {reference}"),
     }
+}
+
+/// The command-line route for attaching an asset to a container.
+///
+/// Asset data always comes from a path outside the browser, so both the editing
+/// action and the browse-mode new action use this one signpost rather than opening
+/// a form that cannot carry the payload.
+fn asset_add_signpost(container: &Container) -> String {
+    format!(
+        "loti {} asset add {} --file <path> — assets are attached from the command line",
+        container.cli_noun(),
+        container.selection().reference(),
+    )
 }
 
 /// A transient one-line notice, holding the hint strip's line until its deadline
@@ -2199,11 +2206,7 @@ impl App {
                 // costs them nothing. A long reference on a narrow terminal would
                 // otherwise take the flag off the end.
                 Selection::Collection(container, Collection::Assets) => {
-                    Some(Offer::Signpost(format!(
-                        "loti {} asset add {} --file <path> — assets are attached from the command line",
-                        container.cli_noun(),
-                        container.selection().reference(),
-                    )))
+                    Some(Offer::Signpost(asset_add_signpost(container)))
                 }
                 _ => None,
             },
@@ -2445,25 +2448,29 @@ impl App {
             // no layer states the rule a second time. See [`App::quit`].
             Action::Quit => {}
 
-            // An epic is created from the epics list and nowhere else: it has no
-            // container row to be added from, which is why this is a key of the
-            // browser's own rather than a letter a row offers.
-            //
-            // Being outside editing mode, it does not pass the offer table where
-            // every other write's availability is decided — so it asks the store's
-            // own state for itself. A store the format gate will not let this binary
-            // write offers no write anywhere, this one included.
-            //
-            // Pressed anywhere but the roster it flashes rather than staying quiet:
-            // the third case [`Action::Unbound`] names, where a bound key answers
-            // for itself instead of following the default, because making an epic
-            // is exactly what this key is expected to do everywhere else on that
-            // list.
-            Action::CreateEpic => match self.read_only {
+            // The navigation model resolves one context-free intent from the
+            // active level. It is deliberately not an editing action: the level is
+            // the container, so the highlighted row cannot retarget the addition.
+            Action::New => match self.read_only {
                 Some(reason) => self.flash(reason.refusal()),
-                None => match self.nav.at_roster() {
-                    true => self.surface = Some(Surface::create_epic()),
-                    false => self.flash(EPICS_ARE_MADE_FROM_THE_EPICS_LIST),
+                None => match self.nav.new_target() {
+                    NewTarget::Epic => self.surface = Some(Surface::create_epic()),
+                    NewTarget::Ticket(parent) | NewTarget::Subticket(parent) => {
+                        self.surface = Some(Surface::create_node(parent));
+                    }
+                    NewTarget::Label(set) => {
+                        let container = set.reference();
+                        self.surface = Some(Surface::add_label(set, container));
+                    }
+                    NewTarget::Comment(list) => {
+                        let container = list.reference();
+                        self.surface = Some(Surface::add_comment(list, container));
+                    }
+                    NewTarget::Blocker(list) => {
+                        let container = list.reference();
+                        self.surface = Some(Surface::add_blocker(list, container));
+                    }
+                    NewTarget::Asset(container) => self.flash(asset_add_signpost(&container)),
                 },
             },
 
@@ -7692,12 +7699,11 @@ mod tests {
         assert!(fx.node_claim().is_none(), "the claim is still held");
     }
 
-    /// Open the form that creates an epic, the way a reader does: from the epics
-    /// list, with the browser's own key.
+    /// Open the form that creates an epic, from the roster's current level.
     fn open_the_epic_form(app: &mut App) {
         to_the_roster(app);
-        app.apply(Action::CreateEpic).unwrap();
-        assert!(app.surface().is_some(), "the epic key opened no form");
+        app.apply(Action::New).unwrap();
+        assert!(app.surface().is_some(), "the new key opened no epic form");
     }
 
     /// Fill the open form in, field by field from the first, the way a reader does:
@@ -7763,12 +7769,10 @@ mod tests {
     }
 
     #[test]
-    fn the_epic_key_opens_its_form_at_the_epics_list_and_nowhere_else() {
+    fn new_uses_the_current_level_not_the_highlighted_row() {
         let (fx, mut app) = app();
         open_the_epic_form(&mut app);
         let surface = app.surface().expect("the form is open");
-        // Three fields: the address it will have, and the pair every creation form
-        // ends with. A float, because none of them holds prose.
         assert_eq!(
             surface
                 .fields()
@@ -7779,45 +7783,80 @@ mod tests {
         );
         assert_eq!(surface.placement(), Placement::Float);
         assert_eq!(surface.focus(), 0);
-        // Several fields, and the key map is told so, which is what binds the keys
-        // that move between them.
         assert_eq!(
             app.mode(),
             surface_mode(Fields::Several, FieldKind::OneLine)
         );
-        // No row is frozen: an epic has no container row to be added from, which is
-        // the whole reason this is not an action inside the mode.
         assert_eq!(app.editing_target(), None);
         app.apply(Action::Unwind).unwrap();
 
-        // And nowhere else. Inside an epic and inside one of its tickets the key
-        // opens nothing and says where an epic is made instead — silence would read
-        // as a broken key, since the key list teaches it without saying where.
-        app.apply(Action::Descend).unwrap(); // into the epic
-        for _ in 0..2 {
-            app.clear_flash();
-            app.apply(Action::CreateEpic).unwrap();
-            assert!(
-                app.surface().is_none(),
-                "a form opened below the epics list: {:?}",
-                app.nav().crumbs()
-            );
-            assert_eq!(
-                app.flash_message(),
-                Some(EPICS_ARE_MADE_FROM_THE_EPICS_LIST),
-                "{:?}",
-                app.nav().crumbs()
-            );
-            to_work_row(&mut app);
-            app.apply(Action::Descend).unwrap(); // into the ticket
-        }
-        // Nothing was created on the way: the key that opened nothing wrote nothing.
+        // Put the cursor on a collection row: the level still belongs to the epic,
+        // so a new ticket cannot be retargeted to that row.
+        to_the_labels_row(&mut app);
+        app.apply(Action::New).unwrap();
+        let surface = app.surface().expect("the epic level opened no ticket form");
+        assert!(surface.title().contains("new ticket on") && surface.title().contains(&fx.epic));
+        app.apply(Action::Unwind).unwrap();
+
+        // The node level is its own container, so the same intent opens the
+        // subticket form even when the cursor rests on that node's assets row.
         to_the_roster(&mut app);
-        assert_eq!(roster_ids(&app), vec![fx.epic.clone()]);
+        app.apply(Action::Descend).unwrap();
+        to_work_row(&mut app);
+        app.apply(Action::Descend).unwrap();
+        to_row(
+            &mut app,
+            |kind| matches!(kind, RowKind::Collection(c) if c.name() == "assets"),
+        );
+        app.apply(Action::New).unwrap();
+        assert!(
+            app.surface()
+                .is_some_and(|surface| surface.title().contains("new subticket on")),
+            "the node level opened no subticket form"
+        );
+        app.apply(Action::Unwind).unwrap();
+
+        for (move_to, expected_title) in [
+            (to_the_labels_row as fn(&mut App), "new label on"),
+            (to_the_comments_row as fn(&mut App), "new comment on"),
+            (to_the_blocked_by_row as fn(&mut App), "new blocker on"),
+        ] {
+            move_to(&mut app);
+            app.apply(Action::Descend).unwrap();
+            app.apply(Action::New).unwrap();
+            assert!(
+                app.surface()
+                    .is_some_and(|surface| surface.title().contains(expected_title)),
+                "{expected_title:?} was not opened at {:?}",
+                app.nav().crumbs()
+            );
+            app.apply(Action::Unwind).unwrap();
+        }
+
+        to_the_assets_row(&mut app);
+        app.apply(Action::Descend).unwrap();
+        app.apply(Action::New).unwrap();
+        assert!(app.surface().is_none(), "assets opened a browser form");
+        assert_eq!(
+            app.flash_message(),
+            Some(asset_add_signpost(&Container::Epic(fx.epic.clone())).as_str())
+        );
     }
 
     #[test]
-    fn the_epic_key_is_the_one_write_the_roster_of_an_empty_store_still_offers() {
+    fn new_is_refused_as_not_an_editing_action() {
+        let (_fx, mut app) = app();
+        freeze_the_epics_row(&mut app);
+        app.apply(Action::New).unwrap();
+        assert!(
+            app.surface().is_none(),
+            "new opened a surface while editing"
+        );
+        assert_eq!(app.flash_message(), Some(NOT_AN_EDITING_ACTION));
+    }
+
+    #[test]
+    fn new_is_the_one_write_the_roster_of_an_empty_store_still_offers() {
         let (_dir, store) = crate::data::fixture::empty_store();
         let mut app = App::new(store, Theme::with_color(false)).unwrap();
         assert!(app.nav().frame().current().is_none());
@@ -7827,8 +7866,8 @@ mod tests {
         // still works where there is nothing to stand on.
         app.apply(Action::EnterEditing).unwrap();
         assert_eq!(app.editing_target(), None);
-        app.apply(Action::CreateEpic).unwrap();
-        assert!(app.surface().is_some(), "the epic key opened no form");
+        app.apply(Action::New).unwrap();
+        assert!(app.surface().is_some(), "the new key opened no form");
 
         fill(&mut app, &["first", "The first effort", ""]);
         app.apply(Action::Accept).unwrap();
@@ -7842,7 +7881,7 @@ mod tests {
     }
 
     #[test]
-    fn the_epic_key_is_as_unavailable_as_every_other_write_while_the_store_refuses_them() {
+    fn new_is_as_unavailable_as_every_other_write_while_the_store_refuses_them() {
         let (fx, mut app) = app();
         turn_read_only_behind_the_browser(&fx, &mut app);
         let reason = app.read_only().expect("the store refuses every write");
@@ -7853,7 +7892,7 @@ mod tests {
         // store the format gate will not let this binary write offers no write at
         // all, and the reason is the store's own words rather than a paraphrase that
         // could go stale.
-        app.apply(Action::CreateEpic).unwrap();
+        app.apply(Action::New).unwrap();
         assert!(
             app.surface().is_none(),
             "a store that may not be written opened a form"
@@ -7865,7 +7904,7 @@ mod tests {
         // well as enters, so the refusal must not outlive the condition.
         crate::data::fixture::turn_writable(&fx.store);
         app.apply(Action::Reload).unwrap();
-        app.apply(Action::CreateEpic).unwrap();
+        app.apply(Action::New).unwrap();
         assert!(app.surface().is_some(), "the form did not come back");
     }
 

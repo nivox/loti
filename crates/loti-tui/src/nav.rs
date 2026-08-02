@@ -14,7 +14,7 @@
 //!     reload that adds or removes siblings leaves the highlight on the same
 //!     ticket rather than on whatever slid into that position.
 
-use crate::data::{Level, Row, Selection};
+use crate::data::{Collection, Container, Level, Row, Selection};
 
 /// One level on the stack: what it lists, how it is named in the breadcrumb,
 /// its rows, and where its cursor sits.
@@ -37,6 +37,29 @@ impl Frame {
     pub fn current(&self) -> Option<&Row> {
         self.rows.get(self.cursor)
     }
+}
+
+/// What the browse-mode new action does at one navigation level.
+///
+/// The target comes from the level, never its highlighted row: the same action
+/// must add to the container on screen even while the cursor rests on one of that
+/// container's existing members.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NewTarget {
+    /// Create an epic at the roster.
+    Epic,
+    /// Create a ticket in this epic.
+    Ticket(Selection),
+    /// Create a subticket in this ticket.
+    Subticket(Selection),
+    /// Add a label to this collection.
+    Label(Selection),
+    /// Add a comment to this collection.
+    Comment(Selection),
+    /// Add a blocker to this dependency list.
+    Blocker(Selection),
+    /// Name the command-line route for attaching an asset to this container.
+    Asset(Container),
 }
 
 /// The whole browser position: a non-empty stack whose first frame is always
@@ -174,14 +197,26 @@ impl Nav {
         matches!(self.frame().level, Level::Collection(..))
     }
 
-    /// Whether the level on screen is the epic roster — the root, and the one
-    /// level whose container is nothing, which is why an epic is created there and
-    /// nowhere else.
+    /// What the browse-mode new action does at the active navigation level.
     ///
-    /// Read off the level rather than off the depth of the stack, so a level that
-    /// merely happens to be the outermost one left cannot answer for it.
-    pub fn at_roster(&self) -> bool {
-        matches!(self.frame().level, Level::Epics)
+    /// Read from the level rather than a row, so moving the cursor cannot retarget
+    /// an addition from a container to one of its existing members.
+    pub fn new_target(&self) -> NewTarget {
+        match &self.frame().level {
+            Level::Epics => NewTarget::Epic,
+            Level::Epic(id) => NewTarget::Ticket(Selection::Epic(id.clone())),
+            Level::Node(reference) => NewTarget::Subticket(Selection::Node(reference.clone())),
+            Level::Collection(container, Collection::Labels) => {
+                NewTarget::Label(Selection::Collection(container.clone(), Collection::Labels))
+            }
+            Level::Collection(container, Collection::Comments) => NewTarget::Comment(
+                Selection::Collection(container.clone(), Collection::Comments),
+            ),
+            Level::Collection(container, Collection::BlockedBy) => NewTarget::Blocker(
+                Selection::Collection(container.clone(), Collection::BlockedBy),
+            ),
+            Level::Collection(container, Collection::Assets) => NewTarget::Asset(container.clone()),
+        }
     }
 
     /// Re-read every level from the store, keeping each cursor on the same
@@ -299,6 +334,60 @@ mod tests {
             .filter(|r| matches!(r.selection, Selection::Epic(_) | Selection::Node(_)))
             .map(|r| r.label.clone())
             .collect()
+    }
+
+    #[test]
+    fn new_target_is_derived_from_the_level_not_the_highlighted_row() {
+        let node = loti_core::domain::NodeRef::new("a", 1);
+        let cases = [
+            (Level::Epics, NewTarget::Epic),
+            (
+                Level::Epic("a".into()),
+                NewTarget::Ticket(Selection::Epic("a".into())),
+            ),
+            (
+                Level::Node(node.clone()),
+                NewTarget::Subticket(Selection::Node(node.clone())),
+            ),
+            (
+                Level::Collection(Container::Epic("a".into()), Collection::Labels),
+                NewTarget::Label(Selection::Collection(
+                    Container::Epic("a".into()),
+                    Collection::Labels,
+                )),
+            ),
+            (
+                Level::Collection(Container::Epic("a".into()), Collection::Comments),
+                NewTarget::Comment(Selection::Collection(
+                    Container::Epic("a".into()),
+                    Collection::Comments,
+                )),
+            ),
+            (
+                Level::Collection(Container::Node(node.clone()), Collection::BlockedBy),
+                NewTarget::Blocker(Selection::Collection(
+                    Container::Node(node.clone()),
+                    Collection::BlockedBy,
+                )),
+            ),
+            (
+                Level::Collection(Container::Epic("a".into()), Collection::Assets),
+                NewTarget::Asset(Container::Epic("a".into())),
+            ),
+        ];
+
+        for (level, expected) in cases {
+            let nav = Nav {
+                stack: vec![Frame {
+                    level,
+                    crumb: "here".into(),
+                    // A member-level cursor cannot change what the level contains.
+                    rows: vec![label_row(Container::Epic("a".into()), "ui")],
+                    cursor: 0,
+                }],
+            };
+            assert_eq!(nav.new_target(), expected);
+        }
     }
 
     /// Put the cursor on the first work row of the level on screen.

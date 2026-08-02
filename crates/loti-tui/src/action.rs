@@ -387,14 +387,14 @@ pub enum Action {
     Reload,
     /// Enter editing mode on the highlighted row.
     EnterEditing,
-    /// Open the form that creates an epic.
+    /// Create or add at the navigation level currently on screen.
     ///
-    /// Not an [`EditingAction`], and deliberately: editing mode acts on a row, and
-    /// an epic has no container row to be added to — the epics list is the one
-    /// level whose container is nothing. So this is the browser's own intent rather
-    /// than a letter a row offers, and whether it is available is answered where it
-    /// is carried out rather than by the offer table every other write passes.
-    CreateEpic,
+    /// The key map carries this one context-free intent. The navigation level
+    /// decides whether it creates an epic, ticket, or subticket, adds metadata, or
+    /// names the command-line asset path; the highlighted row has no say in it.
+    /// It is not an [`EditingAction`]: editing acts on a frozen row, while this
+    /// action acts on the level containing every row on screen.
+    New,
     /// Add a member to the container editing mode is acting on, which opens a
     /// surface to fill in.
     Add,
@@ -494,11 +494,7 @@ pub enum Action {
     /// there is no navigation pane on screen for a reader to expect them to
     /// move something on; and the reflex key inside a field that does not hold
     /// many lines, because the notice would sit over the hint strip for as
-    /// long as it is up, hiding the save key the strip already teaches. A
-    /// third place looks silent and is not: the epic-creation key answers
-    /// with its own notice wherever it is pressed off the epics list, because
-    /// making an epic is exactly what that key is expected to do everywhere
-    /// else in the roster.
+    /// long as it is up, hiding the save key the strip already teaches.
     Unbound,
 }
 

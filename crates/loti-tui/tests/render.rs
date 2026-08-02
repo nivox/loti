@@ -181,27 +181,67 @@ fn the_first_frame_carries_the_breadcrumb_the_panes_and_the_hints() {
 }
 
 #[test]
-fn browse_hints_offer_only_the_writes_the_screen_can_start() {
+fn browse_hints_name_the_new_action_at_every_navigation_level() {
     let (_dir, store) = fixture();
+    // Each collection needs a member to be enterable, so give the two otherwise
+    // empty levels one solely to reach the frame whose footer is under test.
+    ops::add_blocked_by(
+        &store,
+        &NodeRef::new("browser", 1),
+        &[NodeRef::new("browser", 3)],
+    )
+    .unwrap();
+    ops::add_asset(
+        &store,
+        &Target::Epic("browser".into()),
+        "hint.txt",
+        None,
+        b"hint\n",
+    )
+    .unwrap();
     let mut app = App::new(store, Theme::with_color(false)).unwrap();
     let (_t, roster) = draw(&mut app);
-    // The roster can create an epic and has a selected row to edit, so both entry
-    // points lead the droppable strip where an ordinary terminal can show them.
     assert!(roster[23].contains("e edit"), "{:?}", roster[23]);
     assert!(roster[23].contains("N new epic"), "{:?}", roster[23]);
 
     app.apply(Action::Descend).unwrap();
-    let (_t, nested) = draw(&mut app);
-    // An epic can still be edited, but only the roster is a container for a new
-    // epic; a hint must not teach a key whose use here is a refusal.
-    assert!(nested[23].contains("e edit"), "{:?}", nested[23]);
-    assert!(!nested[23].contains("N new epic"), "{:?}", nested[23]);
+    let (_t, epic) = draw(&mut app);
+    assert!(epic[23].contains("e edit"), "{:?}", epic[23]);
+    assert!(epic[23].contains("N new ticket"), "{:?}", epic[23]);
 
-    app.apply(Action::Ascend).unwrap();
+    to_work_row(&mut app);
+    app.apply(Action::Descend).unwrap();
+    let (_t, ticket) = draw(&mut app);
+    assert!(ticket[23].contains("N new subticket"), "{:?}", ticket[23]);
+
+    to_the_roster(&mut app);
+    to_the_labels_row(&mut app);
+    app.apply(Action::Descend).unwrap();
+    let (_t, labels) = draw(&mut app);
+    assert!(labels[23].contains("N add label"), "{:?}", labels[23]);
+
+    to_the_comments_row(&mut app);
+    app.apply(Action::Descend).unwrap();
+    let (_t, comments) = draw(&mut app);
+    assert!(comments[23].contains("N add comment"), "{:?}", comments[23]);
+
+    to_the_roster(&mut app);
+    to_the_blocked_by_row(&mut app);
+    app.apply(Action::Descend).unwrap();
+    let (_t, blockers) = draw(&mut app);
+    assert!(blockers[23].contains("N add blocker"), "{:?}", blockers[23]);
+
+    to_the_roster(&mut app);
+    to_the_assets_row(&mut app);
+    app.apply(Action::Descend).unwrap();
+    let (_t, assets) = draw(&mut app);
+    assert!(!assets[23].contains("N "), "{:?}", assets[23]);
+
+    to_the_roster(&mut app);
     app.apply(Action::ToggleZoom).unwrap();
     let (_t, zoomed) = draw(&mut app);
     // Editing freezes and marks a navigation row, neither of which exists while
-    // zoomed. Epic creation remains a roster action and does not need that pane.
+    // zoomed. New remains a level action and does not need that pane.
     assert!(!zoomed[23].contains("e edit"), "{:?}", zoomed[23]);
     assert!(zoomed[23].contains("N new epic"), "{:?}", zoomed[23]);
 }
@@ -3926,7 +3966,7 @@ fn the_epic_form_is_a_float_of_its_own_fields_and_the_notice_names_what_it_made(
     // key of the browser's own and freezes no row.
     assert!(!browsing[0].contains("EDITING"), "{:?}", browsing[0]);
 
-    app.apply(Action::CreateEpic).unwrap();
+    app.apply(Action::New).unwrap();
     let (after, drawn) = draw(&mut app);
     assert!(!drawn[0].contains("EDITING"), "{:?}", drawn[0]);
     let (before, after) = (cells(&before), cells(&after));

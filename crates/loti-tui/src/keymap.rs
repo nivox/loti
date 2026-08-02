@@ -14,6 +14,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::action::{Action, AnswerWords, Answers, EditingAction, FieldKind, Fields, Mode, Shape};
 use crate::data::FreeForm;
+use crate::nav::NewTarget;
 
 /// The intent a key press carries in a mode, or `None` if it is not bound there.
 pub fn action_for(key: KeyEvent, mode: Mode) -> Option<Action> {
@@ -229,7 +230,7 @@ fn action_for_binding(binding: HelpBinding, key: KeyEvent, mode: Mode) -> Option
         },
         HelpBinding::StartWriting if browsing => match (key.code, ctrl) {
             (KeyCode::Char('e'), false) => Some(Action::EnterEditing),
-            (KeyCode::Char('N'), false) => Some(Action::CreateEpic),
+            (KeyCode::Char('N'), false) => Some(Action::New),
             _ => None,
         },
         HelpBinding::AddDelete if matches!(mode, Mode::Editing) => match (key.code, ctrl) {
@@ -370,7 +371,7 @@ pub const HELP: &[HelpEntry] = &[
     },
     HelpEntry {
         keys: "e / N",
-        description: "edit a row / new epic from epics",
+        description: "edit a row / new at this level",
         requires_write: true,
         binding: HelpBinding::StartWriting,
     },
@@ -463,18 +464,39 @@ pub const FOOTER_HINTS: &[&str] = &[
 /// they apply so an ordinary-width terminal teaches how to begin a write; the
 /// essential pair still wins at widths that cannot hold them.
 const FOOTER_HINT_ENTER_EDITING: &str = "e edit";
-const FOOTER_HINT_CREATE_EPIC: &str = "N new epic";
+
+/// The words for the browse-mode new action at each navigation level.
+///
+/// The navigation model decides the action's target; this table names its one
+/// binding at that target, so a footer cannot teach a different action from the
+/// one the state machine will start.
+fn new_hint(target: &NewTarget) -> Option<&'static str> {
+    match target {
+        NewTarget::Epic => Some("N new epic"),
+        NewTarget::Ticket(_) => Some("N new ticket"),
+        NewTarget::Subticket(_) => Some("N new subticket"),
+        NewTarget::Label(_) => Some("N add label"),
+        NewTarget::Comment(_) => Some("N add comment"),
+        NewTarget::Blocker(_) => Some("N add blocker"),
+        // Assets must be attached through the command line, so the key names that
+        // route when pressed but is not a browser capability the footer teaches.
+        NewTarget::Asset(_) => None,
+    }
+}
 
 /// Browse hints filtered to what the browser can perform at the level on screen.
 /// The state machine owns whether a row exists and whether the store can be
 /// written; this table owns the binding words and their order.
-pub fn footer_hints_browse(can_enter_editing: bool, can_create_epic: bool) -> Vec<&'static str> {
+pub fn footer_hints_browse(
+    can_enter_editing: bool,
+    new_target: Option<&NewTarget>,
+) -> Vec<&'static str> {
     let mut hints = Vec::with_capacity(FOOTER_HINTS.len() + 2);
     if can_enter_editing {
         hints.push(FOOTER_HINT_ENTER_EDITING);
     }
-    if can_create_epic {
-        hints.push(FOOTER_HINT_CREATE_EPIC);
+    if let Some(hint) = new_target.and_then(new_hint) {
+        hints.push(hint);
     }
     hints.extend_from_slice(FOOTER_HINTS);
     hints
@@ -718,28 +740,21 @@ mod tests {
     }
 
     #[test]
-    fn creating_an_epic_is_the_browsers_own_key_and_no_other_key_carries_it() {
-        // An epic has no container row to be added from, so creating one is not a
-        // letter a row offers: it is the browser's own key, bound wherever the
-        // reader is not inside a field. Inside editing mode it carries the same
-        // intent, which that mode does not admit — exactly as the key that enters
-        // the mode does — so the mode answers it rather than the key going dead.
+    fn new_is_the_browsers_context_free_key_and_no_other_key_carries_it() {
+        // The navigation level, not the key map, decides what is made or added.
+        // Editing mode carries the same intent so the mode can refuse it as an
+        // action it does not admit, while a text surface keeps the letter as input.
         for mode in [Mode::Browse, Mode::Editing] {
             let key = plain(KeyCode::Char('N'));
-            assert_eq!(action_for(key, mode), Some(Action::CreateEpic), "{mode:?}");
-            // And nothing else on the board carries it: a key that writes must not
-            // be one stray keystroke away from a key that does not, and the keys
-            // that must not carry it are the list nobody thinks to write down.
+            assert_eq!(action_for(key, mode), Some(Action::New), "{mode:?}");
             for other in every_key().into_iter().filter(|other| *other != key) {
                 assert_ne!(
                     action_for(other, mode),
-                    Some(Action::CreateEpic),
-                    "{other:?} creates an epic in {mode:?}"
+                    Some(Action::New),
+                    "{other:?} carries the new action in {mode:?}"
                 );
             }
         }
-        // Inside a field it is a character like any other letter, so nothing typed
-        // into a buffer can open another one.
         for mode in surface_modes() {
             assert_eq!(
                 action_for(plain(KeyCode::Char('N')), mode),
@@ -747,8 +762,6 @@ mod tests {
                 "{mode:?}"
             );
         }
-        // And no question answers it: a dialog admits the answers it lists and
-        // nothing underneath it may write while one is open.
         for mode in dialog_modes() {
             assert_eq!(
                 action_for(plain(KeyCode::Char('N')), mode),
@@ -767,33 +780,67 @@ mod tests {
     }
 
     #[test]
-    fn browse_write_hints_are_shown_only_where_the_browser_can_start_a_write() {
+    fn browse_write_hints_name_the_new_action_at_each_navigation_level() {
+        let node = loti_core::domain::NodeRef::new("a", 1);
         let cases = [
-            (true, true, vec!["e edit", "N new epic"]),
-            (true, false, vec!["e edit"]),
-            (false, true, vec!["N new epic"]),
-            (false, false, vec![]),
+            (NewTarget::Epic, Some("N new epic")),
+            (
+                NewTarget::Ticket(crate::data::Selection::Epic("a".into())),
+                Some("N new ticket"),
+            ),
+            (
+                NewTarget::Subticket(crate::data::Selection::Node(node.clone())),
+                Some("N new subticket"),
+            ),
+            (
+                NewTarget::Label(crate::data::Selection::Collection(
+                    crate::data::Container::Epic("a".into()),
+                    crate::data::Collection::Labels,
+                )),
+                Some("N add label"),
+            ),
+            (
+                NewTarget::Comment(crate::data::Selection::Collection(
+                    crate::data::Container::Epic("a".into()),
+                    crate::data::Collection::Comments,
+                )),
+                Some("N add comment"),
+            ),
+            (
+                NewTarget::Blocker(crate::data::Selection::Collection(
+                    crate::data::Container::Node(node.clone()),
+                    crate::data::Collection::BlockedBy,
+                )),
+                Some("N add blocker"),
+            ),
+            (
+                NewTarget::Asset(crate::data::Container::Epic("a".into())),
+                None,
+            ),
         ];
-        for (can_enter, can_create, expected) in cases {
-            let hints = footer_hints_browse(can_enter, can_create);
-            for hint in ["e edit", "N new epic"] {
+        for (target, expected_new) in cases {
+            let hints = footer_hints_browse(true, Some(&target));
+            for hint in [
+                "N new epic",
+                "N new ticket",
+                "N new subticket",
+                "N add label",
+                "N add comment",
+                "N add blocker",
+            ] {
                 assert_eq!(
                     hints.contains(&hint),
-                    expected.contains(&hint),
-                    "{can_enter}/{can_create}: {hints:?}"
+                    expected_new == Some(hint),
+                    "{target:?}: {hints:?}"
                 );
             }
         }
-        // The two labels are derived from the bindings the reader presses, so a
-        // strip entry cannot teach a key that does nothing in browse mode.
+        assert_eq!(footer_hints_browse(false, None), FOOTER_HINTS);
         assert_eq!(
             action_for(key_named("e"), Mode::Browse),
             Some(Action::EnterEditing)
         );
-        assert_eq!(
-            action_for(key_named("N"), Mode::Browse),
-            Some(Action::CreateEpic)
-        );
+        assert_eq!(action_for(key_named("N"), Mode::Browse), Some(Action::New));
     }
 
     #[test]

@@ -697,7 +697,10 @@ fn footer(app: &App, width: u16) -> Span<'static> {
                         app.read_only().is_none()
                             && !app.zoomed()
                             && app.nav().frame().current().is_some(),
-                        app.read_only().is_none() && app.nav().crumbs().len() == 1,
+                        app.read_only()
+                            .is_none()
+                            .then(|| app.nav().new_target())
+                            .as_ref(),
                     ),
                     keymap::FOOTER_ESSENTIAL,
                 ),
@@ -1542,11 +1545,11 @@ mod tests {
     fn strips() -> Vec<(Vec<&'static str>, &'static [&'static str])> {
         let mut strips = vec![
             (
-                keymap::footer_hints_browse(true, true),
+                keymap::footer_hints_browse(true, Some(&crate::nav::NewTarget::Epic)),
                 keymap::FOOTER_ESSENTIAL,
             ),
             (
-                keymap::footer_hints_browse(false, false),
+                keymap::footer_hints_browse(false, None),
                 keymap::FOOTER_ESSENTIAL,
             ),
             (
