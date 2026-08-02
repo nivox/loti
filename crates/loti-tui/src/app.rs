@@ -4004,14 +4004,16 @@ mod tests {
                 Constraint::Length(1),
             ])
             .split(area);
-        let panes = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(app.nav_percent()),
-                Constraint::Percentage(100 - app.nav_percent()),
-            ])
-            .split(chunks[1]);
-        let preview = panes[1];
+        let preview = match app.zoomed() {
+            true => chunks[1],
+            false => Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Percentage(app.nav_percent()),
+                    Constraint::Percentage(100 - app.nav_percent()),
+                ])
+                .split(chunks[1])[1],
+        };
 
         (preview.y..preview.y + preview.height)
             .map(|y| {
@@ -4022,6 +4024,39 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    /// Assert the preview's document rows advanced exactly one visible line.
+    ///
+    /// Borders stay fixed, so the first document row after a down-scroll must be
+    /// the second one before it. The last row is omitted because it has no prior
+    /// row to compare. The scrollbar is omitted because its marker changes as the
+    /// viewport moves; this is a frame claim, not an inspection of a scroll offset.
+    fn assert_preview_scrolled_down_one_line(before: &[String], after: &[String]) {
+        assert!(
+            before.len() >= 4,
+            "the preview is too short to observe a line scroll"
+        );
+        let without_scrollbar = |lines: &[String], rows: std::ops::Range<usize>| {
+            lines[rows]
+                .iter()
+                .map(|line| {
+                    line.chars()
+                        .take(line.chars().count().saturating_sub(1))
+                        .collect()
+                })
+                .collect::<Vec<String>>()
+        };
+        assert_eq!(
+            without_scrollbar(after, 1..after.len() - 2),
+            without_scrollbar(before, 2..before.len() - 1),
+            "wheel-down did not advance the preview by exactly one line"
+        );
+    }
+
+    /// Assert the preview's document rows retreated exactly one visible line.
+    fn assert_preview_scrolled_up_one_line(before: &[String], after: &[String]) {
+        assert_preview_scrolled_down_one_line(after, before);
     }
 
     /// The store's own words for a write it refuses by rule, taken from the seam
@@ -4209,10 +4244,31 @@ mod tests {
             lower, top,
             "the fixture's preview is not tall enough for wheel-down to move it"
         );
+        assert_preview_scrolled_down_one_line(&top, &lower);
         assert_eq!(
             app.nav().frame().current().map(|row| &row.selection),
             Some(&selected),
             "wheel-down changed the browse selection"
+        );
+
+        // The second down and first up happen away from the top, where an overly
+        // large up-scroll cannot hide behind the viewer clamping at its boundary.
+        app.apply(Action::WheelDown).unwrap();
+        let lower_again = preview_lines(&mut app, width, height);
+        assert_preview_scrolled_down_one_line(&lower, &lower_again);
+        assert_eq!(
+            app.nav().frame().current().map(|row| &row.selection),
+            Some(&selected),
+            "wheel-down changed the browse selection"
+        );
+        app.apply(Action::WheelUp).unwrap();
+        let raised = preview_lines(&mut app, width, height);
+        assert_preview_scrolled_up_one_line(&lower_again, &raised);
+        assert_eq!(raised, lower, "wheel-up did not restore the prior viewport");
+        assert_eq!(
+            app.nav().frame().current().map(|row| &row.selection),
+            Some(&selected),
+            "wheel-up changed the browse selection"
         );
 
         app.apply(Action::WheelUp).unwrap();
@@ -4224,7 +4280,50 @@ mod tests {
         assert_eq!(
             app.nav().frame().current().map(|row| &row.selection),
             Some(&selected),
-            "wheel-up changed the browse selection"
+            "a wheel changed the browse selection"
+        );
+    }
+
+    #[test]
+    fn a_wheel_scrolls_the_zoomed_preview_without_moving_the_hidden_cursor() {
+        let (_fx, mut app) = app();
+        app.apply(Action::Descend).unwrap();
+        let cursor = app.nav().cursor();
+        let selected = app
+            .nav()
+            .frame()
+            .current()
+            .expect("the epic level has a selected row")
+            .selection
+            .clone();
+        let crumbs: Vec<String> = app.nav().crumbs().iter().map(ToString::to_string).collect();
+        app.apply(Action::ToggleZoom).unwrap();
+
+        let (width, height) = (40, 10);
+        let top = preview_lines(&mut app, width, height);
+        app.apply(Action::WheelDown).unwrap();
+        let lower = preview_lines(&mut app, width, height);
+        assert_ne!(lower, top, "wheel-down did not scroll the zoomed preview");
+        assert_preview_scrolled_down_one_line(&top, &lower);
+
+        app.apply(Action::WheelUp).unwrap();
+        let raised = preview_lines(&mut app, width, height);
+        assert_preview_scrolled_up_one_line(&lower, &raised);
+        assert_eq!(raised, top, "wheel-up did not restore the zoomed preview");
+        assert_eq!(
+            app.nav().cursor(),
+            cursor,
+            "a wheel moved the hidden cursor"
+        );
+        assert_eq!(
+            app.nav().frame().current().map(|row| &row.selection),
+            Some(&selected),
+            "a wheel changed the hidden selection"
+        );
+        assert_eq!(
+            app.nav().crumbs(),
+            crumbs,
+            "a wheel changed the hidden navigation level"
         );
     }
 
