@@ -331,7 +331,15 @@ fn run_migrate_store<O: Write, E: Write>(
 /// mutations are refused later, by the store's mutation gate.
 fn open_store<E: Write>(cli: &Cli, err: &mut E) -> Result<Store> {
     let start = std::env::current_dir().context("determining the current directory")?;
-    let discovered = loti_core::discovery::resolve(&start, cli.root.as_deref())?;
+    Ok(open_store_at(cli, &start, err)?.0)
+}
+
+/// Open a store from an already-observed starting directory and retain the
+/// project directory discovery selected alongside its container. Agent launch
+/// needs both: the store serves the target, while the project directory is its
+/// default working directory.
+fn open_store_at<E: Write>(cli: &Cli, start: &Path, err: &mut E) -> Result<(Store, PathBuf)> {
+    let discovered = loti_core::discovery::resolve(start, cli.root.as_deref())?;
     if let Some(d) = &discovered.disagreement {
         writeln!(
             err,
@@ -343,7 +351,7 @@ fn open_store<E: Write>(cli: &Cli, err: &mut E) -> Result<Store> {
     }
     let store = Store::at(discovered.root);
     store.verify_readable().map_err(|e| anyhow!("{e}"))?;
-    Ok(store)
+    Ok((store, discovered.project_root))
 }
 
 // ---------------------------------------------------------------------------
@@ -1274,12 +1282,12 @@ fn run_agent_launch<E: Write>(
         bail!("agent launch requires stdin, stdout, and stderr to be terminals");
     }
 
-    let store = open_store(cli, err)?;
+    let (store, project_root) = open_store_at(cli, &runtime.current_directory, err)?;
     let target = resolve_launch_target(&store, &args.target)?;
     let profile = resolve_launch_profile(&store, &args.agent)?;
     let workflow = resolve_launch_workflow(&store, &args.workflow)?;
     let caller = CallerContext {
-        project_root: store.root().to_path_buf(),
+        project_root,
         current_directory: runtime.current_directory.clone(),
         env: runtime.environment.clone(),
     };

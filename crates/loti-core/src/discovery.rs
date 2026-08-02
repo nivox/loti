@@ -38,12 +38,16 @@ struct Config {
     match_impl: toml::Table,
 }
 
-/// A resolved store container, plus whether discovery saw the two markers
-/// disagree.
+/// A resolved store container and its project directory, plus whether discovery
+/// saw the two markers disagree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Discovered {
     /// The resolved store container directory.
     pub root: PathBuf,
+    /// The directory whose marker selected this store. Agent launches begin here
+    /// by default; it remains distinct from the store container for `.loti` and
+    /// external `.loti.conf` stores.
+    pub project_root: PathBuf,
     /// Set when a single level held both a config file and a `.loti` directory
     /// that named different containers; the config file's container was taken.
     /// A caller should warn the user.
@@ -92,6 +96,7 @@ pub fn resolve(start: &Path, override_root: Option<&Path>) -> Result<Discovered,
     if let Some(root) = override_root {
         return Ok(Discovered {
             root: root.to_path_buf(),
+            project_root: root.to_path_buf(),
             disagreement: None,
         });
     }
@@ -123,6 +128,7 @@ pub fn discover(start: &Path) -> Result<Discovered, DiscoveryError> {
             };
             return Ok(Discovered {
                 root: config_root,
+                project_root: dir.to_path_buf(),
                 disagreement,
             });
         }
@@ -132,6 +138,7 @@ pub fn discover(start: &Path) -> Result<Discovered, DiscoveryError> {
             // epic dirs. Return it directly, not its parent.
             return Ok(Discovered {
                 root: marker,
+                project_root: dir.to_path_buf(),
                 disagreement: None,
             });
         }
@@ -199,11 +206,12 @@ mod tests {
     }
 
     #[test]
-    fn override_wins_without_walking() {
+    fn explicit_root_is_both_container_and_project_directory() {
         let dir = tempfile::tempdir().unwrap();
         let forced = dir.path().join("elsewhere");
         let found = resolve(dir.path(), Some(&forced)).unwrap();
         assert_eq!(found.root, forced);
+        assert_eq!(found.project_root, forced);
         assert!(found.disagreement.is_none());
     }
 
@@ -217,6 +225,7 @@ mod tests {
         let found = discover(&nested).unwrap();
         // The `.loti` directory *is* the container, not its parent.
         assert_eq!(found.root, base.join(MARKER_DIR));
+        assert_eq!(found.project_root, base);
     }
 
     #[test]
@@ -226,6 +235,7 @@ mod tests {
         std::fs::write(base.join(CONFIG_FILE), "loti-root = \"data\"\n").unwrap();
         let found = discover(&base).unwrap();
         assert_eq!(found.root, base.join("data"));
+        assert_eq!(found.project_root, base);
     }
 
     #[test]
@@ -240,6 +250,7 @@ mod tests {
         .unwrap();
         let found = discover(&base).unwrap();
         assert_eq!(found.root, target);
+        assert_eq!(found.project_root, base);
     }
 
     #[test]
@@ -251,6 +262,7 @@ mod tests {
         let found = discover(&base).unwrap();
         // The config file's container is taken.
         assert_eq!(found.root, base.join("data"));
+        assert_eq!(found.project_root, base);
         // And the disagreement with the sibling `.loti` container is reported;
         // the marker container is the `.loti` directory itself.
         let disagreement = found.disagreement.expect("expected a disagreement");

@@ -72,8 +72,13 @@ pub fn run(root: Option<&Path>) -> Result<()> {
     if !io::stdout().is_terminal() {
         bail!("the browser needs an interactive terminal; it cannot be piped or redirected");
     }
-    let store = data::open(root)?;
-    let app = App::new(store, Theme::from_env())?;
+    let opened = data::open(root)?;
+    let app = App::at_project_root(
+        opened.store,
+        Theme::from_env(),
+        opened.project_root,
+        opened.current_directory,
+    )?;
 
     let mut terminal = enter()?;
     let outcome = event_loop(&mut terminal, app);
@@ -1300,7 +1305,7 @@ mod tests {
     #[test]
     fn a_zero_exit_runs_the_prepared_payload_and_restores_the_browser_silently() {
         for target in [QueuedTarget::Epic, QueuedTarget::Ticket] {
-            let (fixture, _resources, mut app) = queued_agent(target);
+            let (fixture, resources, mut app) = queued_agent(target);
             let (kind, reference) = match target {
                 QueuedTarget::Epic => ("epic", fixture.epic.clone()),
                 QueuedTarget::Ticket => (
@@ -1326,7 +1331,7 @@ mod tests {
                 })
                 .expect("the child was not run");
             assert_eq!(plan.program, "agent");
-            assert_eq!(plan.cwd, fixture.store.root());
+            assert_eq!(plan.cwd, resources.path());
             assert_eq!(
                 plan.env.get(loti_core::launch::SESSION_ENV_VAR),
                 Some(&reference)

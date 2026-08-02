@@ -735,10 +735,30 @@ fn shell_quote(value: &str) -> String {
 /// not a bypass of terminal detection.
 #[cfg(unix)]
 fn pty_run(s: &Store, args: &[&str], env: &[(&str, &str)]) -> Output {
+    pty_run_with_root(s.root(), s, args, env)
+}
+
+#[cfg(unix)]
+fn pty_run_with_root(start: &Path, store: &Store, args: &[&str], env: &[(&str, &str)]) -> Output {
     let loti = assert_cmd::cargo::cargo_bin("loti");
     let mut words = vec![loti.to_string_lossy().into_owned(), "--root".to_string()];
-    words.push(s.root().display().to_string());
+    words.push(store.root().display().to_string());
     words.extend(args.iter().map(|arg| (*arg).to_string()));
+    pty_run_words(start, words, env)
+}
+
+/// Run without `--root`, from a directory whose marker/config must select the
+/// store and project directory.
+#[cfg(unix)]
+fn pty_run_discovered(start: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let loti = assert_cmd::cargo::cargo_bin("loti");
+    let mut words = vec![loti.to_string_lossy().into_owned()];
+    words.extend(args.iter().map(|arg| (*arg).to_string()));
+    pty_run_words(start, words, env)
+}
+
+#[cfg(unix)]
+fn pty_run_words(start: &Path, words: Vec<String>, env: &[(&str, &str)]) -> Output {
     let direct_command = words
         .iter()
         .map(|word| shell_quote(word))
@@ -748,6 +768,7 @@ fn pty_run(s: &Store, args: &[&str], env: &[(&str, &str)]) -> Output {
     // own, so equality proves loti replaced itself rather than wrapping a child.
     let command = format!("export LOTI_TEST_EXPECTED_PID=$$; exec {direct_command}");
     let mut script = Command::new("script");
+    script.current_dir(start);
     script.args(["-qefc", &command, "/dev/null"]);
     script.env("NO_COLOR", "1");
     for (key, value) in env {
@@ -826,7 +847,7 @@ fn nul_fields(path: &Path) -> Vec<String> {
 
 #[cfg(unix)]
 #[test]
-fn agent_run_replaces_itself_with_the_direct_ticket_child_and_preserves_its_payload() {
+fn agent_run_with_explicit_root_replaces_itself_and_uses_the_override_directory() {
     let s = Store::new();
     s.epic("epic");
     let ticket = s.ticket("epic", "ticket target");
@@ -842,7 +863,8 @@ fn agent_run_replaces_itself_with_the_direct_ticket_child_and_preserves_its_payl
     write_workflow(&workflows, "review", "follow this workflow");
     let record = fixture_dir.path().join("record");
 
-    let output = pty_run(
+    let output = pty_run_with_root(
+        fixture_dir.path(),
         &s,
         &[
             "agent",
@@ -876,6 +898,84 @@ fn agent_run_replaces_itself_with_the_direct_ticket_child_and_preserves_its_payl
     assert_eq!(fields[8], "review");
     assert_eq!(&fields[9..12], ["yes", "yes", "yes"]);
     assert_eq!(fields[12], fields[13], "loti did not replace itself");
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_run_from_a_marker_starts_the_child_in_the_marker_directory() {
+    let store = Store::new_discovered();
+    store.epic("epic");
+    let global = GlobalRoot::new();
+    let fixture_dir = tempfile::tempdir().unwrap();
+    let fixture = launch_fixture(fixture_dir.path());
+    write_launch_profile(
+        &global.agents(),
+        "profile",
+        &fixture,
+        "[\"{{ loti_prompt }}\"]",
+    );
+    write_workflow(&global.workflows(), "review", "follow this workflow");
+    let record = fixture_dir.path().join("record");
+    let xdg = global.env();
+
+    let output = pty_run_discovered(
+        store.root(),
+        &[
+            "agent",
+            "run",
+            "epic",
+            "--agent",
+            "profile",
+            "--workflow",
+            "review",
+        ],
+        &[xdg[0], ("LOTI_TEST_RECORD", record.to_str().unwrap())],
+    );
+
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert_eq!(nul_fields(&record)[1], store.root().display().to_string());
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_run_from_a_config_starts_the_child_in_the_config_directory() {
+    let store = Store::new();
+    store.epic("epic");
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join(".loti.conf"),
+        format!("loti-root = \"{}\"\n", store.root().display()),
+    )
+    .unwrap();
+    let global = GlobalRoot::new();
+    let fixture_dir = tempfile::tempdir().unwrap();
+    let fixture = launch_fixture(fixture_dir.path());
+    write_launch_profile(
+        &global.agents(),
+        "profile",
+        &fixture,
+        "[\"{{ loti_prompt }}\"]",
+    );
+    write_workflow(&global.workflows(), "review", "follow this workflow");
+    let record = fixture_dir.path().join("record");
+    let xdg = global.env();
+
+    let output = pty_run_discovered(
+        project.path(),
+        &[
+            "agent",
+            "run",
+            "epic",
+            "--agent",
+            "profile",
+            "--workflow",
+            "review",
+        ],
+        &[xdg[0], ("LOTI_TEST_RECORD", record.to_str().unwrap())],
+    );
+
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert_eq!(nul_fields(&record)[1], project.path().display().to_string());
 }
 
 #[cfg(unix)]

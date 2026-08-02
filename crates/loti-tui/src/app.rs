@@ -1797,6 +1797,10 @@ pub struct App {
     /// it to `data` and never calls it, so store access remains in one module
     /// without a wrapper that adds no behaviour.
     store: Store,
+    /// The directory whose discovery marker selected this store. It is distinct
+    /// from the container when a project keeps tracker data in `.loti` or an
+    /// external location.
+    project_root: PathBuf,
     /// The directory resource discovery starts from. It is captured without
     /// reading configuration so `w`, not rendering or startup, owns discovery.
     working_directory: PathBuf,
@@ -1851,15 +1855,30 @@ pub struct App {
 impl App {
     /// Open the browser on a store, positioned at the epic roster.
     pub fn new(store: Store, theme: Theme) -> Result<Self> {
-        Self::at_working_directory(store, theme, std::env::current_dir()?)
+        let working_directory = std::env::current_dir()?;
+        Self::at_project_root(store, theme, working_directory.clone(), working_directory)
     }
 
     /// Open the browser with resource discovery rooted at `working_directory`.
-    /// The directory is a caller input rather than a cached catalog: configuration
-    /// and resource files are still read only when the workflow action is invoked.
+    /// Callers that have not retained discovery use that directory for both
+    /// launch and resource roots; discovery-aware callers use
+    /// [`Self::at_project_root`] to keep them distinct.
     pub fn at_working_directory(
         store: Store,
         theme: Theme,
+        working_directory: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        let working_directory = working_directory.into();
+        Self::at_project_root(store, theme, working_directory.clone(), working_directory)
+    }
+
+    /// Open the browser with its discovery-selected project directory and its
+    /// current directory kept independently. Resource discovery stays rooted at
+    /// the latter, while an agent's default working directory uses the former.
+    pub fn at_project_root(
+        store: Store,
+        theme: Theme,
+        project_root: impl Into<PathBuf>,
         working_directory: impl Into<PathBuf>,
     ) -> Result<Self> {
         let rows = data::rows(&store, &Level::Epics)?;
@@ -1868,6 +1887,7 @@ impl App {
         let read_only = data::read_only(&store);
         Ok(Self {
             store,
+            project_root: project_root.into(),
             working_directory: working_directory.into(),
             nav: Nav::new(rows),
             theme,
@@ -1949,7 +1969,7 @@ impl App {
         environment: BTreeMap<String, String>,
     ) -> Result<launch::LaunchPlan> {
         data::prepare_agent_launch(
-            &self.store,
+            &self.project_root,
             &self.working_directory,
             &request.target,
             &request.workflow,

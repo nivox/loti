@@ -12,6 +12,8 @@
 //! markdown, so which core call backs a screen — and whether an operation reads
 //! or writes — never leaks into the navigation model or drawing code.
 
+use std::path::PathBuf;
+
 use anyhow::{Context, Result};
 use jiff::Timestamp;
 use loti_core::domain::{EpicStatus, NodeRef};
@@ -449,17 +451,32 @@ pub fn read_only(store: &Store) -> Option<ReadOnly> {
     }
 }
 
+/// The TUI's opening context. The store container serves tracker reads, while
+/// launch preparation needs the project directory that discovery selected.
+pub struct OpenedStore {
+    /// The resolved tracker store container.
+    pub store: Store,
+    /// The directory containing the marker that selected the store.
+    pub project_root: PathBuf,
+    /// The TUI's process directory, retained for resource discovery and template rendering.
+    pub current_directory: PathBuf,
+}
+
 /// Open the store for the current directory, honouring an explicit root the
 /// same way every other surface does, and refuse a format this binary cannot
 /// read before any screen is drawn.
-pub fn open(root: Option<&std::path::Path>) -> Result<Store> {
-    let start = std::env::current_dir()?;
-    let discovered = loti_core::discovery::resolve(&start, root)?;
+pub fn open(root: Option<&std::path::Path>) -> Result<OpenedStore> {
+    let current_directory = std::env::current_dir()?;
+    let discovered = loti_core::discovery::resolve(&current_directory, root)?;
     let store = Store::at(discovered.root);
     store
         .verify_readable()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(store)
+    Ok(OpenedStore {
+        store,
+        project_root: discovered.project_root,
+        current_directory,
+    })
 }
 
 /// The two effective-resource roots used by agent selection and preparation.
@@ -560,11 +577,11 @@ pub fn agent_picker(
 /// without changing the tracker. The picker only carried ids, so resolving here
 /// detects a resource that disappeared or became invalid while it was open.
 ///
-/// The caller context is assembled at the store seam because its project root
-/// belongs to the store. The state machine supplies the opaque handle and its
-/// working directory without inspecting either store state or store paths.
+/// The caller context is assembled at the store seam from discovery's project
+/// directory. The state machine supplies opaque paths without inspecting store
+/// state or resource configuration.
 pub fn prepare_agent_launch(
-    store: &Store,
+    project_root: &std::path::Path,
     start: &std::path::Path,
     target: &launch::Target,
     workflow: &ResourceId,
@@ -572,7 +589,7 @@ pub fn prepare_agent_launch(
     environment: std::collections::BTreeMap<String, String>,
 ) -> Result<launch::LaunchPlan> {
     let caller = launch::CallerContext {
-        project_root: store.root().to_path_buf(),
+        project_root: project_root.to_path_buf(),
         current_directory: start.to_path_buf(),
         env: environment,
     };
@@ -3211,12 +3228,12 @@ mod tests {
         assert!(subnode.frontmatter.blocked_by.is_empty());
     }
 
-    /// Launch preparation belongs at the store seam because a rendered working
-    /// directory and the `project_root` template derive from the store, not from
-    /// the browser state machine's resource directory.
+    /// Resource discovery uses the browser's current directory, while launch
+    /// preparation receives the separate project directory discovery selected.
     #[test]
-    fn launch_preparation_derives_project_root_from_the_store() {
+    fn launch_preparation_keeps_project_and_store_directories_distinct() {
         let fixture = Fixture::build();
+        let project = tempfile::tempdir().unwrap();
         let resources = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(resources.path().join("workflows")).unwrap();
         std::fs::create_dir_all(resources.path().join("agents")).unwrap();
@@ -3239,7 +3256,7 @@ mod tests {
         let picker =
             agent_picker(&fixture.store, &fixture.epic_selection(), resources.path()).unwrap();
         let plan = prepare_agent_launch(
-            &fixture.store,
+            project.path(),
             resources.path(),
             &picker.target,
             &picker.workflows[0].id,
@@ -3248,7 +3265,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(plan.cwd, fixture.store.root());
+        assert_eq!(plan.cwd, project.path());
     }
 
     #[test]
