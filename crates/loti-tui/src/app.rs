@@ -3767,6 +3767,38 @@ mod tests {
         assert!(app.editing_target().is_some());
     }
 
+    #[test]
+    fn prepared_agent_uses_the_project_root_without_losing_its_browser_directory() {
+        let fixture = Fixture::build();
+        let project = tempfile::tempdir().unwrap();
+        let browser = AgentResourceFixture::new();
+        browser.add_local_resources(true, true);
+        std::fs::write(
+            browser.path().join("agents").join("000-picker-agent.toml"),
+            "command = \"agent\"\nargs = [\"{{ loti_prompt }}\", \"{{ current_directory }}\"]\n",
+        )
+        .unwrap();
+        let mut app = App::at_project_root(
+            fixture.store.clone(),
+            Theme::with_color(false),
+            project.path(),
+            browser.path(),
+        )
+        .unwrap();
+
+        freeze_the_epics_row(&mut app);
+        app.apply(Action::RunAgent).unwrap();
+        app.apply(Action::Accept).unwrap();
+        let request = app.take_launch_request().expect("accept queued no request");
+        assert_eq!(request.workflow.as_str(), "000-picker-workflow");
+        assert_eq!(request.profile.as_str(), "000-picker-agent");
+
+        let plan = app.prepare_agent_launch(&request, BTreeMap::new()).unwrap();
+        assert_ne!(project.path(), browser.path(), "fixture paths must differ");
+        assert_eq!(plan.cwd, project.path());
+        assert_eq!(plan.args[1], browser.path().display().to_string());
+    }
+
     /// Open the body buffer, the way a reader does: freeze the epic's row and press
     /// the letter that edits its long-form text.
     fn open_the_body_buffer(app: &mut App) {
