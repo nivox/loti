@@ -50,6 +50,9 @@
           pname = "loti";
           inherit version src;
           cargoLock.lockFile = ./Cargo.lock;
+          # Agent-launch conformance tests allocate a pseudo-terminal with
+          # util-linux's `script` command.
+          nativeCheckInputs = [ pkgs.util-linux ];
           meta = {
             description = "loti (LOcal TIckets) — markdown-backed local ticketing CLI";
             mainProgram = "loti";
@@ -60,7 +63,7 @@
         packages.loti = loti;
 
         devShells.default = pkgs.mkShell {
-          packages = [ rustToolchain ];
+          packages = [ rustToolchain pkgs.util-linux ];
           # Static-link the CRT for the musl release targets (Linux only; the
           # vars are simply unused elsewhere).
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS = "-C target-feature=+crt-static";
