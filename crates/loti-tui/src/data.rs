@@ -621,29 +621,26 @@ pub fn rows(store: &Store, level: &Level) -> Result<Vec<Row>> {
         Level::Epic(id) => {
             let container = Container::Epic(id.clone());
             let mut out = collection_rows(store, &container)?;
-            out.extend(child_rows(store, read::epic_children(store, id)?)?);
+            out.extend(child_rows(read::epic_children(store, id)?)?);
             Ok(out)
         }
         Level::Node(r) => {
             let container = Container::Node(r.clone());
             let mut out = collection_rows(store, &container)?;
-            out.extend(child_rows(store, read::node_children(store, r)?)?);
+            out.extend(child_rows(read::node_children(store, r)?)?);
             Ok(out)
         }
         Level::Collection(container, kind) => member_rows(store, container, *kind),
     }
 }
 
-/// Turn a core children listing into rows, resolving each child's own child
-/// count so the level can be drawn without a second pass.
-///
-/// The holder comes off the listing rather than from a read per child: a node can
-/// have many children, so one call answers for all of them.
-fn child_rows(store: &Store, children: Vec<render::ChildRow>) -> Result<Vec<Row>> {
+/// Turn a core children listing into rows using the direct child count already
+/// carried by each listing row. The function takes no store, so it cannot grow a
+/// read per child while deciding what is below a row.
+fn child_rows(children: Vec<render::ChildRow>) -> Result<Vec<Row>> {
     let mut out = Vec::new();
     for child in children {
         let node_ref = NodeRef::parse(&child.reference)?;
-        let grandchildren = read::node_children(store, &node_ref)?.len();
         out.push(Row {
             label: node_ref.number.to_string(),
             selection: Selection::Node(node_ref),
@@ -652,44 +649,69 @@ fn child_rows(store: &Store, children: Vec<render::ChildRow>) -> Result<Vec<Row>
                 claimed_by: child.claimed_by,
             },
             name: child.name,
-            children: grandchildren,
+            children: child.children,
         });
     }
     Ok(out)
+}
+
+/// Counts for every collection a container may offer. A normal level needs all
+/// of them, so they come from one parsed container rather than one read apiece.
+struct CollectionCounts {
+    labels: usize,
+    comments: usize,
+    blocked_by: usize,
+    assets: usize,
+}
+
+impl CollectionCounts {
+    /// The count for this collection. Tombstones count as comments because their
+    /// rows remain visible in the collection level.
+    fn for_collection(&self, kind: Collection) -> usize {
+        match kind {
+            Collection::Labels => self.labels,
+            Collection::Comments => self.comments,
+            Collection::BlockedBy => self.blocked_by,
+            Collection::Assets => self.assets,
+        }
+    }
 }
 
 /// A container's collection rows: one per collection it carries, present
 /// whether or not it has members, so there is always a row to stand on.
 fn collection_rows(store: &Store, container: &Container) -> Result<Vec<Row>> {
-    let mut out = Vec::new();
-    for kind in container.collections() {
-        out.push(Row {
+    let counts = match container {
+        Container::Epic(id) => {
+            let epic = ops::read_epic(store, id)?;
+            CollectionCounts {
+                labels: epic.frontmatter.labels.len(),
+                comments: epic.frontmatter.comments.len(),
+                blocked_by: 0,
+                assets: epic.frontmatter.assets.len(),
+            }
+        }
+        Container::Node(reference) => {
+            let node = ops::read_node(store, reference)?;
+            CollectionCounts {
+                labels: node.frontmatter.labels.len(),
+                comments: node.frontmatter.comments.len(),
+                blocked_by: node.frontmatter.blocked_by.len(),
+                assets: node.frontmatter.assets.len(),
+            }
+        }
+    };
+
+    Ok(container
+        .collections()
+        .iter()
+        .map(|kind| Row {
             selection: Selection::Collection(container.clone(), *kind),
             kind: RowKind::Collection(*kind),
             label: String::new(),
             name: kind.name().to_string(),
-            children: collection_len(store, container, *kind)?,
-        });
-    }
-    Ok(out)
-}
-
-/// How many members a collection has — the count on its row, which must be what
-/// entering the row reveals and nothing else.
-fn collection_len(store: &Store, container: &Container, kind: Collection) -> Result<usize> {
-    let target = container.target();
-    Ok(match kind {
-        Collection::Labels => ops::list_labels(store, &target)?.len(),
-        // Tombstones are listed, so they are counted: the count promises how
-        // many rows are below, not how many comments can still be read.
-        Collection::Comments => ops::list_comments(store, &target, true)?.len(),
-        Collection::BlockedBy => match container {
-            Container::Node(r) => ops::list_blocked_by(store, r)?.len(),
-            // An epic carries no dependency list, so it is never offered one.
-            Container::Epic(_) => 0,
-        },
-        Collection::Assets => ops::list_assets(store, &target)?.len(),
-    })
+            children: counts.for_collection(*kind),
+        })
+        .collect())
 }
 
 /// The members of one collection, in stored order.
@@ -3157,6 +3179,34 @@ mod tests {
     }
 
     #[test]
+    fn children_listing_counts_become_work_row_counts() {
+        let rows = child_rows(vec![
+            render::ChildRow {
+                reference: "feature/7".to_string(),
+                name: "branch".to_string(),
+                status: "to-do".to_string(),
+                claimed_by: None,
+                children: 3,
+            },
+            render::ChildRow {
+                reference: "feature/8".to_string(),
+                name: "leaf".to_string(),
+                status: "to-do".to_string(),
+                claimed_by: None,
+                children: 0,
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.label.as_str(), row.name.as_str(), row.children))
+                .collect::<Vec<_>>(),
+            [("7", "branch", 3), ("8", "leaf", 0)]
+        );
+    }
+
+    #[test]
     fn every_epic_and_node_level_leads_with_its_collections() {
         let fx = Fixture::build();
         let store = &fx.store;
@@ -3242,14 +3292,16 @@ mod tests {
         )
         .unwrap();
 
+        let parent_rows = rows(store, &Level::Node(fx.node.clone())).unwrap();
         for kind in container.collections() {
             let level = Level::Collection(container.clone(), *kind);
             let members = rows(store, &level).unwrap();
+            let collection_row = parent_rows
+                .iter()
+                .find(|row| row.selection == Selection::Collection(container.clone(), *kind))
+                .expect("the container lists every collection");
             // The count on the collection row is exactly what entering it shows.
-            assert_eq!(
-                members.len(),
-                collection_len(store, &container, *kind).unwrap()
-            );
+            assert_eq!(members.len(), collection_row.children);
             assert!(
                 !members.is_empty(),
                 "the fixture populates every collection"

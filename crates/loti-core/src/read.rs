@@ -8,6 +8,7 @@
 //! richer filter families (label/state/match) are a separate layer that will
 //! narrow the set this module resolves before it is rendered.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde_json::Value;
@@ -36,29 +37,21 @@ pub fn epic_json(store: &Store, epic_id: &str) -> Result<Value, OpError> {
 }
 
 /// The direct children of a node, as rows in ascending order, each carrying its
-/// holder when claimed.
+/// holder when claimed and its own direct child count.
 pub fn node_children(store: &Store, node_ref: &NodeRef) -> Result<Vec<ChildRow>, OpError> {
     let nodes = load_epic_nodes(store, &node_ref.epic_id)?;
-    let mut rows: Vec<(u64, ChildRow)> = nodes
-        .iter()
-        .filter(|n| n.frontmatter.parent == Some(node_ref.number))
-        .map(|n| (n.frontmatter.number, child_row(&node_ref.epic_id, n)))
-        .collect();
-    rows.sort_by_key(|(number, _)| *number);
-    Ok(rows.into_iter().map(|(_, r)| r).collect())
+    Ok(direct_children(
+        &node_ref.epic_id,
+        &nodes,
+        Some(node_ref.number),
+    ))
 }
 
 /// The top-level nodes of an epic (those with no parent), as rows, each
-/// carrying its holder when claimed.
+/// carrying its holder when claimed and its own direct child count.
 pub fn epic_children(store: &Store, epic_id: &str) -> Result<Vec<ChildRow>, OpError> {
     let nodes = load_epic_nodes(store, epic_id)?;
-    let mut rows: Vec<(u64, ChildRow)> = nodes
-        .iter()
-        .filter(|n| n.frontmatter.parent.is_none())
-        .map(|n| (n.frontmatter.number, child_row(epic_id, n)))
-        .collect();
-    rows.sort_by_key(|(number, _)| *number);
-    Ok(rows.into_iter().map(|(_, r)| r).collect())
+    Ok(direct_children(epic_id, &nodes, None))
 }
 
 /// The comments of a node or epic as render lines, honouring the
@@ -361,7 +354,36 @@ fn list_node(epic_id: &str, n: &NodeFile) -> ListNode {
     }
 }
 
-fn child_row(epic_id: &str, n: &NodeFile) -> ChildRow {
+/// Rows for one direct-children listing, with the count of each listed node's
+/// own children from the same epic snapshot.
+fn direct_children(epic_id: &str, nodes: &[NodeFile], parent: Option<u64>) -> Vec<ChildRow> {
+    let mut child_counts = HashMap::<u64, usize>::new();
+    for node in nodes {
+        if let Some(parent) = node.frontmatter.parent {
+            *child_counts.entry(parent).or_default() += 1;
+        }
+    }
+
+    let mut rows: Vec<(u64, ChildRow)> = nodes
+        .iter()
+        .filter(|node| node.frontmatter.parent == parent)
+        .map(|node| {
+            let number = node.frontmatter.number;
+            (
+                number,
+                child_row(
+                    epic_id,
+                    node,
+                    child_counts.get(&number).copied().unwrap_or_default(),
+                ),
+            )
+        })
+        .collect();
+    rows.sort_by_key(|(number, _)| *number);
+    rows.into_iter().map(|(_, row)| row).collect()
+}
+
+fn child_row(epic_id: &str, n: &NodeFile, children: usize) -> ChildRow {
     ChildRow {
         reference: format!("{}/{}", epic_id, n.frontmatter.number),
         name: n.frontmatter.name.clone(),
@@ -369,6 +391,7 @@ fn child_row(epic_id: &str, n: &NodeFile) -> ChildRow {
         // The holder alone identifies a claim for a listing: an unclaimed child
         // carries none, so presence in the row is exactly "this child is claimed".
         claimed_by: n.frontmatter.claim.as_ref().map(|c| c.by.clone()),
+        children,
     }
 }
 
@@ -658,17 +681,31 @@ mod tests {
     fn node_and_epic_children_tables() {
         let (_d, s) = seeded();
         create_epic(&s, new_epic("e")).unwrap();
-        let a = create_node(&s, new_node("e", None, "a")).unwrap();
-        let ar = NodeRef::new("e", a.frontmatter.number);
-        create_node(&s, new_node("e", Some(ar.clone()), "b")).unwrap();
+        let parent = create_node(&s, new_node("e", None, "parent")).unwrap();
+        let parent_ref = NodeRef::new("e", parent.frontmatter.number);
+        create_node(&s, new_node("e", None, "top-level leaf")).unwrap();
+        let branch = create_node(&s, new_node("e", Some(parent_ref.clone()), "branch")).unwrap();
+        let branch_ref = NodeRef::new("e", branch.frontmatter.number);
+        create_node(&s, new_node("e", Some(parent_ref.clone()), "nested leaf")).unwrap();
+        create_node(&s, new_node("e", Some(branch_ref), "grandchild")).unwrap();
 
         let epic_kids = epic_children(&s, "e").unwrap();
-        assert_eq!(epic_kids.len(), 1);
-        assert_eq!(epic_kids[0].name, "a");
+        assert_eq!(
+            epic_kids
+                .iter()
+                .map(|row| (row.name.as_str(), row.children))
+                .collect::<Vec<_>>(),
+            [("parent", 2), ("top-level leaf", 0)]
+        );
 
-        let node_kids = node_children(&s, &ar).unwrap();
-        assert_eq!(node_kids.len(), 1);
-        assert_eq!(node_kids[0].name, "b");
+        let node_kids = node_children(&s, &parent_ref).unwrap();
+        assert_eq!(
+            node_kids
+                .iter()
+                .map(|row| (row.name.as_str(), row.children))
+                .collect::<Vec<_>>(),
+            [("branch", 1), ("nested leaf", 0)]
+        );
     }
 
     #[test]

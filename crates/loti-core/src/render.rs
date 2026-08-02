@@ -467,10 +467,9 @@ fn is_node_value(value: &Value) -> bool {
     value.get("ref").is_some()
 }
 
-/// A direct-children row: reference, name, status, plus who holds the child's
-/// claim. The markdown children table renders the first three; the holder is
-/// there so a surface drawing one level can mark the claimed rows without
-/// reading every child.
+/// A direct-children row: reference, name, status, claim holder, and direct
+/// child count. The markdown children table renders only the first three; the
+/// other fields let a surface draw one level without reading every child.
 #[derive(Debug, Clone)]
 pub struct ChildRow {
     /// The child's `<epic-id>/<n>` reference.
@@ -483,6 +482,9 @@ pub struct ChildRow {
     /// is unclaimed. Only the holder travels with the row — when the claim was
     /// taken belongs to the whole-entity view.
     pub claimed_by: Option<String>,
+    /// How many direct child nodes this child has. This navigation detail is
+    /// deliberately not part of the command-line children table.
+    pub children: usize,
 }
 
 /// Render `show --markdown` (the default, viewer-friendly form): everything in
@@ -1463,6 +1465,7 @@ mod tests {
             name: "child".into(),
             status: "to-do".into(),
             claimed_by: Some("agent:builder".into()),
+            children: 3,
         }];
         let comments = vec![CommentLine::Live {
             id: 1,
@@ -1490,11 +1493,19 @@ mod tests {
         }
         assert!(md.contains("e/2"));
         assert!(md.contains("the body"));
-        // The children table is ref/name/status only: a child's holder never
-        // reaches the rendered document, claimed or not.
-        assert!(md.contains("| ref | name | status |"));
-        assert!(md.contains("| e/2 | child | to-do |"));
-        assert!(!md.contains("agent:builder"));
+        // The children table is ref/name/status only: navigation details never
+        // reach the rendered document, however much information a TUI needs.
+        let table = md
+            .split_once("## Subtickets\n")
+            .unwrap()
+            .1
+            .split_once("\n## Assets")
+            .unwrap()
+            .0;
+        assert_eq!(
+            table,
+            "\n| ref | name | status |\n|---|---|---|\n| e/2 | child | to-do |\n"
+        );
     }
 
     // -- list --------------------------------------------------------------
