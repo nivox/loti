@@ -12,7 +12,8 @@ turns approved specifications into vertical implementation tickets.
 - Read the target and its comments before changing anything. Read a ticket or
   epic again immediately before replacing its body.
 - Use one human question at a time for every `planning:discussion` decision.
-  Do not answer on the human's behalf.
+  Do not answer on the human's behalf, but offer your recommentations with the
+  rationale behind them.
 - Choose a clear free-form identity for your own claims and comments, such as
   `agent`, `research-agent`, or `review-agent`. Use it consistently for this
   session. Do not claim work that the human must perform.
@@ -129,6 +130,11 @@ insight into other decisions. If you deliberately choose a ticket other than
 the lowest-numbered eligible ticket, add a brief map comment naming it and the
 expected insight. If none clearly has greater leverage, choose the lowest-numbered
 eligible ticket.
+
+Only work on one ticket at a time, unless they can be executed autonomously without
+user feedback. In this case spawn subagents for each of them.
+When user feedback is requested (e.g. discussions) always state the ticket you're working on
+and scope the discussion on that ticket only.
 
 When no ticket is eligible:
 
