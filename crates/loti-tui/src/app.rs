@@ -4549,16 +4549,50 @@ mod tests {
 
     #[test]
     fn a_wheel_is_silent_in_editing_mode_where_a_key_would_notice() {
-        let (_fx, mut app) = app();
-        freeze_the_epics_row(&mut app);
+        let (fx, mut app) = app();
+        let body = (1..=24)
+            .map(|line| format!("preview line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fx.rewrite_the_epics_body(&body);
+        to_the_roster(&mut app);
+        app.apply(Action::CursorFirst).unwrap();
+
+        // First prove this row's preview can move in both directions while browsing.
+        // Editing from its one-line-down viewport means either wheel direction would
+        // visibly change the pane if the mode ever let it reach the viewer.
+        let (width, height) = (40, 10);
+        let top = preview_lines(&mut app, width, height);
+        app.apply(Action::WheelDown).unwrap();
+        let lower = preview_lines(&mut app, width, height);
+        assert_preview_scrolled_down_one_line(&top, &lower);
+        app.apply(Action::WheelDown).unwrap();
+        let lower_again = preview_lines(&mut app, width, height);
+        assert_preview_scrolled_down_one_line(&lower, &lower_again);
+        app.apply(Action::WheelUp).unwrap();
+        assert_eq!(
+            preview_lines(&mut app, width, height),
+            lower,
+            "wheel-up did not restore the non-boundary viewport"
+        );
+
+        app.apply(Action::EnterEditing).unwrap();
+        assert!(
+            app.editing_target().is_some(),
+            "the epic row did not enter editing"
+        );
         let cursor = app.nav().cursor();
 
         // Not a key: the notice below is worded for one and would be wrong for a
         // scroll, so a wheel event is answered with the same silence as being
-        // zoomed with no cursor to move.
+        // zoomed with no cursor to move. Compare the pane itself after each action:
+        // a frozen cursor and no notice alone would miss a scroll behind the mode.
         for action in [Action::WheelDown, Action::WheelUp] {
             app.clear_flash();
+            let before = preview_lines(&mut app, width, height);
             assert!(!app.apply(action).unwrap(), "{action:?} quit");
+            let after = preview_lines(&mut app, width, height);
+            assert_eq!(after, before, "{action:?} scrolled the editing preview");
             assert_eq!(app.nav().cursor(), cursor, "{action:?} moved the cursor");
             assert_eq!(app.flash_message(), None, "{action:?} said something");
         }
