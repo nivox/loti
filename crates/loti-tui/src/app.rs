@@ -2372,14 +2372,14 @@ impl App {
             // answer differently live.
             Action::Unbound => {}
 
-            // Zoom hides the navigation pane, so the motion keys fall through to
-            // the preview: they must never move a cursor the reader cannot see. The
-            // wheel shares every arm with the key it stands in for here: browsing
-            // and zoom never tell the two apart, only editing mode does.
-            Action::CursorDown | Action::WheelDown if self.zoomed => {
-                self.preview.viewer.scroll_down(1)
-            }
-            Action::CursorUp | Action::WheelUp if self.zoomed => self.preview.viewer.scroll_up(1),
+            // In browse mode, wheel input always scrolls the preview; cursor keys
+            // move the visible navigation cursor, or the preview when zoom hides it.
+            // Distinct wheel intents let editing consume wheel input silently rather
+            // than treating it as a key that needs an unavailable-action notice.
+            Action::CursorDown if self.zoomed => self.preview.viewer.scroll_down(1),
+            Action::CursorUp if self.zoomed => self.preview.viewer.scroll_up(1),
+            Action::WheelDown => self.preview.viewer.scroll_down(1),
+            Action::WheelUp => self.preview.viewer.scroll_up(1),
             Action::CursorFirst if self.zoomed => self.preview.viewer.scroll_to_top(),
             Action::CursorLast if self.zoomed => self.preview.viewer.scroll_to_bottom(),
             // Silent, deliberately, and named in [`Action::Unbound`] as one of
@@ -2398,8 +2398,8 @@ impl App {
             // choice, so the refusal leaves it as it is rather than un-zooming.
             Action::EnterEditing if self.zoomed => self.flash(EDITING_NEEDS_THE_NAV_PANE),
 
-            Action::CursorDown | Action::WheelDown => self.nav.cursor_down(),
-            Action::CursorUp | Action::WheelUp => self.nav.cursor_up(),
+            Action::CursorDown => self.nav.cursor_down(),
+            Action::CursorUp => self.nav.cursor_up(),
             Action::CursorFirst => self.nav.cursor_first(),
             Action::CursorLast => self.nav.cursor_last(),
             Action::Descend => {
@@ -4183,6 +4183,70 @@ mod tests {
         let (_fx, mut app) = app();
         app.apply(Action::ToggleHelp).unwrap();
         assert!(app.apply(Action::Quit).unwrap());
+    }
+
+    #[test]
+    fn a_wheel_scrolls_the_browse_preview_without_moving_the_selected_row() {
+        let (_fx, mut app) = app();
+        app.apply(Action::Descend).unwrap();
+        let selected = app
+            .nav()
+            .frame()
+            .current()
+            .expect("the epic level has a selected row")
+            .selection
+            .clone();
+
+        // Draw first so the viewer has rendered a viewport. This short frame leaves
+        // the epic preview taller than the pane, making either one-line wheel motion
+        // observable rather than accepting a scroll that cannot go anywhere.
+        let (width, height) = (40, 10);
+        let top = preview_lines(&mut app, width, height);
+
+        app.apply(Action::WheelDown).unwrap();
+        let lower = preview_lines(&mut app, width, height);
+        assert_ne!(
+            lower, top,
+            "the fixture's preview is not tall enough for wheel-down to move it"
+        );
+        assert_eq!(
+            app.nav().frame().current().map(|row| &row.selection),
+            Some(&selected),
+            "wheel-down changed the browse selection"
+        );
+
+        app.apply(Action::WheelUp).unwrap();
+        assert_eq!(
+            preview_lines(&mut app, width, height),
+            top,
+            "wheel-up did not return the preview to its initial viewport"
+        );
+        assert_eq!(
+            app.nav().frame().current().map(|row| &row.selection),
+            Some(&selected),
+            "wheel-up changed the browse selection"
+        );
+    }
+
+    #[test]
+    fn cursor_keys_still_move_the_browse_navigation_cursor() {
+        let (_fx, mut app) = app();
+        app.apply(Action::Descend).unwrap();
+        let first = app.nav().cursor();
+
+        app.apply(Action::CursorDown).unwrap();
+        let second = app.nav().cursor();
+        assert_ne!(
+            second, first,
+            "cursor-down did not move through the browse rows"
+        );
+
+        app.apply(Action::CursorUp).unwrap();
+        assert_eq!(
+            app.nav().cursor(),
+            first,
+            "cursor-up did not return to the original browse row"
+        );
     }
 
     #[test]

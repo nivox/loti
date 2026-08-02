@@ -44,6 +44,7 @@ have their own useful previews; labels retain the containing item's preview.
 | `Enter` / `l` / `→` | open the highlighted row |
 | `Backspace` / `Esc` / `h` / `←` | go back one level |
 | `Ctrl-D` / `Ctrl-U` | scroll preview half a screen, retaining context |
+| mouse wheel | scroll preview one line without moving the highlighted row |
 | `PgDn` / `PgUp` / `Space` | scroll preview a screen |
 | `Home` / `End` | preview start / end |
 | `<` / `>` | change pane split |
@@ -58,8 +59,9 @@ when the preview can show more than one line. A one-line preview advances one
 line because no overlap is possible.
 
 Zoom fills the terminal with the preview and lets the terminal handle ordinary
-mouse text selection. Press `z` again to restore the tree. Drag the divider to
-adjust the split; it lasts for this session only.
+mouse text selection. The mouse wheel keeps scrolling the preview. Press `z`
+again to restore the tree. Drag the divider to adjust the split; it lasts for
+this session only.
 
 ## Edit
 
