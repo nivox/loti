@@ -1793,6 +1793,9 @@ struct Preview {
 
 /// The browser.
 pub struct App {
+    /// An opaque transit handle for the store seam. The state machine forwards
+    /// it to `data` and never calls it, so store access remains in one module
+    /// without a wrapper that adds no behaviour.
     store: Store,
     /// The directory resource discovery starts from. It is captured without
     /// reading configuration so `w`, not rendering or startup, owns discovery.
@@ -1945,17 +1948,13 @@ impl App {
         request: &LaunchRequest,
         environment: BTreeMap<String, String>,
     ) -> Result<launch::LaunchPlan> {
-        let caller = launch::CallerContext {
-            project_root: self.store.root().to_path_buf(),
-            current_directory: self.working_directory.clone(),
-            env: environment,
-        };
         data::prepare_agent_launch(
+            &self.store,
             &self.working_directory,
             &request.target,
             &request.workflow,
             &request.profile,
-            &caller,
+            environment,
         )
     }
 

@@ -1,10 +1,16 @@
-//! The `loti-core` seam: everything the browser knows about a store is loaded
-//! here and nowhere else.
+//! The browser's store seam: everything it learns from or writes to a store
+//! passes through this module.
 //!
-//! Invariant: no other module in this crate touches `loti_core`. The rest of
-//! the crate deals in [`Row`]s and rendered markdown, so which core call backs
-//! a screen — and whether an operation reads or writes — never leaks into the
-//! navigation model or the drawing code.
+//! Two core seams serve different concerns. This module is the only browser
+//! module that calls the store surface; [`crate::theme`] is the only one that
+//! calls the status-colour palette. Keeping presentation vocabulary out of the
+//! store seam means each concern has one predictable place for a core change.
+//!
+//! [`crate::app::App`] carries a [`Store`] only as an opaque transit handle and
+//! passes it straight here. Naming that handle does not reach the store: this
+//! module alone calls it. The rest of the browser deals in [`Row`]s and rendered
+//! markdown, so which core call backs a screen — and whether an operation reads
+//! or writes — never leaks into the navigation model or drawing code.
 
 use anyhow::{Context, Result};
 use jiff::Timestamp;
@@ -553,13 +559,23 @@ pub fn agent_picker(
 /// Resolve the currently effective selections and prepare their direct launch
 /// without changing the tracker. The picker only carried ids, so resolving here
 /// detects a resource that disappeared or became invalid while it was open.
+///
+/// The caller context is assembled at the store seam because its project root
+/// belongs to the store. The state machine supplies the opaque handle and its
+/// working directory without inspecting either store state or store paths.
 pub fn prepare_agent_launch(
+    store: &Store,
     start: &std::path::Path,
     target: &launch::Target,
     workflow: &ResourceId,
     profile: &ResourceId,
-    caller: &launch::CallerContext,
+    environment: std::collections::BTreeMap<String, String>,
 ) -> Result<launch::LaunchPlan> {
+    let caller = launch::CallerContext {
+        project_root: store.root().to_path_buf(),
+        current_directory: start.to_path_buf(),
+        env: environment,
+    };
     let roots = agent_roots(start)?;
     let profile = resource::resolve_profile(&roots.profiles, profile.as_str())?
         .ok_or_else(|| anyhow::anyhow!("agent profile '{profile}' does not exist"))?
@@ -573,7 +589,7 @@ pub fn prepare_agent_launch(
 
     // The workflow body is intentionally opaque; successful resolution says its
     // selected id remains usable, which is all shared preparation needs.
-    launch::prepare(target, &profile, workflow, caller).map_err(Into::into)
+    launch::prepare(target, &profile, workflow, &caller).map_err(Into::into)
 }
 
 /// The rows of one level, in the order every other loti surface lists them:
@@ -3193,6 +3209,46 @@ mod tests {
         assert!(subnode.frontmatter.comments.is_empty());
         assert!(subnode.frontmatter.assets.is_empty());
         assert!(subnode.frontmatter.blocked_by.is_empty());
+    }
+
+    /// Launch preparation belongs at the store seam because a rendered working
+    /// directory and the `project_root` template derive from the store, not from
+    /// the browser state machine's resource directory.
+    #[test]
+    fn launch_preparation_derives_project_root_from_the_store() {
+        let fixture = Fixture::build();
+        let resources = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(resources.path().join("workflows")).unwrap();
+        std::fs::create_dir_all(resources.path().join("agents")).unwrap();
+        std::fs::write(
+            resources.path().join(".loti.conf"),
+            "workflow-root = \"workflows\"\nagent-root = \"agents\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            resources.path().join("workflows").join("review.md"),
+            "# Review\n",
+        )
+        .unwrap();
+        std::fs::write(
+            resources.path().join("agents").join("agent.toml"),
+            "command = \"agent\"\nargs = [\"{{ loti_prompt }}\"]\ncwd = \"{{ project_root }}\"\n",
+        )
+        .unwrap();
+
+        let picker =
+            agent_picker(&fixture.store, &fixture.epic_selection(), resources.path()).unwrap();
+        let plan = prepare_agent_launch(
+            &fixture.store,
+            resources.path(),
+            &picker.target,
+            &picker.workflows[0].id,
+            &picker.profiles[0].id,
+            Default::default(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.cwd, fixture.store.root());
     }
 
     #[test]

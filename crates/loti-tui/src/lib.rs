@@ -643,7 +643,121 @@ fn event_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::fs;
     use std::rc::Rc;
+
+    /// The source before unit tests, which may construct stores as fixtures but
+    /// does not ship in the browser.
+    fn production_source(source: &str) -> &str {
+        source
+            .split_once("\n#[cfg(test)]")
+            .map_or(source, |(code, _)| code)
+    }
+
+    /// Every browser source module, including nested and newly added modules,
+    /// so no new path can silently bypass either core seam.
+    fn browser_sources() -> Vec<(String, String)> {
+        let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources = Vec::new();
+        collect_browser_sources(&source_dir, &source_dir, &mut sources);
+        sources.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        sources
+    }
+
+    fn collect_browser_sources(
+        root: &std::path::Path,
+        directory: &std::path::Path,
+        sources: &mut Vec<(String, String)>,
+    ) {
+        for entry in fs::read_dir(directory)
+            .expect("the browser source directory is readable")
+            .map(|entry| entry.expect("the browser source entry is readable"))
+        {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_browser_sources(root, &path, sources);
+            } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+                let module = path
+                    .strip_prefix(root)
+                    .expect("every browser source belongs to its source directory")
+                    .display()
+                    .to_string();
+                let source = fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+                sources.push((module, source));
+            }
+        }
+    }
+
+    /// Removing whitespace makes a call guard insensitive to idiomatic line
+    /// wrapping without mistaking the opaque `Store` type in `App` for a call.
+    fn compact(source: &str) -> String {
+        source
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect()
+    }
+
+    #[test]
+    fn only_the_data_seam_calls_store_methods() {
+        // Derive the guarded API from Store itself. A new Store method therefore
+        // joins the boundary automatically instead of relying on this list being
+        // manually kept in step.
+        let methods: Vec<_> = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../loti-core/src/store.rs"
+        ))
+        .lines()
+        .filter_map(|line| line.strip_prefix("    pub fn "))
+        .map(|signature| {
+            signature
+                .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+                .next()
+                .expect("a public Store method has a name")
+        })
+        .collect();
+        assert!(!methods.is_empty(), "the Store API was not found");
+
+        for (module, source) in browser_sources() {
+            if module == "data.rs" {
+                continue;
+            }
+            let source = compact(production_source(&source));
+            for method in &methods {
+                let calls = [
+                    format!(".{method}("),
+                    format!(".{method}::<"),
+                    format!("Store::{method}"),
+                    format!("store::Store::{method}"),
+                    format!("loti_core::store::Store::{method}"),
+                ];
+                assert!(
+                    calls.iter().all(|call| !source.contains(call)),
+                    "{module} calls Store::{method}; only data.rs may call the store"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_theme_seam_names_the_status_palette() {
+        // Hue and these two lookup functions are the complete status palette
+        // exported by core. Naming any one outside theme would make presentation
+        // vocabulary spread with no single place to change it.
+        let palette = ["Hue", "node_status_hue", "epic_status_hue"];
+        for (module, source) in browser_sources() {
+            if module == "theme.rs" {
+                continue;
+            }
+            let source = production_source(&source);
+            for symbol in palette {
+                assert!(
+                    !source.contains(symbol),
+                    "{module} names render::{symbol}; only theme.rs may name the status palette"
+                );
+            }
+        }
+    }
 
     use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseEvent};
     use ratatui::backend::TestBackend;

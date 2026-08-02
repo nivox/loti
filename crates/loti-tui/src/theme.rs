@@ -1,9 +1,12 @@
 //! Colours and status glyphs.
 //!
-//! The status palette is not defined here: it is read from `loti-core`, so this
-//! surface and the plain text listings cannot disagree about which state is
-//! which colour. This module only maps a hue to the colour type the widgets
-//! want, and pairs each state with a glyph.
+//! This is the browser's presentation seam: it is the only module that names
+//! core's status-colour vocabulary or calls its palette functions. The store
+//! seam stays in [`crate::data`], so a core change lands once per concern rather
+//! than mixing presentation vocabulary into data access. The status palette is
+//! not defined here, so this surface and the plain text listings cannot disagree
+//! about which state is which colour. This module only maps a hue to the colour
+//! type the widgets want, and pairs each state with a glyph.
 //!
 //! Two rules:
 //!   * the background is never painted, so the terminal's own theme shows
