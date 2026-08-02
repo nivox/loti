@@ -948,8 +948,25 @@ fn age(created: Timestamp, now: Timestamp) -> String {
 /// read that produced it to the write that names it as its precondition, and is
 /// never interpreted in between: no other module compares, formats or invents
 /// one, which is what keeps the freshness rule inside this seam.
+///
+/// The timestamp remains private even though a caller may carry this wrapper
+/// between a read and its matching write. The compiler therefore rejects both
+/// inventing a precondition and inspecting the value that makes one current:
+///
+/// ```compile_fail
+/// use loti_tui::data::Stamp;
+///
+/// let _ = Stamp(todo!());
+/// ```
+///
+/// ```compile_fail
+/// use loti_tui::data::Stamp;
+///
+/// let stamp: Stamp = todo!();
+/// let _ = stamp.0;
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Stamp(pub Timestamp);
+pub struct Stamp(Timestamp);
 
 /// One of an epic's or a node's own fields that a reader rewrites outright
 /// rather than adding an entry to.
