@@ -938,6 +938,50 @@ fn agent_run_from_a_marker_starts_the_child_in_the_marker_directory() {
 
 #[cfg(unix)]
 #[test]
+fn agent_run_from_a_nested_marker_project_renders_the_callers_directory() {
+    let store = Store::new_discovered();
+    store.epic("epic");
+    let nested = store.root().join("nested").join("directory");
+    std::fs::create_dir_all(&nested).unwrap();
+    let global = GlobalRoot::new();
+    let fixture_dir = tempfile::tempdir().unwrap();
+    let fixture = launch_fixture(fixture_dir.path());
+    write_launch_profile(
+        &global.agents(),
+        "profile",
+        &fixture,
+        "[\"{{ loti_prompt }}\", \"{{ project_root }}\", \"{{ current_directory }}\"]",
+    );
+    write_workflow(&global.workflows(), "review", "follow this workflow");
+    let record = fixture_dir.path().join("record");
+    let xdg = global.env();
+
+    let output = pty_run_discovered(
+        &nested,
+        &[
+            "agent",
+            "run",
+            "epic",
+            "--agent",
+            "profile",
+            "--workflow",
+            "review",
+        ],
+        &[xdg[0], ("LOTI_TEST_RECORD", record.to_str().unwrap())],
+    );
+
+    assert!(output.status.success(), "{}", output_text(&output));
+    let fields = nul_fields(&record);
+    assert_eq!(fields[3], store.root().display().to_string());
+    assert_eq!(fields[4], nested.display().to_string());
+    assert_ne!(
+        fields[3], fields[4],
+        "fixture paths must distinguish templates"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn agent_run_from_a_config_starts_the_child_in_the_config_directory() {
     let store = Store::new();
     store.epic("epic");

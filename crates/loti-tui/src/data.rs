@@ -3269,6 +3269,45 @@ mod tests {
     }
 
     #[test]
+    fn launch_preparation_renders_the_browsers_current_directory() {
+        let fixture = Fixture::build();
+        let project = tempfile::tempdir().unwrap();
+        let current = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(current.path().join("workflows")).unwrap();
+        std::fs::create_dir_all(current.path().join("agents")).unwrap();
+        std::fs::write(
+            current.path().join(".loti.conf"),
+            "workflow-root = \"workflows\"\nagent-root = \"agents\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            current.path().join("workflows").join("review.md"),
+            "# Review\n",
+        )
+        .unwrap();
+        std::fs::write(
+            current.path().join("agents").join("agent.toml"),
+            "command = \"agent\"\nargs = [\"{{ loti_prompt }}\", \"{{ current_directory }}\"]\n",
+        )
+        .unwrap();
+
+        let picker =
+            agent_picker(&fixture.store, &fixture.epic_selection(), current.path()).unwrap();
+        let plan = prepare_agent_launch(
+            project.path(),
+            current.path(),
+            &picker.target,
+            &picker.workflows[0].id,
+            &picker.profiles[0].id,
+            Default::default(),
+        )
+        .unwrap();
+
+        assert_ne!(project.path(), current.path(), "fixture paths must differ");
+        assert_eq!(plan.args[1], current.path().display().to_string());
+    }
+
+    #[test]
     fn children_listing_counts_become_work_row_counts() {
         let rows = child_rows(vec![
             render::ChildRow {
