@@ -16,7 +16,10 @@ use serde_json::Value;
 use crate::domain::{epic_status, NodeRef, NodeStatus};
 use crate::filter::{RegexMatcher, StructuredFilters};
 use crate::matcher::{self, MatchWarning, MatcherError, MatcherRegistry, ResolvedMatcher};
-use crate::ops::{descendants_of, list_comments, load_epic_nodes, CommentView, OpError, Target};
+use crate::ops::{
+    descendants_of, list_comments, load_epic_nodes, read_epic, read_node, CommentView, OpError,
+    Target,
+};
 use crate::render::{ChildRow, CommentLine, ListEpic, ListNode};
 use crate::store::{Store, StoreError, EPIC_FILE};
 use crate::{model::NodeFile, render};
@@ -458,25 +461,6 @@ fn epic_ids(store: &Store) -> Result<Vec<String>, OpError> {
         }
     }
     Ok(ids)
-}
-
-/// Read an epic, mapping a missing file to a clean not-found error.
-fn read_epic(store: &Store, epic_id: &str) -> Result<crate::model::EpicFile, OpError> {
-    if !store.epic_path(epic_id).is_file() {
-        return Err(OpError::NoSuchEpic(epic_id.to_string()));
-    }
-    Ok(store.read_epic(epic_id)?)
-}
-
-/// Read a node, mapping a missing file to a clean not-found error.
-fn read_node(store: &Store, node_ref: &NodeRef) -> Result<NodeFile, OpError> {
-    if !store
-        .node_path(&node_ref.epic_id, node_ref.number)
-        .is_file()
-    {
-        return Err(OpError::NoSuchNode(node_ref.clone()));
-    }
-    Ok(store.read_node(&node_ref.epic_id, node_ref.number)?)
 }
 
 #[cfg(test)]

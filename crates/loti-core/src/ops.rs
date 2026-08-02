@@ -1244,10 +1244,10 @@ pub fn descendants_of(store: &Store, node_ref: &NodeRef) -> Result<Vec<NodeStatu
 // existence-checked reads (mapping "not found" to a clean op error)
 // ---------------------------------------------------------------------------
 
-// These are the readers a caller composing a write goes through: an entity must
-// be read before it can be edited, and "it is gone" is an operation-level answer
-// rather than a path in an I/O message. The rule lives here once so no surface
-// restates it.
+// Every caller that reads one named entity — a read projection or an operation
+// composing a write — comes through here. "It is gone" is an operation-level
+// answer rather than a path in an I/O message, so the rule lives here once and
+// no surface restates it.
 
 /// Read an epic, mapping a missing file to [`OpError::NoSuchEpic`] rather than a
 /// raw I/O error.
