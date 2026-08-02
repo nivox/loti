@@ -166,6 +166,14 @@ fn action_for_binding(binding: HelpBinding, key: KeyEvent, mode: Mode) -> Option
             {
                 Some(Action::MoveDown)
             }
+            // A picker has no text, so the letters are free to carry vertical
+            // intent there without touching a text area, where they stay prose.
+            (KeyCode::Char('k'), false, Some(shape)) if matches!(shape.kind, FieldKind::Pick) => {
+                Some(Action::MoveUp)
+            }
+            (KeyCode::Char('j'), false, Some(shape)) if matches!(shape.kind, FieldKind::Pick) => {
+                Some(Action::MoveDown)
+            }
             _ => None,
         },
         HelpBinding::FirstLast if browsing => match (key.code, ctrl) {
@@ -313,7 +321,7 @@ pub struct HelpEntry {
 pub const HELP: &[HelpEntry] = &[
     HelpEntry {
         keys: "j / k / ↓ / ↑ / Ctrl-P / Ctrl-N",
-        description: "move; ↑/↓ or Ctrl-P/N in a field",
+        description: "move; ↑/↓/Ctrl-P/N field, j/k in picker",
         requires_write: false,
         binding: HelpBinding::Motion,
     },
@@ -566,6 +574,9 @@ pub fn footer_hints_surface(shape: Shape) -> Vec<&'static str> {
     }
     if matches!(shape.kind, FieldKind::OneLine | FieldKind::ManyLines) {
         hints.push("Ctrl-G editor");
+    }
+    if matches!(shape.kind, FieldKind::Pick) {
+        hints.push("j / k pick");
     }
     hints
 }
@@ -946,9 +957,11 @@ mod tests {
     #[test]
     fn an_open_surface_takes_every_key_and_lets_none_reach_what_is_under_it() {
         for mode in surface_modes() {
-            // A letter is a character in a field, not the action it carries one
-            // layer up: nothing typed can quit, move a cursor or open a level.
-            for c in ['q', 'j', 'k', 'e', 'r', 'd', 'a', '?', 'z'] {
+            // A letter is content wherever there is text, and carries one layer
+            // up's action nowhere: nothing typed can quit, move a cursor or open a
+            // level. `j`/`k` are excluded here because a picker has no text for
+            // them to be content in — its own test pins what they do there.
+            for c in ['q', 'e', 'r', 'd', 'a', '?', 'z'] {
                 assert_eq!(
                     action_for(plain(KeyCode::Char(c)), mode),
                     Some(Action::Insert(c)),
@@ -975,6 +988,17 @@ mod tests {
                 Some(Action::MoveToEnd),
                 "{mode:?}"
             );
+        }
+        // A letter is content wherever there is text: in a text field `j`/`k` are
+        // still exactly the characters they spell, picker or not aside.
+        for mode in text_fields() {
+            for c in ['j', 'k'] {
+                assert_eq!(
+                    action_for(plain(KeyCode::Char(c)), mode),
+                    Some(Action::Insert(c)),
+                    "{c:?} did not reach the field in {mode:?}"
+                );
+            }
         }
     }
 
@@ -1080,6 +1104,8 @@ mod tests {
                 (plain(KeyCode::Down), Action::MoveDown),
                 (ctrl('p'), Action::MoveUp),
                 (ctrl('n'), Action::MoveDown),
+                (plain(KeyCode::Char('k')), Action::MoveUp),
+                (plain(KeyCode::Char('j')), Action::MoveDown),
             ] {
                 assert_eq!(action_for(key, mode), Some(intent), "{key:?} in {mode:?}");
             }
@@ -1090,6 +1116,8 @@ mod tests {
                 !matches!(key.code, KeyCode::Up | KeyCode::Down)
                     && *key != ctrl('p')
                     && *key != ctrl('n')
+                    && *key != plain(KeyCode::Char('k'))
+                    && *key != plain(KeyCode::Char('j'))
             }) {
                 assert!(
                     !matches!(
@@ -1215,6 +1243,13 @@ mod tests {
                 shape.kind != FieldKind::Pick,
                 "{shape:?}: {hints:?}"
             );
+            // And the picker's own motion key is taught only where the field is a
+            // picker: elsewhere j/k are content, so the strip must not name them.
+            assert_eq!(
+                hints.iter().any(|hint| leading(hint) == "j"),
+                shape.kind == FieldKind::Pick,
+                "{shape:?}: {hints:?}"
+            );
         }
     }
 
@@ -1248,6 +1283,16 @@ mod tests {
                 (ctrl('n'), Action::MoveDown),
             ] {
                 assert_eq!(action_for(key, mode), Some(intent), "{key:?} in {mode:?}");
+            }
+            // The letters a picker aliases to the same motion stay prose here: a
+            // text area has content for them to be, so nothing lets them jump the
+            // queue ahead of `Insert`.
+            for c in ['j', 'k'] {
+                assert_eq!(
+                    action_for(plain(KeyCode::Char(c)), mode),
+                    Some(Action::Insert(c)),
+                    "{c:?} in {mode:?}"
+                );
             }
         }
         // And nowhere else: a field holding one line has no line to move to, so

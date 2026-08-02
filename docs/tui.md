@@ -87,6 +87,8 @@ Use `Esc` to leave editing mode before opening an action. Once a form is open:
 - `Ctrl-C` acts like `Esc`.
 - `F1` opens help.
 - `Ctrl-G` opens the field in `$VISUAL`, or `$EDITOR` when `VISUAL` is unset.
+- In a picker, `↑`/`↓`, `Ctrl-P`/`Ctrl-N`, or `k`/`j` move the highlighted
+  choice, which is the value the form saves.
 
 A body or comment edits in the preview pane. Short fields and multi-field forms
 open as centred dialogs. A save returns you to browsing and confirms what changed.
@@ -96,9 +98,11 @@ If you cancel changed text, the browser asks first; destructive confirmations us
 ## Launch an agent
 
 Press `w` while browsing, on the highlighted epic or ticket, to open a centred
-picker for that row, with `workflow` first and `agent` second. Choices identify
-whether their configured resource is local or global. Choose both values and
-accept the form to launch immediately; there is no second confirmation.
+picker for that row, with `workflow` first and `agent` second. Move a picker's
+highlight, which is its value, with `↑`/`↓`, `Ctrl-P`/`Ctrl-N`, or `k`/`j`.
+Choices identify whether their configured resource is local or global. Choose
+both values and accept the form to launch immediately; there is no second
+confirmation.
 
 Loti validates the selected target, resources, and launch configuration before
 it gives up the terminal. A validation failure leaves the picker open and shows

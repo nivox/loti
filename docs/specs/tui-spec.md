@@ -130,7 +130,9 @@ print its own answers.
 `Shift-Tab` MUST move between fields. `Enter` MUST insert a line break only into
 a many-line field and otherwise be inert; it MUST NOT accept a surface or select
 a picker value. A picker value is its current highlight, and vertical motion
-changes that value directly. `Ctrl-C` is equivalent to `Esc` in editing mode.
+changes that value directly: `↑`/`↓`, `Ctrl-P`/`Ctrl-N`, and, because a picker
+holds no text for them to be content in, `k`/`j` as well. `Ctrl-C` is
+equivalent to `Esc` in editing mode.
 `F1` opens help inside a field; `?` is field content.
 
 `Ctrl-G` MUST hand the current text field to `$VISUAL`, falling back to `$EDITOR`.
