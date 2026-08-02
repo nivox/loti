@@ -46,13 +46,25 @@ valid_version() { [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
 # in Cargo.toml; members inherit via `version.workspace = true`).
 read_version() { sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1; }
 
-# Keep Cargo.toml and both workspace entries in Cargo.lock in lockstep so
+# Every member that inherits the workspace version has an entry in Cargo.lock
+# carrying that same version; the list is derived from Cargo.toml rather than
+# hard-coded so adding a crate cannot silently leave its lock entry behind.
+workspace_members() {
+  local dir
+  sed -n '/^members = \[/,/^]/p' Cargo.toml | sed -n 's/.*"\(.*\)".*/\1/p' \
+  | while read -r dir; do
+      grep -q '^version.workspace = true' "$dir/Cargo.toml" || continue
+      sed -n 's/^name = "\(.*\)"/\1/p' "$dir/Cargo.toml" | head -n1
+    done
+}
+
+# Keep Cargo.toml and the workspace entries in Cargo.lock in lockstep so
 # `cargo build --locked` (used by CI) stays valid without a network fetch.
 set_version() {
   local new="$1"
   sed -i.bak 's/^version = ".*"/version = "'"$new"'"/' Cargo.toml && rm -f Cargo.toml.bak
   local pkg
-  for pkg in loti-core loti-cli; do
+  for pkg in $(workspace_members); do
     awk -v pkg="$pkg" -v new="$new" '
       $0 == "name = \"" pkg "\"" { print; getline; sub(/version = ".*"/, "version = \"" new "\""); print; next }
       { print }
