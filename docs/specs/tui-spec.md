@@ -95,6 +95,10 @@ MUST say there is nothing to hand over. Opening the picker MUST select valid
 effective resources, hand the terminal to the selected agent, and restore the
 browser after the agent exits.
 
+Within one session, the picker MUST open on the last workflow and the last
+agent profile accepted, each when that id is still offered, and otherwise on
+the first offered.
+
 ## 4. Editing mode and actions
 
 `e` enters editing mode only on a selected row. The selected row and level MUST

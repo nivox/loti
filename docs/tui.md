@@ -102,7 +102,9 @@ picker for that row, with `workflow` first and `agent` second. Move a picker's
 highlight, which is its value, with `↑`/`↓`, `Ctrl-P`/`Ctrl-N`, or `k`/`j`.
 Choices identify whether their configured resource is local or global. Choose
 both values and accept the form to launch immediately; there is no second
-confirmation.
+confirmation. The picker opens on the last workflow and agent chosen in this
+session, and falls back to the first offered when that choice is no longer
+available.
 
 Loti validates the selected target, resources, and launch configuration before
 it gives up the terminal. A validation failure leaves the picker open and shows

@@ -1061,6 +1061,45 @@ impl Placement {
     pub const ALL: &'static [Placement] = &[Placement::Float, Placement::Pane];
 }
 
+/// The choice from `options` whose id matches `wanted`, taken from the fresh
+/// list so its display text — the local/global tag — is the current one, never
+/// a stale `Choice` carried over from an earlier catalog read.
+///
+/// An id is matched on its id alone: provenance is display text explaining
+/// which definition won, not part of the identity, so a resource whose
+/// local/global tag changed since it was remembered still counts as the same
+/// choice. Falls back to the first option when `wanted` is `None` or is no
+/// longer offered; [`Field::pick`] needs no second fallback because the seed
+/// it receives has already resolved to one that exists.
+fn remembered_choice(options: &[Choice], wanted: Option<&ResourceId>) -> Option<Choice> {
+    wanted
+        .and_then(|id| {
+            options
+                .iter()
+                .find(|choice| choice.resource_id().as_ref() == Some(id))
+        })
+        .or_else(|| options.first())
+        .cloned()
+}
+
+/// The last workflow and last agent-profile id accepted anywhere in this
+/// browser session, independently of each other.
+///
+/// Invariant: written only when a picker is accepted — see
+/// [`App::accept`] — never when a launch prepares or a child exits, so a
+/// selection preparation later refuses is still what the picker reopens on.
+/// Lives exactly as long as the `App` that owns it: nothing resets it on a
+/// reload, and nothing persists it past the process.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentMemory {
+    /// The last accepted effective workflow id, if any picker has been accepted
+    /// yet this session.
+    workflow: Option<ResourceId>,
+    /// The last accepted effective agent-profile id, if any picker has been
+    /// accepted yet this session.
+    profile: Option<ResourceId>,
+}
+
 /// A selected agent launch that has not been prepared or spawned. The terminal
 /// owner consumes it later, keeping resource selection separate from process and
 /// terminal effects.
@@ -1290,7 +1329,12 @@ impl Surface {
     /// The two-step agent picker. Its options are valid effective resource ids;
     /// their local/global provenance is display text owned by the generic choice
     /// model, so drawing a dynamic picker needs no special renderer.
-    fn run_agent(picker: data::AgentPicker) -> Self {
+    ///
+    /// Each field opens on `memory`'s remembered id when the fresh catalog still
+    /// offers it, and otherwise on the first option — the session-wide seeding
+    /// decision belongs here, beside the fields it seeds, not in the store seam
+    /// that produced the catalog.
+    fn run_agent(picker: data::AgentPicker, memory: &AgentMemory) -> Self {
         let workflows: Vec<Choice> = picker
             .workflows
             .into_iter()
@@ -1313,13 +1357,9 @@ impl Surface {
                 }
             })
             .collect();
-        let workflow = workflows
-            .first()
-            .cloned()
+        let workflow = remembered_choice(&workflows, memory.workflow.as_ref())
             .expect("an agent picker surface has a selectable workflow");
-        let profile = profiles
-            .first()
-            .cloned()
+        let profile = remembered_choice(&profiles, memory.profile.as_ref())
             .expect("an agent picker surface has a selectable profile");
         Self {
             title: format!(" workflow for {} ", picker.target.reference()),
@@ -1880,6 +1920,9 @@ pub struct App {
     editor_handoff: Option<String>,
     /// A selected agent launch waiting for the terminal-owning handoff slice.
     launch_request: Option<LaunchRequest>,
+    /// The last workflow and last agent-profile id accepted anywhere in this
+    /// session, which the next picker opens on. See [`AgentMemory`].
+    agent_memory: AgentMemory,
 }
 
 impl App {
@@ -1941,6 +1984,7 @@ impl App {
             surface: None,
             editor_handoff: None,
             launch_request: None,
+            agent_memory: AgentMemory::default(),
         })
     }
 
@@ -2803,6 +2847,10 @@ impl App {
             return;
         }
         if let Some(request) = surface.launch_request() {
+            // Accepting the picker is the choice being remembered, not whatever
+            // preparation later does with it — see `AgentMemory`.
+            self.agent_memory.workflow = Some(request.workflow.clone());
+            self.agent_memory.profile = Some(request.profile.clone());
             // Selection is not a tracker write and must not prepare or spawn a
             // process here. Leave the picker standing for the handoff slice to
             // preserve if preparation later refuses the request.
@@ -2970,10 +3018,11 @@ impl App {
     /// resolution of which row that is, both happen once, at the call site, before
     /// this runs.
     fn run_agent(&mut self, target: Selection) {
+        let memory = self.agent_memory.clone();
         let opened =
             data::agent_picker(&self.store, &target, &self.working_directory).and_then(|picker| {
                 if picker.is_selectable() {
-                    Ok(Surface::run_agent(picker))
+                    Ok(Surface::run_agent(picker, &memory))
                 } else {
                     anyhow::bail!(picker.unavailable_reason())
                 }
@@ -3311,6 +3360,13 @@ mod tests {
                 std::fs::write(
                     self.path().join("workflows").join("000-picker-workflow.md"),
                     "# Picker workflow\n",
+                )
+                .unwrap();
+                // A second workflow, so a test can distinguish "the remembered one"
+                // from "the first one" — a single-entry catalog cannot fail those tests.
+                std::fs::write(
+                    self.path().join("workflows").join("001-picker-workflow.md"),
+                    "# Second picker workflow\n",
                 )
                 .unwrap();
                 config.push_str("workflow-root = \"workflows\"\n");
@@ -3899,6 +3955,142 @@ mod tests {
         // Selection alone preserves the picker; the terminal-owning handoff later
         // prepares it and either reports a refusal here or closes it for the child.
         assert!(app.surface().is_some());
+    }
+
+    /// The resource id of the value currently marked in a picker field.
+    fn marked_resource_id(field: &Field) -> ResourceId {
+        field
+            .chosen()
+            .and_then(|choice| choice.resource_id())
+            .expect("the field holds a resource choice")
+    }
+
+    /// Move the marked value of a picker field one entry down, the way a
+    /// reader picks a non-default option, and return the id it now holds.
+    fn pick_the_second_option(app: &mut App, field: usize) -> ResourceId {
+        for _ in 0..field {
+            app.apply(Action::NextField).unwrap();
+        }
+        app.apply(Action::MoveDown).unwrap();
+        marked_resource_id(&app.surface().unwrap().fields()[field])
+    }
+
+    /// Close an open, dirtied picker the way a reader discards it: the way out
+    /// asks first because a marked value has moved, and the destructive answer
+    /// is the same letter that asks for the destruction. Requires the picker to
+    /// actually be dirty — a clean picker closes on `Unwind` alone, and a
+    /// stray `Delete` would then land on whatever is under it instead of
+    /// answering a dialog, so this asserts the dialog appeared rather than
+    /// silently accepting a no-op move upstream.
+    fn discard_the_picker(app: &mut App) {
+        app.apply(Action::Unwind).unwrap();
+        assert!(
+            matches!(app.modal(), Some(Modal::Dialog(_))),
+            "discarding a picker that was not actually dirty asked no confirmation"
+        );
+        app.apply(Action::Delete).unwrap();
+        assert!(app.surface().is_none(), "discarding left the picker open");
+    }
+
+    /// Move a picker field's mark with the given action, the way a reader
+    /// nudges a highlight, and return the id it now holds.
+    fn move_the_marked_option(app: &mut App, field: usize, action: Action) -> ResourceId {
+        for _ in 0..field {
+            app.apply(Action::NextField).unwrap();
+        }
+        app.apply(action).unwrap();
+        marked_resource_id(&app.surface().unwrap().fields()[field])
+    }
+
+    #[test]
+    fn reopening_the_picker_after_a_launch_opens_on_both_remembered_ids() {
+        let (_fx, _resources, mut app) = app_with_agent_resources();
+        stand_on_the_epics_row(&mut app);
+
+        app.apply(Action::RunAgent).unwrap();
+        let remembered_workflow = pick_the_second_option(&mut app, 0);
+        let remembered_profile = pick_the_second_option(&mut app, 1);
+        app.apply(Action::Accept).unwrap();
+        app.take_launch_request();
+        discard_the_picker(&mut app);
+
+        app.apply(Action::RunAgent).unwrap();
+        let surface = app.surface().expect("the workflow key opened no picker");
+        assert_eq!(
+            marked_resource_id(&surface.fields()[0]),
+            remembered_workflow
+        );
+        assert_eq!(marked_resource_id(&surface.fields()[1]), remembered_profile);
+    }
+
+    #[test]
+    fn a_remembered_workflow_that_is_no_longer_offered_falls_back_to_first_while_the_remembered_profile_is_still_honoured(
+    ) {
+        let (_fx, resources, mut app) = app_with_agent_resources();
+        stand_on_the_epics_row(&mut app);
+
+        app.apply(Action::RunAgent).unwrap();
+        let first_workflow = marked_resource_id(&app.surface().unwrap().fields()[0]);
+        pick_the_second_option(&mut app, 0);
+        let remembered_profile = pick_the_second_option(&mut app, 1);
+        app.apply(Action::Accept).unwrap();
+        app.take_launch_request();
+        discard_the_picker(&mut app);
+
+        // The remembered workflow is dropped from the catalog. The remembered
+        // profile is left untouched, so the two slots' independence is visible.
+        std::fs::remove_file(
+            resources
+                .path()
+                .join("workflows")
+                .join("001-picker-workflow.md"),
+        )
+        .unwrap();
+
+        app.apply(Action::RunAgent).unwrap();
+        let surface = app.surface().expect("the workflow key opened no picker");
+        assert_eq!(marked_resource_id(&surface.fields()[0]), first_workflow);
+        assert_eq!(marked_resource_id(&surface.fields()[1]), remembered_profile);
+    }
+
+    #[test]
+    fn dismissing_a_picker_without_accepting_leaves_the_previous_memory_intact() {
+        let (_fx, _resources, mut app) = app_with_agent_resources();
+        stand_on_the_epics_row(&mut app);
+
+        app.apply(Action::RunAgent).unwrap();
+        let remembered_workflow = pick_the_second_option(&mut app, 0);
+        let remembered_profile = pick_the_second_option(&mut app, 1);
+        app.apply(Action::Accept).unwrap();
+        app.take_launch_request();
+        discard_the_picker(&mut app);
+
+        // Open again on the remembered pair (both marks sit on the last entry
+        // of this two-entry fixture), move both away with MoveUp — MoveDown
+        // would be a no-op there and leave the field clean, pinning nothing —
+        // and confirm from the surface itself that each mark actually left the
+        // remembered id before discarding without accepting: the write point
+        // is acceptance, not the highlight moving or the surface closing.
+        app.apply(Action::RunAgent).unwrap();
+        let moved_workflow = move_the_marked_option(&mut app, 0, Action::MoveUp);
+        let moved_profile = move_the_marked_option(&mut app, 1, Action::MoveUp);
+        assert_ne!(
+            moved_workflow, remembered_workflow,
+            "the workflow mark did not move off the remembered id"
+        );
+        assert_ne!(
+            moved_profile, remembered_profile,
+            "the profile mark did not move off the remembered id"
+        );
+        discard_the_picker(&mut app);
+
+        app.apply(Action::RunAgent).unwrap();
+        let surface = app.surface().expect("the workflow key opened no picker");
+        assert_eq!(
+            marked_resource_id(&surface.fields()[0]),
+            remembered_workflow
+        );
+        assert_eq!(marked_resource_id(&surface.fields()[1]), remembered_profile);
     }
 
     #[test]
