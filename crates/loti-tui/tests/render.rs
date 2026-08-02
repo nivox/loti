@@ -1,9 +1,9 @@
 //! Rendering smoke tests against a real store, on a headless backend.
 //!
 //! These assert the frame's *structure* — the breadcrumb line, the panes, the
-//! hint strip — and deliberately not the markdown body: the preview's inner
-//! layout belongs to the rendering library, so pinning it here would turn every
-//! upstream release into a test failure without telling us anything about loti.
+//! hint strip — and deliberately not the markdown body, except where a reader's
+//! preview-navigation behavior is the claim. The preview's inner layout belongs
+//! to the rendering library, so ordinary rendering tests must not pin it.
 
 use loti_core::domain::NodeRef;
 use loti_core::lock::LockConfig;
@@ -1381,6 +1381,74 @@ fn reload_refreshes_a_scrolled_preview_without_returning_it_to_the_top() {
     assert!(
         !after.iter().any(|line| line.contains(top_marker)),
         "reload returned the preview to the top: {after:#?}"
+    );
+}
+
+#[test]
+fn preview_half_paging_keeps_a_line_from_the_previous_view_visible_in_both_directions() {
+    let (_dir, store) = fixture();
+    let node = NodeRef::new("browser", 1);
+    let markers = (0..80)
+        .map(|line| format!("- paging marker {line:03}\n"))
+        .collect();
+    ops::edit_node(
+        &store,
+        &node,
+        ops::NodeEdits {
+            body: Some(markers),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let mut app = App::new(store, Theme::with_color(false)).unwrap();
+    app.apply(Action::Descend).unwrap();
+    to_work_row(&mut app);
+    let width = nav_pane_width(&app);
+
+    // Draw before moving so the viewer has learned the actual vertical viewport.
+    let (_initial, _) = draw(&mut app);
+    app.preview_viewer().scroll_down(20);
+    let (before_frame, _) = draw(&mut app);
+    let before = preview_side(&before_frame, width);
+    let visible_markers = |lines: &[String]| {
+        lines
+            .iter()
+            .filter_map(|line| {
+                line.split_once("paging marker ")
+                    .and_then(|(_, marker)| marker.split_whitespace().next())
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>()
+    };
+    let before_markers = visible_markers(&before);
+    assert!(
+        !before_markers.is_empty(),
+        "the fixture did not put paging markers in the initial viewport: {before:#?}"
+    );
+
+    app.apply(Action::PreviewHalfDown).unwrap();
+    let (after_frame, _) = draw(&mut app);
+    let after = preview_side(&after_frame, width);
+    let after_markers = visible_markers(&after);
+    assert_ne!(
+        after_markers, before_markers,
+        "half paging did not move the preview: {after:#?}"
+    );
+    assert!(
+        after_markers
+            .iter()
+            .any(|marker| before_markers.contains(marker)),
+        "half paging down lost every line from the previous view: before={before:#?}, after={after:#?}"
+    );
+
+    app.apply(Action::PreviewHalfUp).unwrap();
+    let (restored_frame, _) = draw(&mut app);
+    let restored = preview_side(&restored_frame, width);
+    assert_eq!(
+        visible_markers(&restored),
+        before_markers,
+        "half paging up did not restore the preceding viewport: {restored:#?}"
     );
 }
 

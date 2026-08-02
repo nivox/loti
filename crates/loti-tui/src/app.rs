@@ -1777,6 +1777,12 @@ impl Surface {
 struct Preview {
     viewer: MarkdownViewer,
     width: u16,
+    /// The number of document lines visible in the last drawn frame.
+    ///
+    /// Preview paging is driven between frames, while the markdown viewer learns
+    /// its viewport only as it draws. Keep that last rendered size so Ctrl-U/D
+    /// remains a vertical motion rather than depending on the pane's width.
+    height: u16,
     /// The document identity currently rendered — [`Selection::document`], not
     /// the raw row selection — so a cursor move across rows that share a
     /// document (a container's collection rows, and the label rows inside a
@@ -1894,6 +1900,7 @@ impl App {
             preview: Preview {
                 viewer: MarkdownViewer::new(),
                 width: 0,
+                height: 0,
                 shown: None,
                 invalidated: false,
             },
@@ -3145,6 +3152,15 @@ impl App {
         }
     }
 
+    /// Record the document height from the preview's rendered frame.
+    ///
+    /// The markdown viewer owns the actual viewport. Its size becomes known only
+    /// when the UI gives it a pane, but the next paging key is handled before the
+    /// following frame, so the last rendered height is the relevant page size.
+    pub fn set_preview_height(&mut self, height: u16) {
+        self.preview.height = height;
+    }
+
     /// The preview widget, for drawing.
     pub fn preview_viewer(&mut self) -> &mut MarkdownViewer {
         &mut self.preview.viewer
@@ -3160,9 +3176,9 @@ impl App {
     }
 
     fn half_page(&self) -> u16 {
-        // The viewer knows its own page; half of the last drawn one is close
-        // enough and needs no extra state.
-        (self.preview.width / 2).max(1)
+        // A half-height move keeps part of the previous view visible. A one-line
+        // viewport cannot overlap, so it advances one line instead.
+        (self.preview.height / 2).max(1)
     }
 }
 

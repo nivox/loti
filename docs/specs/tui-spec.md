@@ -63,8 +63,12 @@ In browse mode, `j`/`k` and arrows move the cursor; `g`/`G` move to the first or
 last row; `Enter`, `l`, and right-arrow enter; and Backspace, `Esc`, `h`, and
 left-arrow ascend. `q` and `Ctrl-C` quit. `?` and `F1` open help. `r` reloads.
 `Ctrl-D`/`Ctrl-U`, PgDn/PgUp/Space, and Home/End scroll the preview as their
-respective half-page, page, and end motions. `<`/`>` change the split by 5%, `=`
-restores it, and `z` zooms the preview.
+respective half-page, page, and end motions. A half-page motion MUST use half of
+the last rendered preview height, rounded down and with a minimum of one line.
+When that height exceeds one line, it MUST retain at least one line from the
+previous view; a one-line preview advances by one line because overlap is
+impossible. `<`/`>` change the split by 5%, `=` restores it, and `z` zooms the
+preview.
 
 Zoom MUST fill the width with the preview, release mouse capture, hide the
 navigation cursor, and disable entering or leaving a level. In that state,

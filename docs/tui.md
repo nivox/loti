@@ -43,7 +43,7 @@ have their own useful previews; labels retain the containing item's preview.
 | `g` / `G` | first / last row |
 | `Enter` / `l` / `→` | open the highlighted row |
 | `Backspace` / `Esc` / `h` / `←` | go back one level |
-| `Ctrl-D` / `Ctrl-U` | scroll preview half a screen |
+| `Ctrl-D` / `Ctrl-U` | scroll preview half a screen, retaining context |
 | `PgDn` / `PgUp` / `Space` | scroll preview a screen |
 | `Home` / `End` | preview start / end |
 | `<` / `>` | change pane split |
@@ -52,6 +52,10 @@ have their own useful previews; labels retain the containing item's preview.
 | `r` | reload from the store |
 | `?` / `F1` | key help |
 | `q` / `Ctrl-C` | quit |
+
+Half-screen preview movement retains at least one line from the previous view
+when the preview can show more than one line. A one-line preview advances one
+line because no overlap is possible.
 
 Zoom fills the terminal with the preview and lets the terminal handle ordinary
 mouse text selection. Press `z` again to restore the tree. Drag the divider to

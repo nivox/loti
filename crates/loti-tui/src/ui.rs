@@ -151,15 +151,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // the whole body while the preview fills the width and the right-hand pane
     // otherwise, so a surface that renders in the pane follows the pane rather than
     // holding a second opinion about the layout.
-    let preview_area;
-    if app.zoomed() {
-        preview_area = body;
+    let preview_area = if app.zoomed() {
         app.set_divider_column(None);
-        app.sync_preview(preview_wrap_width(body.width));
-        let title = app.preview_title();
-        let viewer = app.preview_viewer();
-        *viewer = std::mem::take(viewer).with_title(title);
-        viewer.render(f, body, &theme);
+        body
     } else {
         let panes = Layout::default()
             .direction(Direction::Horizontal)
@@ -168,18 +162,19 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 Constraint::Percentage(100 - app.nav_percent()),
             ])
             .split(body);
-        preview_area = panes[1];
         // The divider is where the two pane borders meet, which is the column a
         // drag has to grab.
         app.set_divider_column(Some(panes[1].x));
         draw_nav(f, panes[0], app, theme);
+        panes[1]
+    };
 
-        app.sync_preview(preview_wrap_width(panes[1].width));
-        let title = app.preview_title();
-        let viewer = app.preview_viewer();
-        *viewer = std::mem::take(viewer).with_title(title);
-        viewer.render(f, panes[1], &theme);
-    }
+    app.set_preview_height(preview_content_height(preview_area.height));
+    app.sync_preview(preview_wrap_width(preview_area.width));
+    let title = app.preview_title();
+    let viewer = app.preview_viewer();
+    *viewer = std::mem::take(viewer).with_title(title);
+    viewer.render(f, preview_area, &theme);
 
     f.render_widget(
         Paragraph::new(Line::from(footer(app, chunks[2].width))),
@@ -643,6 +638,12 @@ fn centred(area: Rect, width: u16, height: u16) -> Rect {
 /// when the document overflows.
 fn preview_wrap_width(pane_width: u16) -> u16 {
     pane_width.saturating_sub(5).max(1)
+}
+
+/// The viewer draws a border around the preview and no vertical padding, so its
+/// document viewport is the pane less those two border rows.
+fn preview_content_height(pane_height: u16) -> u16 {
+    pane_height.saturating_sub(2)
 }
 
 /// The columns a full-width line may use, allowing for the one-column indent.
