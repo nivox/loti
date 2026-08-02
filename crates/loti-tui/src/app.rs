@@ -4093,6 +4093,81 @@ mod tests {
         assert_eq!(marked_resource_id(&surface.fields()[1]), remembered_profile);
     }
 
+    /// Move a picker field's mark down until it lands on the id given, bounded by
+    /// the field's own option count so a missing id fails loudly instead of
+    /// spinning: a helper that gives up after a bound and says what it was
+    /// waiting for turns a hang into a failure that names itself.
+    fn move_to_resource_id(app: &mut App, field: usize, id: &ResourceId) -> ResourceId {
+        for _ in 0..field {
+            app.apply(Action::NextField).unwrap();
+        }
+        let bound = options_of(&app.surface().unwrap().fields()[field]).0.len();
+        for _ in 0..bound {
+            let current = marked_resource_id(&app.surface().unwrap().fields()[field]);
+            if current == *id {
+                return current;
+            }
+            app.apply(Action::MoveDown).unwrap();
+        }
+        panic!("id {id} was never offered in field {field}");
+    }
+
+    #[test]
+    fn a_remembered_id_stays_marked_when_its_provenance_changes_between_accept_and_reopen() {
+        // A local file shadows a global one of the same id, so removing the local
+        // file afterwards flips that id's provenance from local to global without
+        // changing which id it is — the rule under test is that identity is the
+        // id alone, never the local/global tag beside it.
+        let (_fx, resources, mut app) = app_with_agent_resources();
+        resources.add_global_resources();
+        let shadow_path = resources
+            .path()
+            .join("workflows")
+            .join("global-workflow.md");
+        std::fs::write(&shadow_path, "# Locally shadowed global workflow\n").unwrap();
+        let shadowed_id = ResourceId::parse("global-workflow").unwrap();
+
+        stand_on_the_epics_row(&mut app);
+        app.apply(Action::RunAgent).unwrap();
+        // Three workflow options now: the fixture's two locals plus the
+        // locally-shadowed id, so "still marked on the remembered id" is
+        // distinguishable from "fell back to the first".
+        assert!(
+            options_of(&app.surface().unwrap().fields()[0]).0.len() >= 2,
+            "the workflow field needs at least two options to tell a kept mark from a fallback"
+        );
+        move_to_resource_id(&mut app, 0, &shadowed_id);
+        let (options_before, at_before) = options_of(&app.surface().unwrap().fields()[0]);
+        let shown_before = options_before[at_before].clone();
+        assert_eq!(
+            shown_before,
+            format!("{shadowed_id} (local)"),
+            "expected the shadowed id to show as local before the shadow is removed"
+        );
+        app.apply(Action::Accept).unwrap();
+        app.take_launch_request();
+        discard_the_picker(&mut app);
+
+        // Flip the id's provenance: the local file that shadowed the global one
+        // is gone, so "global-workflow" now resolves from the global catalog.
+        std::fs::remove_file(&shadow_path).unwrap();
+
+        app.apply(Action::RunAgent).unwrap();
+        let surface = app.surface().expect("the workflow key opened no picker");
+        assert_eq!(marked_resource_id(&surface.fields()[0]), shadowed_id);
+        let (options_after, at_after) = options_of(&surface.fields()[0]);
+        let shown_after = options_after[at_after].clone();
+        assert_eq!(
+            shown_after,
+            format!("{shadowed_id} (global)"),
+            "expected the reopened picker to show the id as global now that the shadow is gone"
+        );
+        assert_ne!(
+            shown_before, shown_after,
+            "the remembered id's displayed provenance never changed, so this test proves nothing about surviving a provenance flip"
+        );
+    }
+
     #[test]
     fn prepared_agent_uses_the_project_root_without_losing_its_browser_directory() {
         let fixture = Fixture::build();
