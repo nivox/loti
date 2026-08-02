@@ -527,6 +527,53 @@ fn wheel_action(kind: MouseEventKind) -> Option<action::Action> {
     }
 }
 
+/// Apply one terminal event to the browser and say whether it ends the session.
+///
+/// Every received event owes a frame before its meaning is considered. A handler
+/// that does nothing therefore cannot leave the screen stale behind terminal input.
+/// The width belongs to the terminal boundary, but passing it in keeps this
+/// dispatch path independent of a terminal for the drag rule and its tests.
+fn dispatch_event(app: &mut App, event: Event, width: u16) -> bool {
+    app.request_redraw();
+
+    match event {
+        // Key repeats and releases would otherwise apply an action several times
+        // on the terminals that report them.
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+            // Any key retires a live notice, bound or not: the reader has moved
+            // on, and a notice's lifetime is a maximum. Before dispatch, so a key
+            // that raises one of its own keeps it.
+            app.clear_flash();
+            // The mode is an input to the mapping, so one key can be the way out
+            // of a mode here and the way out of the browser there. Every key
+            // reaches `apply`, bound or not — see `dispatch`.
+            let action = dispatch(key, app.mode());
+            let outcome = app.apply(action);
+            intent_outcome(app, outcome)
+        }
+        Event::Key(_) => false,
+        Event::Mouse(mouse) => {
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    app.press(mouse.column);
+                }
+                MouseEventKind::Drag(MouseButton::Left) => app.drag(mouse.column, width),
+                MouseEventKind::Up(MouseButton::Left) => app.release(),
+                kind => {
+                    if let Some(action) = wheel_action(kind) {
+                        let outcome = app.apply(action);
+                        intent_outcome(app, outcome);
+                    }
+                }
+            }
+            false
+        }
+        // Focus, paste and resize events have no browser intent, but no incoming
+        // terminal event may leave the browser displaying a frame that predates it.
+        Event::FocusGained | Event::FocusLost | Event::Paste(_) | Event::Resize(_, _) => false,
+    }
+}
+
 fn event_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
     // Mouse capture is what makes the divider draggable, but it also takes
     // click-drag text selection away from the terminal. Zoom is the way out:
@@ -562,42 +609,10 @@ fn event_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
         if !event::poll(TICK)? {
             continue;
         }
-        app.request_redraw();
-
-        match event::read()? {
-            // Key repeats and releases would otherwise apply an action several
-            // times on the terminals that report them.
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
-                // Any key retires a live notice, bound or not: the reader has
-                // moved on, and a notice's lifetime is a maximum. Before
-                // dispatch, so a key that raises one of its own keeps it.
-                app.clear_flash();
-                // The mode is an input to the mapping, so one key can be the way
-                // out of a mode here and the way out of the browser there. Every
-                // key reaches `apply`, bound or not — see `dispatch`.
-                let action = dispatch(key, app.mode());
-                let outcome = app.apply(action);
-                if intent_outcome(&mut app, outcome) {
-                    return Ok(());
-                }
-            }
-            Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::Down(MouseButton::Left) => {
-                    app.press(mouse.column);
-                }
-                MouseEventKind::Drag(MouseButton::Left) => {
-                    let width = terminal.size()?.width;
-                    app.drag(mouse.column, width);
-                }
-                MouseEventKind::Up(MouseButton::Left) => app.release(),
-                kind => {
-                    if let Some(action) = wheel_action(kind) {
-                        let outcome = app.apply(action);
-                        intent_outcome(&mut app, outcome);
-                    }
-                }
-            },
-            _ => {}
+        let event = event::read()?;
+        let width = terminal.size()?.width;
+        if dispatch_event(&mut app, event, width) {
+            return Ok(());
         }
 
         // Only the loop owns the terminal, so an editor can only be run from here.
@@ -630,7 +645,7 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use crossterm::event::{KeyCode, KeyModifiers, MouseEvent};
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseEvent};
     use ratatui::backend::TestBackend;
     use ratatui::widgets::Paragraph;
 
@@ -1588,6 +1603,118 @@ mod tests {
         let bound = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
         assert_eq!(keymap::action_for(bound, Mode::Browse), Some(Action::Quit));
         assert_eq!(dispatch(bound, Mode::Browse), Action::Quit);
+    }
+
+    #[test]
+    fn every_received_event_variant_owes_a_redraw() {
+        // Built from each crossterm event the loop receives. Focus, paste and
+        // resize deliberately have no browser intent, so their rows prove the
+        // redraw request belongs before dispatch rather than inside a handler.
+        let events = [
+            ("focus gained", Event::FocusGained),
+            ("focus lost", Event::FocusLost),
+            (
+                "key press",
+                Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            ),
+            (
+                "key repeat",
+                Event::Key(KeyEvent::new_with_kind(
+                    KeyCode::Char('x'),
+                    KeyModifiers::NONE,
+                    KeyEventKind::Repeat,
+                )),
+            ),
+            (
+                "key release",
+                Event::Key(KeyEvent::new_with_kind(
+                    KeyCode::Char('x'),
+                    KeyModifiers::NONE,
+                    KeyEventKind::Release,
+                )),
+            ),
+            (
+                "mouse",
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    column: 0,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                }),
+            ),
+            ("paste", Event::Paste("pasted".into())),
+            ("resize", Event::Resize(100, 24)),
+        ];
+
+        for (kind, event) in events {
+            let fixture = data::fixture::Fixture::build();
+            let mut app = App::new(fixture.store.clone(), Theme::with_color(false)).unwrap();
+            assert!(app.take_redraw_request(), "the opening frame is owed");
+
+            assert!(
+                !dispatch_event(&mut app, event, 100),
+                "{kind} unexpectedly ended the session"
+            );
+            assert!(
+                app.take_redraw_request(),
+                "{kind} did not request the frame it owes"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_retires_an_earlier_notice_before_its_own_dispatch() {
+        let fixture = data::fixture::Fixture::build();
+        let mut app = App::new(fixture.store.clone(), Theme::with_color(false)).unwrap();
+        assert!(app.take_redraw_request(), "the opening frame is owed");
+        app.apply(Action::EnterEditing).unwrap();
+        app.flash("an earlier notice");
+        assert_eq!(app.flash_message(), Some("an earlier notice"));
+        assert!(app.take_redraw_request(), "the earlier notice is visible");
+
+        // `j` is a key the editing mode cannot apply to this frozen epic row, so
+        // dispatch replaces the earlier notice with the mode's own explanation.
+        assert!(!dispatch_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+            100,
+        ));
+        assert_eq!(
+            app.flash_message(),
+            Some("not an editing action — Esc to leave")
+        );
+    }
+
+    #[test]
+    fn a_bound_or_unbound_key_retires_a_notice_when_it_raises_no_replacement() {
+        let keys = [
+            (
+                "bound layout key",
+                KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+                Some(Action::ToggleZoom),
+            ),
+            (
+                "unbound key",
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+                None,
+            ),
+        ];
+
+        for (kind, key, expected) in keys {
+            // Both paths are deliberately silent in browse mode, so any notice
+            // after dispatch could only be the one this key was required to retire.
+            assert_eq!(keymap::action_for(key, Mode::Browse), expected, "{kind}");
+            let fixture = data::fixture::Fixture::build();
+            let mut app = App::new(fixture.store.clone(), Theme::with_color(false)).unwrap();
+            app.flash("an earlier notice");
+            assert_eq!(app.flash_message(), Some("an earlier notice"));
+
+            assert!(
+                !dispatch_event(&mut app, Event::Key(key), 100),
+                "{kind} unexpectedly ended the session"
+            );
+            assert_eq!(app.flash_message(), None, "{kind} kept the earlier notice");
+        }
     }
 
     #[test]
