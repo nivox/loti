@@ -50,9 +50,8 @@
           pname = "loti";
           inherit version src;
           cargoLock.lockFile = ./Cargo.lock;
-          # Agent-launch conformance tests allocate a pseudo-terminal with
-          # util-linux's `script` command.
-          nativeCheckInputs = [ pkgs.util-linux ];
+          # The package build compiles only; the suite is run from the dev shell
+          doCheck = false;
           meta = {
             description = "loti (LOcal TIckets) — markdown-backed local ticketing CLI";
             mainProgram = "loti";
